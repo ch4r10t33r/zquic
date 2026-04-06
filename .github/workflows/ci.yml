@@ -37,3 +37,25 @@ jobs:
 
       - name: Check formatting
         run: zig fmt --check .
+
+  interop-image:
+    name: Interop Docker Image
+    runs-on: ubuntu-latest
+    # Only build the Docker image on pushes to master and on PRs to master
+    # to keep CI fast on feature branches.
+    if: github.ref == 'refs/heads/master' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build interop image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: interop/Dockerfile
+          push: false
+          tags: zquic-interop:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
