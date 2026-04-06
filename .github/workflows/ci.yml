@@ -42,17 +42,13 @@ jobs:
         run: zig fmt --check .
 
   interop-image:
-    name: Interop Docker Image
+    name: Build Interop Image
     runs-on: ubuntu-latest
-    # Build the Docker image on every push to master and on every PR
-    # targeting master so images are always ready for interop testing.
-    if: github.ref == 'refs/heads/master' || github.event_name == 'pull_request'
+    # Build the image on every branch push and on PRs so problems are caught
+    # before they reach master. The interop-run job below then uses it.
     steps:
       - uses: actions/checkout@v4
 
-      # Build the Zig binaries on the Actions runner. This avoids
-      # downloading Zig inside the Docker build context (which fails when
-      # ziglang.org is unreachable or the version is a pre-release).
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -66,63 +62,151 @@ jobs:
 
       # Dockerfile.prebuilt simply COPYs zig-out/bin/* — no Zig toolchain
       # download happens inside Docker.
-      - name: Build interop image (no push)
+      - name: Build and export interop image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: interop/Dockerfile.prebuilt
+          # Export to the local daemon so the interop-run job can load it.
+          load: true
           push: false
-          tags: zquic-interop:ci
+          tags: zquic:interop
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Interop runner ──────────────────────────────────────────────────────────
-  # Runs the actual quic-interop-runner test suite against the built image.
-  # Triggered only on pushes to master (not on PRs) because:
-  #   • The runner needs Docker images from two implementations to compare.
-  #   • It takes ~10–30 minutes per test case.
-  #   • PRs get the image build above as a fast sanity check.
-  #
-  # To enable: set the INTEROP_RUNNER_ENABLED repository variable to "true"
-  # and ensure the runner host has docker-compose and quic-interop-runner
-  # checked out at $QUIC_INTEROP_RUNNER_PATH.
-  #
-  # Uncomment the block below once the UDP I/O loop is wired up and the
-  # implementation can complete a real handshake.
-  #
-  # interop-run:
-  #   name: Interop Runner
-  #   runs-on: [self-hosted, interop]
-  #   needs: [test, interop-image]
-  #   if: >
-  #     github.ref == 'refs/heads/master' &&
-  #     vars.INTEROP_RUNNER_ENABLED == 'true'
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - name: Setup Zig
-  #       uses: mlugg/setup-zig@v2
-  #       with:
-  #         version: "0.15.0"
-  #
-  #     - name: Build release binaries
-  #       run: zig build -Doptimize=ReleaseFast
-  #
-  #     - name: Build and tag interop image
-  #       run: |
-  #         docker build -t zquic -f interop/Dockerfile.prebuilt .
-  #
-  #     - name: Run quic-interop-runner
-  #       working-directory: ${{ env.QUIC_INTEROP_RUNNER_PATH }}
-  #       run: |
-  #         python3 run.py \
-  #           --client zquic \
-  #           --server zquic \
-  #           --test handshake,transfer,retry,resumption,zerortt,http3,keyupdate,connectionmigration,multiconnect \
-  #           --output results/
-  #
-  #     - name: Upload interop results
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: interop-results
-  #         path: ${{ env.QUIC_INTEROP_RUNNER_PATH }}/results/
+      # Save the image as a tar so the interop-run job can load it without
+      # rebuilding (the two jobs run on separate runners).
+      - name: Save image tar
+        run: docker save zquic:interop | gzip > zquic-interop.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zquic-interop-image
+          path: zquic-interop.tar.gz
+          retention-days: 1
+
+  # ── Interop Runner ──────────────────────────────────────────────────────────
+  # Runs the full quic-interop-runner suite against zquic (self-test) on every
+  # push to master.  The job is marked continue-on-error because the UDP I/O
+  # loop is still being implemented; test failures are expected and tracked via
+  # the uploaded results artefact.  Remove continue-on-error once the handshake
+  # test case passes.
+  interop-run:
+    name: Interop Runner Tests
+    runs-on: ubuntu-latest
+    needs: [test, interop-image]
+    if: github.ref == 'refs/heads/master'
+    # Do not block master merges while the I/O loop is WIP.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # Load the Docker image that was built and saved by the interop-image job.
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: zquic-interop-image
+
+      - name: Load Docker image
+        run: docker load < zquic-interop.tar.gz
+
+      # Checkout the official quic-interop-runner.
+      - name: Checkout quic-interop-runner
+        uses: actions/checkout@v4
+        with:
+          repository: quic-interop/quic-interop-runner
+          path: quic-interop-runner
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install interop runner dependencies
+        run: pip3 install -r quic-interop-runner/requirements.txt
+
+      # Register zquic in implementations_quic.json alongside the existing
+      # implementations.  We use role "both" (can act as client and server).
+      - name: Register zquic implementation
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib
+
+          path = pathlib.Path("quic-interop-runner/implementations_quic.json")
+          impls = json.loads(path.read_text())
+          impls["zquic"] = {
+              "image": "zquic:interop",
+              "url": "https://github.com/ch4r10t33r/zquic",
+              "role": "both",
+          }
+          path.write_text(json.dumps(impls, indent=2))
+          print("Registered zquic:", impls["zquic"])
+          EOF
+
+      # Enable IPv6 in Docker (required by the interop network simulator).
+      - name: Enable IPv6 for Docker
+        run: |
+          sudo modprobe ip6table_filter || true
+          echo '{"ipv6": true, "fixed-cidr-v6": "2001:db8:1::/64"}' | \
+            sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      # Run the test suite against zquic acting as both client and server.
+      # Test cases are ordered from most fundamental to most complex so
+      # partial results are useful even if later cases time out.
+      - name: Run interop test suite
+        run: |
+          mkdir -p interop-results/logs
+          cd quic-interop-runner
+          python3 run.py \
+            --client zquic \
+            --server zquic \
+            --test handshake,transfer,retry,resumption,zerortt,http3,keyupdate,connectionmigration,multiconnect \
+            --log-dir ../interop-results/logs \
+            --json ../interop-results/results.json \
+            --debug
+        continue-on-error: true
+
+      # Always upload results so we can track progress across commits.
+      - name: Upload interop results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-results-${{ github.sha }}
+          path: interop-results/
+          retention-days: 30
+
+      # Print a compact pass/fail summary to the job log.
+      - name: Print result summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib, sys
+
+          p = pathlib.Path("interop-results/results.json")
+          if not p.exists():
+              print("No results.json found — test run may have failed to start.")
+              sys.exit(0)
+
+          data = json.loads(p.read_text())
+          results = data.get("results", [])
+          passed, failed, unsupported = [], [], []
+          for r in results:
+              tc = r.get("test", r.get("name", "?"))
+              result = r.get("result", r.get("status", "?"))
+              if result in ("succeeded", "passed"):
+                  passed.append(tc)
+              elif result in ("unsupported", "skipped"):
+                  unsupported.append(tc)
+              else:
+                  failed.append(tc)
+
+          print(f"\n{'='*50}")
+          print(f"INTEROP RESULTS  (commit {pathlib.Path('interop-results').parent.name[:7]})")
+          print(f"{'='*50}")
+          print(f"  PASSED      : {len(passed):2d}  {passed}")
+          print(f"  FAILED      : {len(failed):2d}  {failed}")
+          print(f"  UNSUPPORTED : {len(unsupported):2d}  {unsupported}")
+          print(f"{'='*50}\n")
+          EOF
