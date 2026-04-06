@@ -1469,8 +1469,12 @@ pub const Server = struct {
             }
             if (ft >= 0x08 and ft <= 0x0f) {
                 // STREAM frame
-                const sf_r = stream_frame_mod.StreamFrame.parse(frames[pos..], ft) catch return;
+                const sf_r = stream_frame_mod.StreamFrame.parse(frames[pos..], ft) catch |err| {
+                    std.debug.print("io: STREAM frame parse error ft=0x{x:0>2}: {}\n", .{ ft, err });
+                    return;
+                };
                 pos += sf_r.consumed;
+                std.debug.print("io: STREAM frame parsed: stream_id={} offset={} data_len={} fin={}\n", .{ sf_r.frame.stream_id, sf_r.frame.offset, sf_r.frame.data.len, sf_r.frame.fin });
                 self.handleStreamData(conn, &sf_r.frame, src);
                 continue;
             }
@@ -1500,19 +1504,26 @@ pub const Server = struct {
             &conn.app_server_km,
             conn.key_phase_bit,
             conn.use_chacha20,
-        ) catch return;
+        ) catch |err| {
+            std.debug.print("io: build1RttPacketFull error payload_len={}: {}\n", .{ effective_payload.len, err });
+            return;
+        };
         conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch {};
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch |err| {
+            std.debug.print("io: sendto error pkt_len={}: {}\n", .{ pkt_len, err });
+        };
     }
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
         var file_buf: [1200]u8 = undefined;
-        const n = slot.file.read(&file_buf) catch {
+        const n = slot.file.read(&file_buf) catch |err| {
+            std.debug.print("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             slot.close();
             return;
         };
         if (n == 0) {
+            std.debug.print("io: http09 stream_id={} EOF (offset={}, file_end={})\n", .{ slot.stream_id, slot.stream_offset, slot.file_end });
             slot.close();
             return;
         }
@@ -1524,14 +1535,20 @@ pub const Server = struct {
             .fin = fin,
             .has_length = true,
         };
+        const old_offset = slot.stream_offset;
         slot.stream_offset += @intCast(n);
         var frame_buf: [2048]u8 = undefined;
-        const frame_len = sf_out.serialize(&frame_buf) catch {
+        const frame_len = sf_out.serialize(&frame_buf) catch |err| {
+            std.debug.print("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
             slot.close();
             return;
         };
+        std.debug.print("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
-        if (fin) slot.close();
+        if (fin) {
+            std.debug.print("io: http09 stream_id={} complete\n", .{slot.stream_id});
+            slot.close();
+        }
     }
 
     /// Drain queued HTTP/0.9 bodies a little at a time so recv/ACK processing can run.
@@ -1578,9 +1595,16 @@ pub const Server = struct {
 
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
         _ = src;
+        std.debug.print("io: handleHttp09Stream called: stream_id={} data_len={}\n", .{ sf.stream_id, sf.data.len });
         // Only unidirectional client-initiated streams carry HTTP/0.9 requests
-        if (sf.stream_id % 4 != 0 and sf.stream_id % 4 != 2) return;
-        if (sf.data.len == 0) return;
+        if (sf.stream_id % 4 != 0 and sf.stream_id % 4 != 2) {
+            std.debug.print("io: http09 stream_id={} rejected (not client-initiated, % 4 = {})\n", .{ sf.stream_id, sf.stream_id % 4 });
+            return;
+        }
+        if (sf.data.len == 0) {
+            std.debug.print("io: http09 stream_id={} empty data\n", .{sf.stream_id});
+            return;
+        }
 
         for (&conn.http09_slots) |*slot| {
             if (slot.active and slot.stream_id == sf.stream_id) return;
@@ -1588,10 +1612,17 @@ pub const Server = struct {
 
         var req_buf: [http09_server.max_request_len]u8 = undefined;
         @memcpy(req_buf[0..sf.data.len], sf.data);
-        const req = http09_server.parseRequest(req_buf[0..sf.data.len]) catch return;
+        const req = http09_server.parseRequest(req_buf[0..sf.data.len]) catch |err| {
+            std.debug.print("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
+            return;
+        };
+        std.debug.print("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
 
         var path_buf: [512]u8 = undefined;
-        const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch return;
+        const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
+            std.debug.print("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
+            return;
+        };
 
         const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
             std.debug.print("io: file not found: {s}\n", .{fs_path});
@@ -1611,6 +1642,7 @@ pub const Server = struct {
                 .stream_offset = 0,
                 .file_end = file_end,
             };
+            std.debug.print("io: http09 stream_id={} opened (size={})\n", .{ sf.stream_id, file_end });
             return;
         }
         std.debug.print("io: http/0.9 out slots full\n", .{});
