@@ -9,8 +9,16 @@
 
 pub const varint = @import("varint.zig");
 pub const types = @import("types.zig");
+pub const packet = struct {
+    pub const header = @import("packet/header.zig");
+    pub const number = @import("packet/number.zig");
+    pub const pkt = @import("packet/packet.zig");
+};
 
 test {
     _ = @import("varint.zig");
     _ = @import("types.zig");
+    _ = @import("packet/header.zig");
+    _ = @import("packet/number.zig");
+    _ = @import("packet/packet.zig");
 }
