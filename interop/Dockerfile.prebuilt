@@ -1,0 +1,22 @@
+# zquic interop runner image — pre-built binaries (CI optimised)
+#
+# Expects the Zig release binaries to already exist in zig-out/bin/
+# (built on the CI runner with `zig build -Doptimize=ReleaseFast`).
+# Does NOT download or run Zig inside Docker.
+#
+# Used by .github/workflows/ci.yml:
+#   zig build -Doptimize=ReleaseFast
+#   docker build -t zquic-interop -f interop/Dockerfile.prebuilt .
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY zig-out/bin/server /usr/local/bin/zquic-server
+COPY zig-out/bin/client /usr/local/bin/zquic-client
+COPY interop/run_endpoint.sh /run_endpoint.sh
+RUN chmod +x /run_endpoint.sh
+
+ENTRYPOINT ["/run_endpoint.sh"]
