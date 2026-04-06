@@ -969,6 +969,31 @@ test "handshake: build and parse ServerHello" {
     try testing.expectEqual(MSG_SERVER_HELLO, buf[0]);
 }
 
+test "handshake: client-server secrets are mirrored" {
+    // Run client and server handshake in memory, verify derived secrets match.
+    const testing = std.testing;
+
+    var srv = ServerHandshake.init();
+    var cli = ClientHandshake.init();
+
+    // ── ClientHello ──────────────────────────────────────────────────────
+    var ch_buf: [1024]u8 = undefined;
+    const ch_len = try cli.buildClientHelloMsg(&ch_buf, &.{}, null, null);
+    const ch_bytes = ch_buf[0..ch_len];
+
+    // ── ServerHello (Initial) ────────────────────────────────────────────
+    var sh_buf: [512]u8 = undefined;
+    const sh_len = try srv.processClientHello(ch_bytes, &sh_buf);
+    const sh_bytes = sh_buf[0..sh_len];
+
+    // Client processes ServerHello → derives handshake secrets
+    try cli.processServerHello(sh_bytes);
+
+    // At this point both sides should have matching handshake secrets
+    try testing.expectEqualSlices(u8, &cli.secrets.client_handshake, &srv.secrets.client_handshake);
+    try testing.expectEqualSlices(u8, &cli.secrets.server_handshake, &srv.secrets.server_handshake);
+}
+
 test "handshake: QUIC key derivation" {
     const testing = std.testing;
     const secret = [_]u8{0x77} ** 32;

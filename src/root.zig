@@ -69,6 +69,7 @@ test {
     _ = @import("crypto/quic_tls.zig");
     _ = @import("crypto/session.zig");
     _ = @import("crypto/key_update.zig");
+    _ = @import("tls/handshake.zig");
     _ = @import("loss/recovery.zig");
     _ = @import("loss/congestion.zig");
     _ = @import("transport/connection.zig");
@@ -76,6 +77,7 @@ test {
     _ = @import("transport/flow_control.zig");
     _ = @import("transport/stream_manager.zig");
     _ = @import("transport/migration.zig");
+    _ = @import("transport/io.zig");
     _ = @import("http3/frame.zig");
     _ = @import("http3/qpack.zig");
     _ = @import("http09/server.zig");
