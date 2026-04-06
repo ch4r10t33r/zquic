@@ -833,6 +833,8 @@ pub const ClientHandshake = struct {
     handshake_done: bool,
     /// Cipher suite chosen by the server (set after processServerHello).
     cipher_suite: u16 = TLS_AES_128_GCM_SHA256,
+    /// The 32-byte random value from ClientHello (needed for NSS keylog format).
+    client_random: [32]u8 = [_]u8{0} ** 32,
 
     pub fn init() ClientHandshake {
         return .{
@@ -854,6 +856,8 @@ pub const ClientHandshake = struct {
     ) !usize {
         const n = try buildClientHello(out, &self.kp.public_key, quic_tp, alpn, server_name);
         self.transcript.update(out[0..n]);
+        // ClientHello layout: type(1) + len(3) + legacy_version(2) + random(32)
+        if (n >= 6 + 32) @memcpy(&self.client_random, out[6..38]);
         return n;
     }
 
@@ -867,6 +871,7 @@ pub const ClientHandshake = struct {
     ) !usize {
         const n = try buildClientHelloChaCha20(out, &self.kp.public_key, quic_tp, alpn, server_name);
         self.transcript.update(out[0..n]);
+        if (n >= 6 + 32) @memcpy(&self.client_random, out[6..38]);
         return n;
     }
 

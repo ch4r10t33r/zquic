@@ -93,6 +93,77 @@ pub fn buildHandshakeDoneFrame(out: []u8) usize {
     return 1;
 }
 
+/// Encode `src` as lowercase hex into `dst` (dst must be 2*src.len bytes).
+fn hexEncode(dst: []u8, src: []const u8) void {
+    const chars = "0123456789abcdef";
+    for (src, 0..) |b, i| {
+        dst[i * 2] = chars[b >> 4];
+        dst[i * 2 + 1] = chars[b & 0xf];
+    }
+}
+
+/// Write TLS secrets to a keylog file in NSS key log format.
+/// Enables Wireshark/tshark to decrypt captured QUIC traffic.
+fn writeKeylog(path: []const u8, client_random: [32]u8, secrets: *const tls_hs.TrafficSecrets) void {
+    const file = std.fs.createFileAbsolute(path, .{ .truncate = false }) catch return;
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+
+    const labels = [_][]const u8{
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+        "SERVER_TRAFFIC_SECRET_0",
+    };
+    const values = [_][32]u8{
+        secrets.client_handshake,
+        secrets.server_handshake,
+        secrets.client_app,
+        secrets.server_app,
+    };
+    var rand_hex: [64]u8 = undefined;
+    hexEncode(&rand_hex, &client_random);
+
+    var line_buf: [256]u8 = undefined;
+    var secret_hex: [64]u8 = undefined;
+    for (labels, values) |label, secret| {
+        hexEncode(&secret_hex, &secret);
+        const line = std.fmt.bufPrint(&line_buf, "{s} {s} {s}\n", .{
+            label, rand_hex, secret_hex,
+        }) catch continue;
+        file.writeAll(line) catch {};
+    }
+}
+
+/// Skip the body of an ACK frame (type 0x02 or 0x03), advancing `pos` past it.
+/// `is_ecn` should be true for type 0x03 (includes ECN counts).
+/// Returns the number of bytes consumed from `data` (which starts AFTER the type varint).
+fn skipAckBody(data: []const u8, is_ecn: bool) usize {
+    var pos: usize = 0;
+    const lar = varint.decode(data[pos..]) catch return data.len;
+    pos += lar.len;
+    const del = varint.decode(data[pos..]) catch return data.len;
+    pos += del.len;
+    const cnt = varint.decode(data[pos..]) catch return data.len;
+    pos += cnt.len;
+    const fst = varint.decode(data[pos..]) catch return data.len;
+    pos += fst.len;
+    var ri: u64 = 0;
+    while (ri < cnt.value) : (ri += 1) {
+        const gp = varint.decode(data[pos..]) catch return data.len;
+        pos += gp.len;
+        const rl = varint.decode(data[pos..]) catch return data.len;
+        pos += rl.len;
+    }
+    if (is_ecn) {
+        inline for (0..3) |_| {
+            const ec = varint.decode(data[pos..]) catch return data.len;
+            pos += ec.len;
+        }
+    }
+    return pos;
+}
+
 /// Build an Initial packet with the given payload.
 /// Returns bytes written.
 pub fn buildInitialPacket(
@@ -1091,6 +1162,10 @@ pub const Server = struct {
         std.debug.print("io: handshake complete for connection\n", .{});
         conn.phase = .connected;
 
+        if (self.config.keylog_path) |kpath| {
+            writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
+        }
+
         // Send Handshake ACK + 1-RTT HANDSHAKE_DONE
         self.sendHandshakeAck(conn, src);
         self.sendHandshakeDone(conn, src);
@@ -1233,7 +1308,10 @@ pub const Server = struct {
             pos += ft_r.len;
 
             if (ft == 0x00) continue; // PADDING
-            if (ft == 0x01) { // PING — no body, continue
+            if (ft == 0x01) continue; // PING — no body
+            if (ft == 0x02 or ft == 0x03) {
+                // ACK frame — parse and skip all variable-length fields.
+                pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
             }
             if (ft == 0x1a) {
@@ -1264,7 +1342,7 @@ pub const Server = struct {
                 self.handleStreamData(conn, &sf_r.frame, src);
                 continue;
             }
-            // Unknown frame — stop parsing
+            // Unknown frame type — cannot safely skip without knowing the length.
             return;
         }
     }
@@ -1965,9 +2043,17 @@ pub const Client = struct {
 
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
+            if (ft == 0x02 or ft == 0x03) {
+                // ACK frame — parse and skip all variable-length fields.
+                pos += skipAckBody(plaintext[pos..pt_len], ft == 0x03);
+                continue;
+            }
             if (ft == 0x1e) { // HANDSHAKE_DONE
                 std.debug.print("io: client received HANDSHAKE_DONE\n", .{});
                 self.conn.phase = .connected;
+                if (self.config.keylog_path) |kpath| {
+                    writeKeylog(kpath, self.tls.client_random, &self.tls.secrets);
+                }
                 continue;
             }
             if (ft == 0x06) {
@@ -2008,7 +2094,7 @@ pub const Client = struct {
                 self.handleStreamResponse(&sf_r.frame);
                 continue;
             }
-            // Skip unrecognised frame — can't reliably advance, stop
+            // Unknown frame type — cannot safely skip without knowing the length.
             return;
         }
     }
