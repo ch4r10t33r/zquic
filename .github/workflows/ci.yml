@@ -216,23 +216,31 @@ jobs:
           # quic-interop-runner JSON layout:
           #   clients:  [str, ...]
           #   servers:  [str, ...]
-          #   results:  list[list[dict[test_name, result_str]]]
-          #             results[client_idx][server_idx][test_name] = "succeeded"|"failed"|...
+          #   results:  flat list, one entry per (client, server) pair (iterating clients outer, servers inner)
+          #             each entry is a list of per-test dicts: [{abbr, name, result}, ...]
+          #             result values: "succeeded" | "failed" | "unsupported" | None
           clients = data.get("clients", [])
           servers = data.get("servers", [])
           raw = data.get("results", [])
 
           passed, failed, unsupported = [], [], []
-          for ci, client_row in enumerate(raw):
-              for si, cell in enumerate(client_row):
-                  if not isinstance(cell, dict):
-                      continue
-                  label = f"{clients[ci] if ci < len(clients) else ci}→{servers[si] if si < len(servers) else si}"
-                  for test_name, result in cell.items():
+          pair_idx = 0
+          for client in clients:
+              for server in servers:
+                  if pair_idx >= len(raw):
+                      break
+                  pair_results = raw[pair_idx]
+                  pair_idx += 1
+                  label = f"{client}→{server}"
+                  for test_result in pair_results:
+                      if not isinstance(test_result, dict):
+                          continue
+                      test_name = test_result.get("name") or test_result.get("abbr", "?")
+                      result = test_result.get("result")
                       tag = f"{test_name}({label})"
-                      if result in ("succeeded", "passed"):
+                      if result == "succeeded":
                           passed.append(tag)
-                      elif result in ("unsupported", "skipped"):
+                      elif result in (None, "unsupported", "skipped"):
                           unsupported.append(tag)
                       else:
                           failed.append(tag)

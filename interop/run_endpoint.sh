@@ -1,54 +1,32 @@
 #!/usr/bin/env bash
 # Entry point for the quic-interop-runner.
 #
-# Environment variables set by the runner:
-#   ROLE        — "server" or "client"
-#   TESTCASE    — one of: handshake, transfer, retry, resumption, zerortt,
-#                          http3, connectionmigration, rebind, keyupdate,
-#                          multiconnect, v2
-#   SERVER      — hostname / IP of the server (client role only)
-#   CLIENT      — hostname / IP of the client (server role only)
-#   PORT        — UDP port to bind/connect
-#   REQUESTS    — space-separated list of URLs to fetch (client role only)
-#   SSLKEYLOGFILE — path where TLS secrets should be written
-#   QLOGDIR     — directory for qlog output
-#   LOGS        — directory for additional log files
-#
-# Interop-runner test case mapping:
-#   handshake          → basic QUIC handshake
-#   transfer           → HTTP/0.9 file transfer
-#   retry              → server sends Retry packet before accepting
-#   resumption         → session ticket resumption (1-RTT)
-#   zerortt            → 0-RTT early data
-#   http3              → HTTP/3 GET
-#   connectionmigration→ client migrates to a new port after connection
-#   rebind             → server rebinds to a new address/port
-#   keyupdate          → key update mid-connection
-#   multiconnect       → multiple sequential connections
-#   v2                 → QUIC version 2 (RFC 9369) — not yet supported
+# Environment variables set by the runner (via docker-compose.yml):
+#   ROLE            — "server" or "client"
+#   TESTCASE        — e.g. handshake, transfer, retry, resumption, zerortt,
+#                     http3, connectionmigration, keyupdate, chacha20,
+#                     multiplexing, rebind
+#   REQUESTS        — space-separated URLs for client to download
+#                     Format: "https://server4:443/path ..."
+#                     The server host and port are parsed from here.
+#   SSLKEYLOGFILE   — where to write TLS key material (NSS key log format)
+#   QLOGDIR         — directory for qlog output
+#   CERTS           — directory containing cert.pem and priv.key (server role)
 
 set -euo pipefail
 
 ROLE="${ROLE:-server}"
 TESTCASE="${TESTCASE:-handshake}"
-PORT="${PORT:-443}"
-SERVER="${SERVER:-localhost}"
 SSLKEYLOGFILE="${SSLKEYLOGFILE:-/dev/null}"
-QLOGDIR="${QLOGDIR:-/tmp/qlogs}"
-CERT_DIR="${CERT_DIR:-/certs}"
+QLOGDIR="${QLOGDIR:-/logs/qlog}"
+CERT_DIR="${CERTS:-/certs}"
 
 mkdir -p "${QLOGDIR}"
 
-# Shared flags
-COMMON_FLAGS=(
-    --port "${PORT}"
-    --keylog "${SSLKEYLOGFILE}"
-    --qlog-dir "${QLOGDIR}"
-)
-
 # Map test cases to feature flags understood by our binaries.
+# Unknown or unsupported test cases exit 127 so the runner marks them "unsupported".
 case "${TESTCASE}" in
-    handshake|multiconnect)
+    handshake|multiplexing|multiconnect)
         EXTRA_FLAGS=()
         ;;
     transfer)
@@ -75,8 +53,10 @@ case "${TESTCASE}" in
     keyupdate)
         EXTRA_FLAGS=(--key-update)
         ;;
+    chacha20)
+        EXTRA_FLAGS=(--chacha20)
+        ;;
     v2)
-        # QUIC v2 not yet supported — exit with interop "unsupported" code 127.
         echo "TESTCASE v2 not supported" >&2
         exit 127
         ;;
@@ -88,22 +68,44 @@ esac
 
 if [[ "${ROLE}" == "server" ]]; then
     exec zquic-server \
-        "${COMMON_FLAGS[@]}" \
+        --port 443 \
+        --keylog "${SSLKEYLOGFILE}" \
+        --qlog-dir "${QLOGDIR}" \
         "${EXTRA_FLAGS[@]}" \
         --cert "${CERT_DIR}/cert.pem" \
         --key  "${CERT_DIR}/priv.key" \
         --www  /www
 else
-    # Build URL list from REQUESTS env var.
+    # Parse the server host and port from the first URL in REQUESTS.
+    # The docker-compose does not set a SERVER env var for the client
+    # container; the server address is encoded in the REQUESTS URLs.
+    # URL format: https://server4:443/path
+    HOST="server4"
+    PORT="443"
+    if [[ -n "${REQUESTS:-}" ]]; then
+        FIRST_URL="${REQUESTS%% *}"         # take only the first URL
+        HOSTPATH="${FIRST_URL#https://}"    # strip https://
+        HOSTPORT="${HOSTPATH%%/*}"          # strip everything after the first /
+        if [[ "${HOSTPORT}" == *:* ]]; then
+            HOST="${HOSTPORT%:*}"
+            PORT="${HOSTPORT##*:}"
+        else
+            HOST="${HOSTPORT}"
+        fi
+    fi
+
+    # Build per-URL download flags.
     URL_FLAGS=()
     for url in ${REQUESTS:-}; do
         URL_FLAGS+=(--url "${url}")
     done
 
     exec zquic-client \
-        "${COMMON_FLAGS[@]}" \
+        --host "${HOST}" \
+        --port "${PORT}" \
+        --keylog "${SSLKEYLOGFILE}" \
+        --qlog-dir "${QLOGDIR}" \
         "${EXTRA_FLAGS[@]}" \
-        --host "${SERVER}" \
         "${URL_FLAGS[@]}" \
         --output /downloads
 fi
