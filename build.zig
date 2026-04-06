@@ -61,4 +61,28 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // Examples
+    const examples_step = b.step("examples", "Build all examples");
+    const example_files = [_][]const u8{
+        "examples/echo_server.zig",
+        "examples/parse_packet.zig",
+        "examples/session_resumption.zig",
+    };
+    for (example_files) |src| {
+        // Derive binary name from filename without extension.
+        const base = std.fs.path.stem(src);
+        const ex_mod = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = target,
+            .optimize = optimize,
+        });
+        ex_mod.addImport("zquic", zquic_mod);
+        const ex = b.addExecutable(.{
+            .name = base,
+            .root_module = ex_mod,
+        });
+        const ex_install = b.addInstallArtifact(ex, .{});
+        examples_step.dependOn(&ex_install.step);
+    }
 }
