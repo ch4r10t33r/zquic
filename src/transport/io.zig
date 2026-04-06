@@ -564,6 +564,7 @@ pub const Server = struct {
 
     /// Dispatch a received UDP datagram.
     fn processPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+        std.debug.print("io: server recv {} bytes from {any}\n", .{ buf.len, src });
         if (buf.len < 5) return;
 
         // Version Negotiation: first byte 0x80, version = 0
@@ -1489,6 +1490,7 @@ pub const Client = struct {
         const server_addr = std.net.Address.parseIp4(self.config.host, self.config.port) catch
             try resolveAddress(self.allocator, self.config.host, self.config.port);
         self.conn.peer = server_addr;
+        std.debug.print("io: client resolved {s} to {any}\n", .{ self.config.host, server_addr });
 
         // Send ClientHello Initial packet
         try self.sendClientHello(server_addr);
