@@ -23,6 +23,9 @@ const initial_mod = @import("../crypto/initial.zig");
 const quic_tls_mod = @import("../crypto/quic_tls.zig");
 const tls_hs = @import("../tls/handshake.zig");
 const tls_vendor = @import("tls");
+const stream_frame_mod = @import("../frames/stream.zig");
+const http09_server = @import("../http09/server.zig");
+const http09_client = @import("../http09/client.zig");
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -826,12 +829,76 @@ pub const Server = struct {
     }
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
-        _ = conn;
-        _ = frames;
-        _ = src;
-        _ = self;
-        // TODO: handle STREAM frames for HTTP/0.9 and HTTP/3
-        std.debug.print("io: received 1-RTT application data\n", .{});
+        var pos: usize = 0;
+        while (pos < frames.len) {
+            const ft_r = varint.decode(frames[pos..]) catch return;
+            const ft = ft_r.value;
+            pos += ft_r.len;
+
+            if (ft == 0x00) continue; // PADDING
+            if (ft == 0x01) return; // PING — no body
+            if (ft >= 0x08 and ft <= 0x0f) {
+                // STREAM frame
+                const sf_r = stream_frame_mod.StreamFrame.parse(frames[pos..], ft) catch return;
+                pos += sf_r.consumed;
+                self.handleStreamData(conn, &sf_r.frame, src);
+                continue;
+            }
+            // Unknown frame — stop parsing
+            return;
+        }
+    }
+
+    fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+        // Only unidirectional client-initiated streams carry HTTP/0.9 requests
+        if (sf.stream_id % 4 != 0 and sf.stream_id % 4 != 2) return; // bidi or server-initiated
+        if (sf.data.len == 0) return;
+
+        var req_buf: [http09_server.max_request_len]u8 = undefined;
+        @memcpy(req_buf[0..sf.data.len], sf.data);
+        const req = http09_server.parseRequest(req_buf[0..sf.data.len]) catch return;
+
+        var path_buf: [512]u8 = undefined;
+        const fs_path = http09_server.resolvePath(req.path, &path_buf) catch return;
+
+        const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
+            std.debug.print("io: file not found: {s}\n", .{fs_path});
+            return;
+        };
+        defer file.close();
+
+        // Send file contents in STREAM frames
+        var file_buf: [1024]u8 = undefined;
+        var stream_offset: u64 = 0;
+        while (true) {
+            const n = file.read(&file_buf) catch break;
+            if (n == 0) break;
+
+            const fin = (file.getEndPos() catch 0) == (file.getPos() catch 1);
+            const sf_out = stream_frame_mod.StreamFrame{
+                .stream_id = sf.stream_id,
+                .offset = stream_offset,
+                .data = file_buf[0..n],
+                .fin = fin,
+                .has_length = true,
+            };
+            stream_offset += n;
+
+            var frame_buf: [1200]u8 = undefined;
+            const frame_len = sf_out.serialize(&frame_buf) catch break;
+
+            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const pkt_len = build1RttPacket(
+                &send_buf,
+                conn.remote_cid,
+                frame_buf[0..frame_len],
+                conn.app_pn,
+                &conn.app_server_km,
+            ) catch break;
+            conn.app_pn += 1;
+
+            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+        }
     }
 };
 
@@ -850,6 +917,17 @@ pub const ClientConfig = struct {
     http3: bool = false,
 };
 
+// ── Stream download tracker ───────────────────────────────────────────────────
+
+/// Maps a QUIC stream ID to an open output file for download accumulation.
+const MAX_STREAMS = 64;
+
+const StreamDownload = struct {
+    stream_id: u64,
+    file: std.fs.File,
+    active: bool,
+};
+
 // ── QUIC Client ───────────────────────────────────────────────────────────────
 
 pub const Client = struct {
@@ -858,6 +936,8 @@ pub const Client = struct {
     sock: std.posix.socket_t,
     tls: ClientHandshake,
     conn: ConnState,
+    streams: [MAX_STREAMS]StreamDownload = [_]StreamDownload{.{ .stream_id = 0, .file = undefined, .active = false }} ** MAX_STREAMS,
+    streams_done: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
         const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
@@ -1130,20 +1210,135 @@ pub const Client = struct {
 
         var pos: usize = 0;
         while (pos < pt_len) {
-            if (plaintext[pos] == 0x1e) { // HANDSHAKE_DONE
+            const ft_r = varint.decode(plaintext[pos..]) catch return;
+            const ft = ft_r.value;
+            pos += ft_r.len;
+
+            if (ft == 0x00) continue; // PADDING
+            if (ft == 0x1e) { // HANDSHAKE_DONE
                 std.debug.print("io: client received HANDSHAKE_DONE\n", .{});
                 self.conn.phase = .connected;
-                pos += 1;
-            } else {
-                break;
+                continue;
+            }
+            if (ft >= 0x08 and ft <= 0x0f) {
+                // STREAM frame — write data to download file
+                const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[pos..pt_len], ft) catch return;
+                pos += sf_r.consumed;
+                self.handleStreamResponse(&sf_r.frame);
+                continue;
+            }
+            // Skip unrecognised frame — can't reliably advance, stop
+            return;
+        }
+    }
+
+    fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
+        for (&self.streams) |*s| {
+            if (s.active and s.stream_id == sf.stream_id) {
+                _ = s.file.write(sf.data) catch {};
+                if (sf.fin) {
+                    s.file.close();
+                    s.active = false;
+                    self.streams_done += 1;
+                    std.debug.print("io: stream {} download complete\n", .{sf.stream_id});
+                }
+                return;
             }
         }
     }
 
     fn downloadUrls(self: *Client, server: std.net.Address) !void {
-        _ = server;
-        std.debug.print("io: client connected, {} URLs to download\n", .{self.config.urls.len});
-        // TODO: send STREAM frames for each URL
+        std.debug.print("io: sending {} HTTP/0.9 requests\n", .{self.config.urls.len});
+
+        // Ensure output directory exists
+        std.fs.makeDirAbsolute(self.config.output_dir) catch {};
+
+        for (self.config.urls, 0..) |url, i| {
+            // Extract path from url (strip scheme+host if present, keep path)
+            const path = blk: {
+                if (std.mem.indexOf(u8, url, "://")) |sep| {
+                    const after_scheme = url[sep + 3 ..];
+                    if (std.mem.indexOf(u8, after_scheme, "/")) |slash| {
+                        break :blk after_scheme[slash..];
+                    }
+                }
+                break :blk url;
+            };
+
+            // Build HTTP/0.9 request
+            var req_buf: [4096]u8 = undefined;
+            const req = http09_client.buildRequest(path, &req_buf) catch continue;
+
+            // Allocate stream ID: client-initiated bidirectional = 4*i
+            const stream_id: u64 = @as(u64, i) * 4;
+
+            // Open output file
+            var dl_path_buf: [512]u8 = undefined;
+            const dl_path = http09_client.downloadPath(path, &dl_path_buf) catch continue;
+            const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
+                std.debug.print("io: cannot create {s}\n", .{dl_path});
+                continue;
+            };
+
+            // Register stream download
+            for (&self.streams) |*s| {
+                if (!s.active) {
+                    s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                    break;
+                }
+            } else {
+                out_file.close();
+                continue;
+            }
+
+            // Build STREAM frame with request payload
+            const sf = stream_frame_mod.StreamFrame{
+                .stream_id = stream_id,
+                .offset = 0,
+                .data = req,
+                .fin = true,
+                .has_length = true,
+            };
+            var frame_buf: [4200]u8 = undefined;
+            const frame_len = sf.serialize(&frame_buf) catch continue;
+
+            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const pkt_len = build1RttPacket(
+                &send_buf,
+                self.conn.remote_cid,
+                frame_buf[0..frame_len],
+                self.conn.app_pn,
+                &self.conn.app_client_km,
+            ) catch continue;
+            self.conn.app_pn += 1;
+
+            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+        }
+
+        // Wait for all downloads to complete (receive STREAM data + FIN)
+        var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const deadline = std.time.milliTimestamp() + 30_000;
+        while (std.time.milliTimestamp() < deadline) {
+            if (self.streams_done >= self.config.urls.len) break;
+
+            var fds = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, 200) catch 0;
+            if (ready == 0) continue;
+            if (fds[0].revents & std.posix.POLL.IN == 0) continue;
+
+            var src_addr: std.posix.sockaddr.storage = undefined;
+            var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
+            const n = std.posix.recvfrom(self.sock, &recv_buf, 0, @ptrCast(&src_addr), &src_len) catch continue;
+            self.processPacket(recv_buf[0..n]);
+        }
+
+        // Close all stream files
+        for (&self.streams) |*s| {
+            if (s.active) {
+                s.file.close();
+                s.active = false;
+            }
+        }
     }
 };
 
