@@ -1317,6 +1317,7 @@ pub const Server = struct {
     }
 
     fn process1RttPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+        std.debug.print("io: process1RttPacket buf_len={}\n", .{buf.len});
         // Find connection by scanning CID prefix
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
@@ -1388,6 +1389,7 @@ pub const Server = struct {
                 return;
             }
         }
+        std.debug.print("io: process1RttPacket: no matching connection found\n", .{});
     }
 
     /// Trigger a local key update: rotate send keys and emit a packet with
@@ -1405,6 +1407,7 @@ pub const Server = struct {
     }
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
+        std.debug.print("io: processAppFrames called: {} bytes\n", .{frames.len});
         // Detect address change (connection migration, RFC 9000 §9).
         // If the source address differs from the stored peer address and
         // migration is enabled, send PATH_CHALLENGE to validate the new path.
@@ -1420,7 +1423,10 @@ pub const Server = struct {
 
         var pos: usize = 0;
         while (pos < frames.len) {
-            const ft_r = varint.decode(frames[pos..]) catch return;
+            const ft_r = varint.decode(frames[pos..]) catch {
+                std.debug.print("io: frame type decode error at pos={}\n", .{pos});
+                return;
+            };
             const ft = ft_r.value;
             pos += ft_r.len;
 
