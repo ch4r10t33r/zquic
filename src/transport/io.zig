@@ -859,7 +859,10 @@ pub const Server = struct {
         // Parse frames for CRYPTO
         var fpos: usize = 0;
         while (fpos < pt_len) {
-            if (plaintext[fpos] == 0x00) { fpos += 1; continue; }
+            if (plaintext[fpos] == 0x00) {
+                fpos += 1;
+                continue;
+            }
             if (plaintext[fpos] == 0x06) {
                 fpos += 1;
                 const off_r = varint.decode(plaintext[fpos..]) catch break;
@@ -944,7 +947,7 @@ pub const Server = struct {
             // Ticket = resumption secret (32 bytes)
             const res_secret = conn.tls.resumptionSecret();
             const nst_len = tls_hs.buildNewSessionTicket(
-                frames_buf[fp + 4 + 8..], // leave room for CRYPTO frame header
+                frames_buf[fp + 4 + 8 ..], // leave room for CRYPTO frame header
                 3600,
                 &nonce,
                 &res_secret,
@@ -1515,7 +1518,10 @@ pub const Client = struct {
         // Extract CRYPTO frames
         var pos: usize = 0;
         while (pos < pt_len) {
-            if (plaintext[pos] == 0x00) { pos += 1; continue; }
+            if (plaintext[pos] == 0x00) {
+                pos += 1;
+                continue;
+            }
             if (plaintext[pos] == 0x02 or plaintext[pos] == 0x03) break; // skip ACK
             if (plaintext[pos] != 0x06) break;
             pos += 1;
@@ -1526,18 +1532,18 @@ pub const Client = struct {
             const dlen: usize = @intCast(dlen_r.value);
             if (pos + dlen > pt_len) break;
             const cdata = plaintext[pos .. pos + dlen];
-                if (cdata.len >= 4 and cdata[0] == tls_hs.MSG_SERVER_HELLO) {
-                    self.tls.processServerHello(cdata) catch |err| {
-                        std.debug.print("io: processServerHello failed: {}\n", .{err});
-                        return;
-                    };
-                    // Now we have handshake secrets — derive QUIC keys
-                    self.conn.deriveHandshakeKeys(&self.tls.secrets);
-                    // Set cipher based on what the server negotiated.
-                    if (self.tls.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
-                        self.conn.use_chacha20 = true;
-                    }
+            if (cdata.len >= 4 and cdata[0] == tls_hs.MSG_SERVER_HELLO) {
+                self.tls.processServerHello(cdata) catch |err| {
+                    std.debug.print("io: processServerHello failed: {}\n", .{err});
+                    return;
+                };
+                // Now we have handshake secrets — derive QUIC keys
+                self.conn.deriveHandshakeKeys(&self.tls.secrets);
+                // Set cipher based on what the server negotiated.
+                if (self.tls.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
+                    self.conn.use_chacha20 = true;
                 }
+            }
             pos += dlen;
         }
     }
@@ -1569,7 +1575,10 @@ pub const Client = struct {
         // Accumulate Handshake CRYPTO frames
         var fpos: usize = 0;
         while (fpos < pt_len) {
-            if (plaintext[fpos] == 0x00) { fpos += 1; continue; }
+            if (plaintext[fpos] == 0x00) {
+                fpos += 1;
+                continue;
+            }
             if (plaintext[fpos] != 0x06) break;
             fpos += 1;
             const off_r = varint.decode(plaintext[fpos..]) catch break;

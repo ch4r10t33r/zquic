@@ -1,5 +1,4 @@
 //! zquic client — interop runner entry point.
-
 //!
 //! Parses the command-line flags produced by interop/run_endpoint.sh and
 //! downloads files from a QUIC server, writing them to /downloads.

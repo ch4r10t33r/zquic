@@ -738,10 +738,14 @@ pub const ServerHandshake = struct {
         self.handshake_secret = deriveHandshakeSecret(shared);
         const hello_hash = peekHash(self.transcript);
         self.secrets.client_handshake = deriveTrafficSecret(
-            self.handshake_secret, "c hs traffic", &hello_hash,
+            self.handshake_secret,
+            "c hs traffic",
+            &hello_hash,
         );
         self.secrets.server_handshake = deriveTrafficSecret(
-            self.handshake_secret, "s hs traffic", &hello_hash,
+            self.handshake_secret,
+            "s hs traffic",
+            &hello_hash,
         );
 
         return n;
@@ -915,10 +919,14 @@ pub const ClientHandshake = struct {
         self.handshake_secret = deriveHandshakeSecret(shared);
         const hello_hash = peekHash(self.transcript);
         self.secrets.client_handshake = deriveTrafficSecret(
-            self.handshake_secret, "c hs traffic", &hello_hash,
+            self.handshake_secret,
+            "c hs traffic",
+            &hello_hash,
         );
         self.secrets.server_handshake = deriveTrafficSecret(
-            self.handshake_secret, "s hs traffic", &hello_hash,
+            self.handshake_secret,
+            "s hs traffic",
+            &hello_hash,
         );
     }
 
