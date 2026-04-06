@@ -759,6 +759,13 @@ pub const ServerHandshake = struct {
         return pos;
     }
 
+    /// Derive the resumption secret for NewSessionTicket (RFC 8446 §7.5).
+    pub fn resumptionSecret(self: *const ServerHandshake) [32]u8 {
+        const final_hash = peekHash(self.transcript);
+        const master = deriveMasterSecret(self.handshake_secret);
+        return deriveTrafficSecret(master, "res master", &final_hash);
+    }
+
     /// Verify the client's Finished message (raw bytes).
     pub fn processClientFinished(self: *ServerHandshake, fin_bytes: []const u8) !void {
         if (fin_bytes.len < 4) return error.TruncatedMessage;
@@ -930,6 +937,55 @@ pub const QuicKeyMaterial = struct {
     iv: [12]u8, // AES-128-GCM IV (nonce base)
     hp: [16]u8, // header protection key
 };
+
+/// Build a TLS 1.3 NewSessionTicket message.
+///
+/// Format (RFC 8446 §4.6.1):
+///   msg type (1) | length (3) | lifetime (4) | age_add (4) |
+///   nonce len (1) | nonce | ticket len (2) | ticket | extensions (2)
+pub fn buildNewSessionTicket(
+    out: []u8,
+    lifetime_s: u32,
+    nonce: []const u8,
+    ticket: []const u8,
+    max_early_data: u32,
+) error{BufferTooSmall}!usize {
+    const ext_len: usize = if (max_early_data > 0) 8 else 2; // early_data ext or empty
+    const body_len = 4 + 4 + 1 + nonce.len + 2 + ticket.len + ext_len;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+    var pos: usize = 0;
+    out[pos] = 0x04; // msg_type = new_session_ticket
+    pos += 1;
+    writeU24(out[pos..], @intCast(body_len));
+    pos += 3;
+    std.mem.writeInt(u32, out[pos..][0..4], lifetime_s, .big);
+    pos += 4;
+    std.mem.writeInt(u32, out[pos..][0..4], 0, .big); // ticket_age_add = 0
+    pos += 4;
+    out[pos] = @intCast(nonce.len);
+    pos += 1;
+    @memcpy(out[pos .. pos + nonce.len], nonce);
+    pos += nonce.len;
+    std.mem.writeInt(u16, out[pos..][0..2], @intCast(ticket.len), .big);
+    pos += 2;
+    @memcpy(out[pos .. pos + ticket.len], ticket);
+    pos += ticket.len;
+    if (max_early_data > 0) {
+        // early_data extension: type 0x002a, len 4, max_early_data_size
+        std.mem.writeInt(u16, out[pos..][0..2], 6, .big); // extensions total length
+        pos += 2;
+        std.mem.writeInt(u16, out[pos..][0..2], 0x002a, .big); // ext type
+        pos += 2;
+        std.mem.writeInt(u16, out[pos..][0..2], 4, .big); // ext data length
+        pos += 2;
+        std.mem.writeInt(u32, out[pos..][0..4], max_early_data, .big);
+        pos += 4;
+    } else {
+        std.mem.writeInt(u16, out[pos..][0..2], 0, .big); // empty extensions
+        pos += 2;
+    }
+    return pos;
+}
 
 /// Derive QUIC key material from a TLS 1.3 traffic secret (RFC 9001 §5.1).
 pub fn deriveQuicKeys(traffic_secret: [32]u8) QuicKeyMaterial {

@@ -27,6 +27,7 @@ const stream_frame_mod = @import("../frames/stream.zig");
 const http09_server = @import("../http09/server.zig");
 const http09_client = @import("../http09/client.zig");
 const retry_mod = @import("../packet/retry.zig");
+const session_mod = @import("../crypto/session.zig");
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -306,6 +307,7 @@ pub const ConnState = struct {
 
     // CRYPTO stream offset tracking (in-order reassembly)
     init_crypto_offset: u64 = 0,
+    app_crypto_offset: u64 = 0,
 
     // Retry token (set when server sends Retry; included in next Initial)
     retry_token: [64]u8 = [_]u8{0} ** 64,
@@ -842,14 +844,40 @@ pub const Server = struct {
     fn sendHandshakeDone(self: *Server, conn: *ConnState, src: std.net.Address) void {
         if (!conn.has_app_keys) return;
 
-        var send_buf: [256]u8 = undefined;
-        var frames_buf: [16]u8 = undefined;
-        const done_len = buildHandshakeDoneFrame(&frames_buf);
+        var frames_buf: [2048]u8 = undefined;
+        var fp: usize = 0;
 
+        // HANDSHAKE_DONE frame
+        fp += buildHandshakeDoneFrame(frames_buf[fp..]);
+
+        // NewSessionTicket (if resumption is enabled)
+        if (self.config.resumption_enabled) {
+            const nonce = [_]u8{0x01} ** 8;
+            // Ticket = resumption secret (32 bytes)
+            const res_secret = conn.tls.resumptionSecret();
+            const nst_len = tls_hs.buildNewSessionTicket(
+                frames_buf[fp + 4 + 8..], // leave room for CRYPTO frame header
+                3600,
+                &nonce,
+                &res_secret,
+                16384, // max_early_data
+            ) catch 0;
+            if (nst_len > 0) {
+                const crypto_len = buildCryptoFrame(
+                    frames_buf[fp..],
+                    conn.app_crypto_offset,
+                    frames_buf[fp + 4 + 8 .. fp + 4 + 8 + nst_len],
+                ) catch 0;
+                conn.app_crypto_offset += nst_len;
+                fp += crypto_len;
+            }
+        }
+
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacket(
             &send_buf,
             conn.remote_cid,
-            frames_buf[0..done_len],
+            frames_buf[0..fp],
             conn.app_pn,
             &conn.app_server_km,
         ) catch return;
@@ -997,6 +1025,7 @@ pub const Client = struct {
     conn: ConnState,
     streams: [MAX_STREAMS]StreamDownload = [_]StreamDownload{.{ .stream_id = 0, .file = undefined, .active = false }} ** MAX_STREAMS,
     streams_done: usize = 0,
+    ticket_store: session_mod.TicketStore = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
         const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
@@ -1306,6 +1335,18 @@ pub const Client = struct {
                 self.conn.phase = .connected;
                 continue;
             }
+            if (ft == 0x06) {
+                // CRYPTO frame — may contain NewSessionTicket
+                const off_r = varint.decode(plaintext[pos..]) catch return;
+                pos += off_r.len;
+                const dlen_r = varint.decode(plaintext[pos..]) catch return;
+                pos += dlen_r.len;
+                const dlen: usize = @intCast(dlen_r.value);
+                if (pos + dlen > pt_len) return;
+                self.handleAppCrypto(plaintext[pos .. pos + dlen]);
+                pos += dlen;
+                continue;
+            }
             if (ft >= 0x08 and ft <= 0x0f) {
                 // STREAM frame — write data to download file
                 const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[pos..pt_len], ft) catch return;
@@ -1316,6 +1357,54 @@ pub const Client = struct {
             // Skip unrecognised frame — can't reliably advance, stop
             return;
         }
+    }
+
+    fn handleAppCrypto(self: *Client, data: []const u8) void {
+        if (data.len < 4) return;
+        if (data[0] != 0x04) return; // not NewSessionTicket
+        const body_len = readU24(data[1..4]);
+        if (4 + body_len > data.len) return;
+        const body = data[4 .. 4 + body_len];
+        if (body.len < 4 + 4 + 1) return;
+
+        var p: usize = 0;
+        const lifetime_s = std.mem.readInt(u32, body[p..][0..4], .big);
+        p += 4;
+        p += 4; // skip ticket_age_add
+        const nonce_len = body[p];
+        p += 1;
+        if (p + nonce_len + 2 > body.len) return;
+        var nonce: [32]u8 = .{0} ** 32;
+        const nl = @min(nonce_len, 32);
+        @memcpy(nonce[0..nl], body[p .. p + nl]);
+        p += nonce_len;
+        const ticket_len = std.mem.readInt(u16, body[p..][0..2], .big);
+        p += 2;
+        if (p + ticket_len > body.len) return;
+        const ticket_blob = body[p .. p + ticket_len];
+
+        // Use the TLS application_traffic_secret as resumption secret
+        const res_secret = self.tls.secrets.client_app;
+        var ticket_arr: [session_mod.max_ticket_len]u8 = .{0} ** session_mod.max_ticket_len;
+        const tl = @min(ticket_blob.len, session_mod.max_ticket_len);
+        @memcpy(ticket_arr[0..tl], ticket_blob[0..tl]);
+
+        var rs_arr: [48]u8 = .{0} ** 48;
+        @memcpy(rs_arr[0..32], &res_secret);
+
+        const ticket = session_mod.SessionTicket{
+            .lifetime_s = lifetime_s,
+            .nonce = nonce,
+            .nonce_len = @intCast(nl),
+            .ticket = ticket_arr,
+            .ticket_len = tl,
+            .resumption_secret = rs_arr,
+            .resumption_secret_len = 32,
+            .max_early_data_size = 16384,
+            .received_at_ms = @intCast(std.time.milliTimestamp()),
+        };
+        self.ticket_store.store(ticket);
+        std.debug.print("io: stored session ticket (lifetime={}s)\n", .{lifetime_s});
     }
 
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
@@ -1429,6 +1518,10 @@ pub const Client = struct {
 };
 
 // ── Transport parameter helpers ───────────────────────────────────────────────
+
+inline fn readU24(b: []const u8) u32 {
+    return (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | @as(u32, b[2]);
+}
 
 fn buildClientTransportParams(buf: []u8) []const u8 {
     const n = quic_tls_mod.buildClientTransportParams(buf);
