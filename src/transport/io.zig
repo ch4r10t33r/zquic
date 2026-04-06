@@ -1355,6 +1355,10 @@ pub const Server = struct {
                             break :decrypt n;
                         } else |_| {}
                     }
+                    std.debug.print(
+                        "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
+                        .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
+                    );
                     continue;
                 };
 
