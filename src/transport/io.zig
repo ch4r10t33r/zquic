@@ -255,6 +255,31 @@ pub fn unprotect1RttPacket(
     return initial_mod.unprotectInitialPacket(dst, buf, pn_start, buf.len, km);
 }
 
+/// Return the unprotected first byte of a 1-RTT short-header packet.
+/// Removes AES-128 header protection to reveal the Key Phase bit (0x04).
+/// Returns null if the packet is too short to sample.
+fn peekUnprotectedFirstByte(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chacha20: bool) ?u8 {
+    const sample_start = pn_start + initial_mod.hp_sample_offset;
+    if (buf.len < sample_start + initial_mod.hp_sample_len) return null;
+    var sample: [initial_mod.hp_sample_len]u8 = undefined;
+    @memcpy(&sample, buf[sample_start .. sample_start + initial_mod.hp_sample_len]);
+
+    var mask0: u8 = undefined;
+    if (chacha20) {
+        const counter = std.mem.readInt(u32, sample[0..4], .little);
+        const cc_nonce = sample[4..16].*;
+        var full_mask: [64]u8 = undefined;
+        std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
+        mask0 = full_mask[0];
+    } else {
+        const ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
+        var mask: [16]u8 = undefined;
+        ctx.encrypt(&mask, &sample);
+        mask0 = mask[0];
+    }
+    return buf[0] ^ (mask0 & 0x1f); // short header: mask bits 5-0
+}
+
 // ── QUIC packet decryption ────────────────────────────────────────────────────
 
 /// Decrypt a Handshake or 1-RTT packet payload.
@@ -375,6 +400,10 @@ pub const ConnState = struct {
     retry_token_len: usize = 0,
     hs_crypto_offset: u64 = 0,
 
+    // Set once client has seen the server's first Initial packet and has
+    // updated remote_cid to the server's SCID (RFC 9000 §7.2).
+    server_cid_confirmed: bool = false,
+
     // 1-RTT key phase tracking for key updates (RFC 9001 §6).
     // Tracks the current key phase bit for outgoing short-header packets.
     key_phase_bit: bool = false,
@@ -406,20 +435,27 @@ pub const ConnState = struct {
         self.init_keys = InitialSecrets.derive(dcid.slice());
     }
 
-    /// Derive Handshake and 1-RTT QUIC keys from TLS traffic secrets.
+    /// Derive Handshake QUIC keys from TLS handshake traffic secrets.
+    /// Call this after processServerHello (client) or processClientHello (server).
     pub fn deriveHandshakeKeys(self: *ConnState, secrets: *const tls_hs.TrafficSecrets) void {
         const hs_client_qkm = tls_hs.deriveQuicKeys(secrets.client_handshake);
         const hs_server_qkm = tls_hs.deriveQuicKeys(secrets.server_handshake);
+
+        self.hs_client_km = .{ .key = hs_client_qkm.key, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .secret = secrets.client_handshake };
+        self.hs_server_km = .{ .key = hs_server_qkm.key, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .secret = secrets.server_handshake };
+
+        self.has_hs_keys = true;
+    }
+
+    /// Derive 1-RTT QUIC keys from TLS application traffic secrets.
+    /// Call this after buildServerFlight (server) or processServerFlight (client).
+    pub fn deriveAppKeys(self: *ConnState, secrets: *const tls_hs.TrafficSecrets) void {
         const app_client_qkm = tls_hs.deriveQuicKeys(secrets.client_app);
         const app_server_qkm = tls_hs.deriveQuicKeys(secrets.server_app);
 
-        // Convert QuicKeyMaterial to KeyMaterial
-        self.hs_client_km = .{ .key = hs_client_qkm.key, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .secret = secrets.client_handshake };
-        self.hs_server_km = .{ .key = hs_server_qkm.key, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .secret = secrets.server_handshake };
         self.app_client_km = .{ .key = app_client_qkm.key, .iv = app_client_qkm.iv, .hp = app_client_qkm.hp, .secret = secrets.client_app };
         self.app_server_km = .{ .key = app_server_qkm.key, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .secret = secrets.server_app };
 
-        self.has_hs_keys = true;
         self.has_app_keys = true;
     }
 };
@@ -726,8 +762,7 @@ pub const Server = struct {
         };
         conn.sh_len = sh_len;
 
-        // Derive QUIC key material from TLS handshake secrets
-        // (secrets are now available after processClientHello)
+        // Handshake secrets are available; derive QUIC handshake keys.
         conn.deriveHandshakeKeys(&conn.tls.secrets);
 
         // Set cipher based on what was negotiated with the client.
@@ -746,7 +781,6 @@ pub const Server = struct {
         const quic_tp = tp_buf[0..tp_len];
 
         const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
-
         const flight_len = conn.tls.buildServerFlight(
             self.cert_der,
             &self.private_key,
@@ -758,6 +792,9 @@ pub const Server = struct {
             return;
         };
         conn.flight_len = flight_len;
+
+        // App secrets are now derived inside buildServerFlight; derive QUIC keys.
+        conn.deriveAppKeys(&conn.tls.secrets);
 
         // Send Initial packet with ServerHello CRYPTO frame
         self.sendInitialServerHello(conn, src);
@@ -997,16 +1034,17 @@ pub const Server = struct {
                 const candidate = ConnectionId.fromSlice(buf[1 .. 1 + cid_len]) catch continue;
                 if (!ConnectionId.eql(conn.local_cid, candidate)) continue;
 
-                // Detect peer-initiated key update via key phase bit flip.
-                const incoming_phase = (buf[0] & 0x04) != 0;
-                if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
-                    // Rotate receive keys to match the peer's new phase.
-                    conn.app_client_km = conn.app_client_km.nextGen();
-                }
-
                 // Try to decrypt with current client app keys.
                 var plaintext: [4096]u8 = undefined;
                 const pn_start = 1 + cid_len;
+
+                // Detect peer-initiated key update via the UNPROTECTED key phase bit.
+                // Must remove HP first before reading bit 2 (RFC 9001 §5.4.1).
+                const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &conn.app_client_km, conn.use_chacha20) orelse continue;
+                const incoming_phase = (unprotected_first & 0x04) != 0;
+                if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
+                    conn.app_client_km = conn.app_client_km.nextGen();
+                }
                 const pt_len = unprotect1RttPacket(
                     &plaintext,
                     buf,
@@ -1099,10 +1137,20 @@ pub const Server = struct {
     /// Encrypt and send a 1-RTT packet, selecting AES or ChaCha20 per conn.
     fn send1Rtt(self: *Server, conn: *ConnState, payload: []const u8, dst: std.net.Address) void {
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        // Header protection sampling (RFC 9001 §5.4.2) requires at least 3 bytes
+        // of plaintext (PN(1) + plaintext(n) + tag(16) >= pn_offset+4+16=pn_offset+20).
+        // Pad with PADDING frames (0x00) if needed.
+        var padded_payload_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const min_len: usize = 3;
+        const effective_payload: []const u8 = if (payload.len < min_len) blk: {
+            @memcpy(padded_payload_buf[0..payload.len], payload);
+            @memset(padded_payload_buf[payload.len..min_len], 0x00);
+            break :blk padded_payload_buf[0..min_len];
+        } else payload;
         const pkt_len = build1RttPacketFull(
             &send_buf,
             conn.remote_cid,
-            payload,
+            effective_payload,
             conn.app_pn,
             &conn.app_server_km,
             conn.key_phase_bit,
@@ -1144,7 +1192,7 @@ pub const Server = struct {
         const req = http09_server.parseRequest(req_buf[0..sf.data.len]) catch return;
 
         var path_buf: [512]u8 = undefined;
-        const fs_path = http09_server.resolvePath(req.path, &path_buf) catch return;
+        const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch return;
 
         const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
             std.debug.print("io: file not found: {s}\n", .{fs_path});
@@ -1229,7 +1277,7 @@ pub const Server = struct {
 
         // Serve the file
         var fs_path_buf: [512]u8 = undefined;
-        const fs_path = http09_server.resolvePath(path, &fs_path_buf) catch return;
+        const fs_path = http09_server.resolvePath(self.config.www_dir, path, &fs_path_buf) catch return;
 
         const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
             self.sendH3Response(conn, sf.stream_id, 404, &.{}, src);
@@ -1523,6 +1571,12 @@ pub const Client = struct {
         buf: []const u8,
     ) void {
         const ip = packet_mod.parseInitial(buf) catch return;
+        // RFC 9000 §7.2: When a client receives the first Initial from the server,
+        // it MUST update its DCID to the server's SCID for all subsequent packets.
+        if (!self.conn.server_cid_confirmed) {
+            self.conn.remote_cid = ip.scid;
+            self.conn.server_cid_confirmed = true;
+        }
         const init_km = self.conn.init_keys orelse return;
 
         var plaintext: [4096]u8 = undefined;
@@ -1532,17 +1586,42 @@ pub const Client = struct {
             ip.payload_offset,
             ip.payload_offset + ip.payload_len,
             &init_km.server,
-        ) catch return;
+        ) catch return; // bad packet
 
-        // Extract CRYPTO frames
+        // Extract CRYPTO frames, skipping ACK and PADDING frames.
         var pos: usize = 0;
         while (pos < pt_len) {
-            if (plaintext[pos] == 0x00) {
+            const ft = plaintext[pos];
+            if (ft == 0x00) { // PADDING
                 pos += 1;
                 continue;
             }
-            if (plaintext[pos] == 0x02 or plaintext[pos] == 0x03) break; // skip ACK
-            if (plaintext[pos] != 0x06) break;
+            if (ft == 0x02 or ft == 0x03) { // ACK — parse and skip
+                pos += 1; // type byte
+                const lar = varint.decode(plaintext[pos..]) catch break;
+                pos += lar.len;
+                const del = varint.decode(plaintext[pos..]) catch break;
+                pos += del.len;
+                const cnt = varint.decode(plaintext[pos..]) catch break;
+                pos += cnt.len;
+                const fst = varint.decode(plaintext[pos..]) catch break;
+                pos += fst.len;
+                var ri: u64 = 0;
+                while (ri < cnt.value) : (ri += 1) {
+                    const gp = varint.decode(plaintext[pos..]) catch break;
+                    pos += gp.len;
+                    const rl = varint.decode(plaintext[pos..]) catch break;
+                    pos += rl.len;
+                }
+                if (ft == 0x03) { // ECN counts (3 varints)
+                    inline for (0..3) |_| {
+                        const ec = varint.decode(plaintext[pos..]) catch break;
+                        pos += ec.len;
+                    }
+                }
+                continue;
+            }
+            if (ft != 0x06) break; // not a CRYPTO frame — stop
             pos += 1;
             const off_r = varint.decode(plaintext[pos..]) catch break;
             pos += off_r.len;
@@ -1598,7 +1677,7 @@ pub const Client = struct {
                 fpos += 1;
                 continue;
             }
-            if (plaintext[fpos] != 0x06) break;
+            if (plaintext[fpos] != 0x06) break; // skip non-CRYPTO (e.g. ACK)
             fpos += 1;
             const off_r = varint.decode(plaintext[fpos..]) catch break;
             fpos += off_r.len;
@@ -1617,6 +1696,8 @@ pub const Client = struct {
                 fpos += dlen;
                 continue;
             };
+            // App secrets are now derived; update QUIC 1-RTT keys.
+            self.conn.deriveAppKeys(&self.tls.secrets);
 
             // Send client Finished
             self.sendClientFinished(fin_buf[0..fin_len]);
@@ -1655,15 +1736,18 @@ pub const Client = struct {
         const cid_len = self.conn.local_cid.len;
         if (buf.len < 1 + cid_len) return;
 
-        // Detect key phase flip from server (key update initiated by server).
-        const incoming_phase = (buf[0] & 0x04) != 0;
+        var plaintext: [4096]u8 = undefined;
+        const pn_start = 1 + cid_len;
+
+        // Detect key phase flip from server using the UNPROTECTED header byte.
+        // The Key Phase bit (0x04) is masked by header protection, so we must
+        // remove HP first before reading it (RFC 9001 §5.4.1).
+        const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &self.conn.app_server_km, self.conn.use_chacha20) orelse return;
+        const incoming_phase = (unprotected_first & 0x04) != 0;
         if (incoming_phase != self.conn.peer_key_phase and !self.conn.key_update_pending) {
             // Server has rotated its send keys; rotate our receive keys to match.
             self.conn.app_server_km = self.conn.app_server_km.nextGen();
         }
-
-        var plaintext: [4096]u8 = undefined;
-        const pn_start = 1 + cid_len;
         const pt_len = unprotect1RttPacket(
             &plaintext,
             buf,
@@ -1839,7 +1923,7 @@ pub const Client = struct {
 
             // Open output file
             var dl_path_buf: [512]u8 = undefined;
-            const dl_path = http09_client.downloadPath(path, &dl_path_buf) catch continue;
+            const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
             const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
                 std.debug.print("io: cannot create {s}\n", .{dl_path});
                 continue;

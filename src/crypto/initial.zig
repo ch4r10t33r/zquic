@@ -68,8 +68,9 @@ pub fn protectInitialPacket(
     @memcpy(&sample, dst[sample_start .. sample_start + hp_sample_len]);
 
     const pn_bytes_slice = dst[pn_start .. pn_start + actual_pn_len];
-    // Long header: mask first byte with 0x0f (protect reserved bits and PN length)
-    aead.HeaderProtection.applyAes128(km.hp, sample, &dst[0], pn_bytes_slice, 0x0f);
+    // RFC 9001 §5.4.1: long headers mask bits 3-0 (0x0f), short headers mask bits 5-0 (0x1f).
+    const first_byte_mask: u8 = if (header[0] & 0x80 != 0) 0x0f else 0x1f;
+    aead.HeaderProtection.applyAes128(km.hp, sample, &dst[0], pn_bytes_slice, first_byte_mask);
 
     return pos;
 }

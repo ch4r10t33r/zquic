@@ -38,10 +38,10 @@ pub fn filenameFromPath(path: []const u8) []const u8 {
 
 /// Build the local download destination path for a given URL path.
 ///
-/// "/foo/bar.txt" → "/downloads/bar.txt"
-pub fn downloadPath(path: []const u8, buf: []u8) error{BufferTooSmall}![]u8 {
+/// dir="/downloads", path="/foo/bar.txt" → "/downloads/bar.txt"
+pub fn downloadPath(dir: []const u8, path: []const u8, buf: []u8) error{BufferTooSmall}![]u8 {
     const name = filenameFromPath(path);
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ downloads_root, name }) catch error.BufferTooSmall;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch error.BufferTooSmall;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +64,6 @@ test "http09 client: filenameFromPath" {
 
 test "http09 client: downloadPath" {
     var buf: [64]u8 = undefined;
-    const p = try downloadPath("/data/result.bin", &buf);
+    const p = try downloadPath("/downloads", "/data/result.bin", &buf);
     try std.testing.expectEqualSlices(u8, "/downloads/result.bin", p);
 }

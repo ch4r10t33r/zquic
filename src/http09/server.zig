@@ -48,14 +48,14 @@ pub fn parseRequest(data: []const u8) ParseError!Request {
     return Request{ .path = path };
 }
 
-/// Resolve a request path to a filesystem path under `www_root`.
+/// Resolve a request path to a filesystem path under `dir`.
 ///
 /// Security: Rejects paths containing `..` or `//` to prevent directory
 /// traversal.
-pub fn resolvePath(path: []const u8, buf: []u8) error{ PathTooLong, Unsafe }![]u8 {
+pub fn resolvePath(dir: []const u8, path: []const u8, buf: []u8) error{ PathTooLong, Unsafe }![]u8 {
     if (std.mem.indexOf(u8, path, "..") != null) return error.Unsafe;
     if (std.mem.indexOf(u8, path, "//") != null) return error.Unsafe;
-    const resolved = std.fmt.bufPrint(buf, "{s}{s}", .{ www_root, path }) catch return error.PathTooLong;
+    const resolved = std.fmt.bufPrint(buf, "{s}{s}", .{ dir, path }) catch return error.PathTooLong;
     return resolved;
 }
 
@@ -86,11 +86,11 @@ test "http09 server: not a GET" {
 
 test "http09 server: resolve path" {
     var buf: [256]u8 = undefined;
-    const resolved = try resolvePath("/hello.txt", &buf);
+    const resolved = try resolvePath("/www", "/hello.txt", &buf);
     try std.testing.expectEqualSlices(u8, "/www/hello.txt", resolved);
 }
 
 test "http09 server: reject path traversal" {
     var buf: [256]u8 = undefined;
-    try std.testing.expectError(error.Unsafe, resolvePath("/../etc/passwd", &buf));
+    try std.testing.expectError(error.Unsafe, resolvePath("/www", "/../etc/passwd", &buf));
 }
