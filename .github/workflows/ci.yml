@@ -188,7 +188,9 @@ jobs:
             --log-dir ../interop-results/logs \
             --json ../interop-results/results.json \
             --debug
-        continue-on-error: true
+        # run.py exits with nr_failed (0 = all passed). Do NOT use continue-on-error
+        # here — test failures must fail the job. The upload/summary steps below use
+        # if: always() so they still run even when this step fails.
 
       # Always upload results so we can track progress across commits.
       - name: Upload interop results
