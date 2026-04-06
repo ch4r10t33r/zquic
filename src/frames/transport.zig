@@ -135,10 +135,38 @@ pub const RetireConnectionId = struct {
 
 pub const PathChallenge = struct {
     data: [8]u8,
+
+    pub fn parse(buf: []const u8) error{BufferTooShort}!struct { frame: PathChallenge, consumed: usize } {
+        if (buf.len < 8) return error.BufferTooShort;
+        var d: [8]u8 = undefined;
+        @memcpy(&d, buf[0..8]);
+        return .{ .frame = .{ .data = d }, .consumed = 8 };
+    }
+
+    pub fn serialize(self: PathChallenge, buf: []u8) error{BufferTooShort}!usize {
+        if (buf.len < 9) return error.BufferTooShort;
+        buf[0] = 0x1a;
+        @memcpy(buf[1..9], &self.data);
+        return 9;
+    }
 };
 
 pub const PathResponse = struct {
     data: [8]u8,
+
+    pub fn parse(buf: []const u8) error{BufferTooShort}!struct { frame: PathResponse, consumed: usize } {
+        if (buf.len < 8) return error.BufferTooShort;
+        var d: [8]u8 = undefined;
+        @memcpy(&d, buf[0..8]);
+        return .{ .frame = .{ .data = d }, .consumed = 8 };
+    }
+
+    pub fn serialize(self: PathResponse, buf: []u8) error{BufferTooShort}!usize {
+        if (buf.len < 9) return error.BufferTooShort;
+        buf[0] = 0x1b;
+        @memcpy(buf[1..9], &self.data);
+        return 9;
+    }
 };
 
 pub const ConnectionClose = struct {

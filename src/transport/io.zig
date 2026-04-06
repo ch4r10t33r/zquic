@@ -30,6 +30,7 @@ const retry_mod = @import("../packet/retry.zig");
 const session_mod = @import("../crypto/session.zig");
 const h3_frame = @import("../http3/frame.zig");
 const h3_qpack = @import("../http3/qpack.zig");
+const transport_frames = @import("../frames/transport.zig");
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -180,6 +181,18 @@ pub fn buildHandshakePacket(
 }
 
 /// Build a 1-RTT (Short Header) packet.
+/// Compare two `std.net.Address` values for equality (address + port).
+fn addressEqual(a: std.net.Address, b: std.net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+    return switch (a.any.family) {
+        std.posix.AF.INET => a.in.sa.port == b.in.sa.port and
+            a.in.sa.addr == b.in.sa.addr,
+        std.posix.AF.INET6 => a.in6.sa.port == b.in6.sa.port and
+            std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr),
+        else => false,
+    };
+}
+
 pub fn build1RttPacket(
     out: []u8,
     dcid: ConnectionId,
@@ -340,6 +353,10 @@ pub const ConnState = struct {
     // Tracks the key phase bit seen in the last successfully decrypted
     // 1-RTT packet; used to detect peer-initiated key updates.
     peer_key_phase: bool = false,
+
+    // Connection migration (RFC 9000 §9): pending PATH_CHALLENGE data.
+    // Non-null while waiting for a PATH_RESPONSE from the new address.
+    path_challenge_data: ?[8]u8 = null,
 
     // TLS handshake state machine (server side)
     tls: ServerHandshake = undefined,
@@ -983,6 +1000,19 @@ pub const Server = struct {
     }
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
+        // Detect address change (connection migration, RFC 9000 §9).
+        // If the source address differs from the stored peer address and
+        // migration is enabled, send PATH_CHALLENGE to validate the new path.
+        if (self.config.migrate and conn.path_challenge_data == null) {
+            if (!addressEqual(conn.peer, src)) {
+                var challenge: [8]u8 = undefined;
+                var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+                prng.random().bytes(&challenge);
+                conn.path_challenge_data = challenge;
+                self.sendPathChallenge(conn, challenge, src);
+            }
+        }
+
         var pos: usize = 0;
         while (pos < frames.len) {
             const ft_r = varint.decode(frames[pos..]) catch return;
@@ -990,7 +1020,30 @@ pub const Server = struct {
             pos += ft_r.len;
 
             if (ft == 0x00) continue; // PADDING
-            if (ft == 0x01) return; // PING — no body
+            if (ft == 0x01) { // PING — no body, continue
+                continue;
+            }
+            if (ft == 0x1a) {
+                // PATH_CHALLENGE — echo data back as PATH_RESPONSE.
+                const pc = transport_frames.PathChallenge.parse(frames[pos..]) catch return;
+                pos += pc.consumed;
+                self.sendPathResponse(conn, pc.frame.data, src);
+                continue;
+            }
+            if (ft == 0x1b) {
+                // PATH_RESPONSE — validate against pending challenge.
+                const pr = transport_frames.PathResponse.parse(frames[pos..]) catch return;
+                pos += pr.consumed;
+                if (conn.path_challenge_data) |expected| {
+                    if (std.mem.eql(u8, &pr.frame.data, &expected)) {
+                        // Path validated — migrate to the new address.
+                        conn.peer = src;
+                        conn.path_challenge_data = null;
+                        std.debug.print("io: connection migrated to new address\n", .{});
+                    }
+                }
+                continue;
+            }
             if (ft >= 0x08 and ft <= 0x0f) {
                 // STREAM frame
                 const sf_r = stream_frame_mod.StreamFrame.parse(frames[pos..], ft) catch return;
@@ -1001,6 +1054,26 @@ pub const Server = struct {
             // Unknown frame — stop parsing
             return;
         }
+    }
+
+    /// Send a PATH_CHALLENGE frame to validate a new peer address.
+    fn sendPathChallenge(self: *Server, conn: *ConnState, data: [8]u8, dst: std.net.Address) void {
+        var frame_buf: [64]u8 = undefined;
+        const frame_len = transport_frames.PathChallenge.serialize(.{ .data = data }, &frame_buf) catch return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacket(&send_buf, conn.remote_cid, frame_buf[0..frame_len], conn.app_pn, &conn.app_server_km) catch return;
+        conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch {};
+    }
+
+    /// Send a PATH_RESPONSE echoing the challenge data back to the sender.
+    fn sendPathResponse(self: *Server, conn: *ConnState, data: [8]u8, dst: std.net.Address) void {
+        var frame_buf: [64]u8 = undefined;
+        const frame_len = transport_frames.PathResponse.serialize(.{ .data = data }, &frame_buf) catch return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacket(&send_buf, conn.remote_cid, frame_buf[0..frame_len], conn.app_pn, &conn.app_server_km) catch return;
+        conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch {};
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
@@ -1578,6 +1651,7 @@ pub const Client = struct {
             pos += ft_r.len;
 
             if (ft == 0x00) continue; // PADDING
+            if (ft == 0x01) continue; // PING — no body
             if (ft == 0x1e) { // HANDSHAKE_DONE
                 std.debug.print("io: client received HANDSHAKE_DONE\n", .{});
                 self.conn.phase = .connected;
@@ -1593,6 +1667,25 @@ pub const Client = struct {
                 if (pos + dlen > pt_len) return;
                 self.handleAppCrypto(plaintext[pos .. pos + dlen]);
                 pos += dlen;
+                continue;
+            }
+            if (ft == 0x1a) {
+                // PATH_CHALLENGE — respond with PATH_RESPONSE.
+                const pc = transport_frames.PathChallenge.parse(plaintext[pos..]) catch return;
+                pos += pc.consumed;
+                self.sendClientPathResponse(pc.frame.data);
+                continue;
+            }
+            if (ft == 0x1b) {
+                // PATH_RESPONSE — validate pending challenge.
+                const pr = transport_frames.PathResponse.parse(plaintext[pos..]) catch return;
+                pos += pr.consumed;
+                if (self.conn.path_challenge_data) |expected| {
+                    if (std.mem.eql(u8, &pr.frame.data, &expected)) {
+                        self.conn.path_challenge_data = null;
+                        std.debug.print("io: client path validated\n", .{});
+                    }
+                }
                 continue;
             }
             if (ft >= 0x08 and ft <= 0x0f) {
@@ -1653,6 +1746,16 @@ pub const Client = struct {
         };
         self.ticket_store.store(ticket);
         std.debug.print("io: stored session ticket (lifetime={}s)\n", .{lifetime_s});
+    }
+
+    /// Respond to a server-sent PATH_CHALLENGE with a matching PATH_RESPONSE.
+    fn sendClientPathResponse(self: *Client, data: [8]u8) void {
+        var frame_buf: [64]u8 = undefined;
+        const frame_len = transport_frames.PathResponse.serialize(.{ .data = data }, &frame_buf) catch return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacket(&send_buf, self.conn.remote_cid, frame_buf[0..frame_len], self.conn.app_pn, &self.conn.app_client_km) catch return;
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
     }
 
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
