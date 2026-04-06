@@ -67,6 +67,13 @@ case "${TESTCASE}" in
 esac
 
 if [[ "${ROLE}" == "server" ]]; then
+    # Disable reverse-path filtering so we can receive packets routed through
+    # the network simulator (source IP is on a different subnet than our NIC).
+    sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+    sysctl -w net.ipv4.conf.eth0.rp_filter=0 2>/dev/null || true
+    # Add a route for the client subnet via the sim's rightnet gateway so
+    # our UDP responses are sent back through the sim (not dropped).
+    ip route add 193.167.0.0/24 via 193.167.100.2 2>/dev/null || true
     exec zquic-server \
         --port 443 \
         --keylog "${SSLKEYLOGFILE}" \

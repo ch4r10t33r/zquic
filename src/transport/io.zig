@@ -542,8 +542,27 @@ pub const Server = struct {
     /// Run the server event loop (blocking).
     pub fn run(self: *Server) !void {
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        var idle_secs: u32 = 0;
 
         while (true) {
+            // Use poll with 2s timeout so we can print heartbeat messages when
+            // no packets arrive (helps diagnose CI networking issues).
+            var fds = [1]std.posix.pollfd{.{
+                .fd = self.sock,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&fds, 2000) catch |err| {
+                std.debug.print("io: poll error: {}\n", .{err});
+                continue;
+            };
+            if (ready == 0) {
+                idle_secs += 2;
+                std.debug.print("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
+                continue;
+            }
+            idle_secs = 0;
+
             var src_addr: std.posix.sockaddr.storage = undefined;
             var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
             const n = std.posix.recvfrom(
@@ -556,6 +575,7 @@ pub const Server = struct {
                 std.debug.print("io: recvfrom error: {}\n", .{err});
                 continue;
             };
+            std.debug.print("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
 
             const src = std.net.Address{ .any = @as(*const std.posix.sockaddr, @ptrCast(&src_addr)).* };
             self.processPacket(recv_buf[0..n], src);
@@ -564,27 +584,42 @@ pub const Server = struct {
 
     /// Dispatch a received UDP datagram.
     fn processPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
-        std.debug.print("io: server recv {} bytes from {any}\n", .{ buf.len, src });
+        const src_ip = src.any.data[2..6];
+        std.debug.print("io: server recv {} bytes first_byte=0x{x:0>2} src_ip={}.{}.{}.{}\n", .{
+            buf.len,   if (buf.len > 0) buf[0] else 0,
+            src_ip[0], src_ip[1],
+            src_ip[2], src_ip[3],
+        });
         if (buf.len < 5) return;
 
         // Version Negotiation: first byte 0x80, version = 0
         if (buf[0] & 0x80 != 0 and buf.len >= 5 and
             buf[1] == 0 and buf[2] == 0 and buf[3] == 0 and buf[4] == 0)
         {
+            std.debug.print("io: server discard VN packet\n", .{});
             return; // discard
         }
 
         if (buf[0] & 0x80 != 0) {
             // Long header
-            const lh = header_mod.parseLong(buf) catch return;
+            const version: u32 = (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 8) | buf[4];
+            std.debug.print("io: server long header version=0x{x:0>8}\n", .{version});
+            const lh = header_mod.parseLong(buf) catch |err| {
+                std.debug.print("io: server parseLong failed: {}\n", .{err});
+                return;
+            };
             // RFC 9000 §6.1: respond with Version Negotiation for any
             // unsupported version so that readiness probes (wait-for-it-quic
             // sends version 0x57415449 "WAIT") get a proper reply and do not
             // consume connection slots.
             if (lh.header.version != version_neg_mod.QUIC_V1) {
+                std.debug.print("io: server sendVersionNegotiation to {}.{}.{}.{}\n", .{
+                    src_ip[0], src_ip[1], src_ip[2], src_ip[3],
+                });
                 self.sendVersionNegotiation(lh.header.scid.slice(), lh.header.dcid.slice(), src);
                 return;
             }
+            std.debug.print("io: server pkt_type={any}\n", .{lh.header.packet_type});
             switch (lh.header.packet_type) {
                 .initial => self.processInitialPacket(buf, src),
                 .handshake => self.processHandshakePacket(buf, src),
@@ -595,6 +630,7 @@ pub const Server = struct {
             // Short (1-RTT) header
             self.process1RttPacket(buf, src);
         }
+        std.debug.print("io: server processPacket done\n", .{});
     }
 
     /// Find an existing connection by DCID.
