@@ -14,6 +14,11 @@ pub const packet = struct {
     pub const number = @import("packet/number.zig");
     pub const pkt = @import("packet/packet.zig");
 };
+pub const crypto = struct {
+    pub const keys = @import("crypto/keys.zig");
+    pub const aead = @import("crypto/aead.zig");
+    pub const initial = @import("crypto/initial.zig");
+};
 
 test {
     _ = @import("varint.zig");
@@ -21,4 +26,7 @@ test {
     _ = @import("packet/header.zig");
     _ = @import("packet/number.zig");
     _ = @import("packet/packet.zig");
+    _ = @import("crypto/keys.zig");
+    _ = @import("crypto/aead.zig");
+    _ = @import("crypto/initial.zig");
 }
