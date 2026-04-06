@@ -41,20 +41,34 @@ jobs:
   interop-image:
     name: Interop Docker Image
     runs-on: ubuntu-latest
-    # Only build the Docker image on pushes to master and on PRs to master
-    # to keep CI fast on feature branches.
+    # Only build the Docker image on pushes to master and on PRs to master.
     if: github.ref == 'refs/heads/master' || github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
+      # Build the Zig binaries on the runner (avoids downloading Zig inside
+      # the Docker build context, which fails when ziglang.org blocks or when
+      # the version is still a dev build).
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.0"
+
+      - name: Build release binaries
+        run: zig build -Doptimize=ReleaseFast
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Pass PREBUILT=1 so the Dockerfile skips the Zig download stage and
+      # copies the pre-built binaries from zig-out/ directly.
       - name: Build interop image (no push)
         uses: docker/build-push-action@v5
         with:
           context: .
           file: interop/Dockerfile
+          build-args: |
+            PREBUILT=1
           push: false
           tags: zquic-interop:ci
           cache-from: type=gha
