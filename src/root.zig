@@ -34,6 +34,10 @@ pub const transport = struct {
     pub const flow_control = @import("transport/flow_control.zig");
     pub const stream_manager = @import("transport/stream_manager.zig");
 };
+pub const http09 = struct {
+    pub const server = @import("http09/server.zig");
+    pub const client = @import("http09/client.zig");
+};
 pub const frames = struct {
     pub const frame = @import("frames/frame.zig");
     pub const ack = @import("frames/ack.zig");
@@ -62,6 +66,8 @@ test {
     _ = @import("transport/endpoint.zig");
     _ = @import("transport/flow_control.zig");
     _ = @import("transport/stream_manager.zig");
+    _ = @import("http09/server.zig");
+    _ = @import("http09/client.zig");
     _ = @import("frames/frame.zig");
     _ = @import("frames/ack.zig");
     _ = @import("frames/crypto_frame.zig");
