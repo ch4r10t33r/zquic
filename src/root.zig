@@ -20,6 +20,10 @@ pub const crypto = struct {
     pub const initial = @import("crypto/initial.zig");
     pub const quic_tls = @import("crypto/quic_tls.zig");
 };
+pub const loss = struct {
+    pub const recovery = @import("loss/recovery.zig");
+    pub const congestion = @import("loss/congestion.zig");
+};
 pub const transport = struct {
     pub const connection = @import("transport/connection.zig");
     pub const endpoint = @import("transport/endpoint.zig");
@@ -44,6 +48,8 @@ test {
     _ = @import("crypto/aead.zig");
     _ = @import("crypto/initial.zig");
     _ = @import("crypto/quic_tls.zig");
+    _ = @import("loss/recovery.zig");
+    _ = @import("loss/congestion.zig");
     _ = @import("transport/connection.zig");
     _ = @import("transport/endpoint.zig");
     _ = @import("transport/flow_control.zig");
