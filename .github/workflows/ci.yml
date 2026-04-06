@@ -157,7 +157,7 @@ jobs:
       # partial results are useful even if later cases time out.
       - name: Run interop test suite
         run: |
-          mkdir -p interop-results/logs
+          mkdir -p interop-results
           cd quic-interop-runner
           python3 run.py \
             --client zquic \
