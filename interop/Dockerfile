@@ -41,6 +41,9 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        ethtool \
+        iproute2 \
+        net-tools \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/zig-out/bin/server /usr/local/bin/zquic-server
