@@ -14,6 +14,8 @@ const varint = @import("../varint.zig");
 const frames = @import("../frames/frame.zig");
 const crypto_keys = @import("../crypto/keys.zig");
 const quic_tls = @import("../crypto/quic_tls.zig");
+const retry_mod = @import("../packet/retry.zig");
+const version_neg = @import("../packet/version_negotiation.zig");
 
 pub const ConnectionId = types.ConnectionId;
 pub const TransportError = types.TransportError;
@@ -159,6 +161,15 @@ pub const Connection = struct {
     /// Close error, if any.
     close_error: ?TransportError = null,
 
+    /// Retry token received from server (client-side only).
+    /// Used in the client's retry-response Initial packet.
+    retry_token: ?[256]u8 = null,
+    retry_token_len: usize = 0,
+
+    /// Original Destination Connection ID (ODCID) – set on client when
+    /// a Retry is received so the client can verify the Retry integrity tag.
+    original_dcid: ?ConnectionId = null,
+
     /// Statistics.
     stats: Stats = .{},
 
@@ -207,6 +218,81 @@ pub const Connection = struct {
         self.close_error = err;
         self.state = .draining;
     }
+
+    /// Handle a received Retry packet (client-side only).
+    ///
+    /// Verifies the Retry integrity tag using the ODCID. On success the
+    /// client must restart the handshake:
+    /// - Replace the remote CID with the SCID from the Retry packet.
+    /// - Store the retry token for inclusion in the next Initial packet.
+    /// - Reset packet number space back to 0.
+    /// - Re-derive initial keys with the new remote CID.
+    ///
+    /// Returns an error if:
+    /// - Called on a server-role connection
+    /// - The integrity tag is invalid
+    /// - A Retry was already processed for this connection
+    pub fn handleRetry(
+        self: *Connection,
+        scid: []const u8,
+        token: []const u8,
+        retry_packet_with_tag: []const u8,
+    ) error{ WrongRole, InvalidRetryTag, AlreadyRetried, TooLong }!void {
+        if (self.role != .client) return error.WrongRole;
+        if (self.original_dcid != null) return error.AlreadyRetried;
+
+        // Save ODCID before overwriting remote_cid.
+        self.original_dcid = self.remote_cid;
+
+        // Verify integrity tag using ODCID.
+        const odcid_slice = self.original_dcid.?.slice();
+        if (!retry_mod.verifyIntegrityTag(odcid_slice, retry_packet_with_tag)) {
+            self.original_dcid = null; // Roll back.
+            return error.InvalidRetryTag;
+        }
+
+        // Store retry token.
+        if (token.len > self.retry_token.?.len) return error.TooLong;
+        self.retry_token = [_]u8{0} ** 256;
+        @memcpy(self.retry_token.?[0..token.len], token);
+        self.retry_token_len = token.len;
+
+        // Update remote CID and re-derive Initial keys with the new SCID.
+        self.remote_cid = try ConnectionId.fromSlice(scid);
+        self.deriveInitialKeys(self.remote_cid);
+
+        // Reset Initial packet number space.
+        self.initial_pn = .{};
+        self.initial_ack = .{};
+    }
+
+    /// Handle a received Version Negotiation packet (client-side only).
+    ///
+    /// Returns the list of server-supported versions so the caller can decide
+    /// whether to retry with a different version or close.
+    ///
+    /// Returns error.WrongRole for server connections.
+    /// Returns error.NoCommonVersion if QUIC v1 is absent from the list.
+    pub fn handleVersionNegotiation(
+        self: *Connection,
+        vn_packet: []const u8,
+    ) error{ WrongRole, NoCommonVersion, ParseError }!void {
+        if (self.role != .client) return error.WrongRole;
+        const pkt = version_neg.parse(vn_packet) catch return error.ParseError;
+        var it = pkt.versions();
+        while (it.next()) |v| {
+            if (v == version_neg.QUIC_V1) {
+                // We already support this version; the server should be able to
+                // handle our packets.  In a real implementation the client would
+                // retry the connection with this version.  For now we just
+                // acknowledge that v1 is supported.
+                return;
+            }
+        }
+        // No common version — close the connection.
+        self.closeWithError(.protocol_violation);
+        return error.NoCommonVersion;
+    }
 };
 
 test "connection: state machine transitions" {
@@ -250,6 +336,92 @@ test "connection: initial key derivation" {
     try testing.expect(conn.initial_keys != null);
     const expected_key = "\x1f\x36\x96\x13\xdd\x76\xd5\x46\x77\x30\xef\xcb\xe3\xb1\xa2\x2d";
     try testing.expectEqualSlices(u8, expected_key, &conn.initial_keys.?.client.key);
+}
+
+test "connection: handle retry packet" {
+    const testing = std.testing;
+
+    const dcid_bytes = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const dcid = try ConnectionId.fromSlice(&dcid_bytes);
+    const scid_bytes = [_]u8{ 0x01, 0x02 };
+    const scid = try ConnectionId.fromSlice(&scid_bytes);
+    var conn = Connection.init(.client, scid, dcid);
+    conn.deriveInitialKeys(dcid);
+    conn.retry_token = [_]u8{0} ** 256;
+
+    const new_scid = [_]u8{ 0xaa, 0xbb };
+    const token = "retry-token";
+
+    // Build a valid Retry packet.
+    var retry_buf: [256]u8 = undefined;
+    const retry_written = try retry_mod.buildRetryPacket(
+        &retry_buf,
+        0x00000001,
+        &[_]u8{ 0x10, 0x11 }, // dcid echoed to client
+        &new_scid,
+        token,
+        &dcid_bytes, // odcid
+    );
+
+    try conn.handleRetry(&new_scid, token, retry_buf[0..retry_written]);
+
+    // After Retry, remote_cid should be updated.
+    try testing.expectEqualSlices(u8, &new_scid, conn.remote_cid.slice());
+    // ODCID should be stored.
+    try testing.expectEqualSlices(u8, &dcid_bytes, conn.original_dcid.?.slice());
+    // Token stored.
+    try testing.expectEqualSlices(u8, token, conn.retry_token.?[0..conn.retry_token_len]);
+    // Initial PN reset.
+    try testing.expectEqual(@as(u64, 0), conn.initial_pn.next_pn);
+}
+
+test "connection: handle retry with bad tag" {
+    const dcid_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const dcid = try ConnectionId.fromSlice(&dcid_bytes);
+    const scid = try ConnectionId.fromSlice(&[_]u8{0x10});
+    var conn = Connection.init(.client, scid, dcid);
+    conn.retry_token = [_]u8{0} ** 256;
+
+    // Build a Retry packet with a wrong ODCID so the tag check fails.
+    const wrong_odcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    var retry_buf: [128]u8 = undefined;
+    const retry_written = try retry_mod.buildRetryPacket(
+        &retry_buf,
+        0x00000001,
+        &[_]u8{0x05},
+        &[_]u8{0x06},
+        "token",
+        &wrong_odcid, // deliberately wrong
+    );
+
+    const result = conn.handleRetry(&[_]u8{0x06}, "token", retry_buf[0..retry_written]);
+    try std.testing.expectError(error.InvalidRetryTag, result);
+}
+
+test "connection: version negotiation common version" {
+    const testing = std.testing;
+    const dcid = try ConnectionId.fromSlice(&[_]u8{0x01});
+    const scid = try ConnectionId.fromSlice(&[_]u8{0x02});
+    var conn = Connection.init(.client, scid, dcid);
+
+    var buf: [32]u8 = undefined;
+    const written = try version_neg.build(&buf, &[_]u8{0x01}, &[_]u8{0x02}, &[_]u32{ version_neg.QUIC_V1, 0xfaceb002 });
+    try conn.handleVersionNegotiation(buf[0..written]);
+    // Still initial state – a common version was found.
+    try testing.expectEqual(State.initial, conn.state);
+}
+
+test "connection: version negotiation no common version" {
+    const dcid = try ConnectionId.fromSlice(&[_]u8{0x01});
+    const scid = try ConnectionId.fromSlice(&[_]u8{0x02});
+    var conn = Connection.init(.client, scid, dcid);
+
+    var buf: [32]u8 = undefined;
+    const written = try version_neg.build(&buf, &[_]u8{0x01}, &[_]u8{0x02}, &[_]u32{0xfaceb002});
+    const result = conn.handleVersionNegotiation(buf[0..written]);
+    try std.testing.expectError(error.NoCommonVersion, result);
+    // Connection should be draining.
+    try std.testing.expectEqual(State.draining, conn.state);
 }
 
 test "ack_manager: single packet observation" {
