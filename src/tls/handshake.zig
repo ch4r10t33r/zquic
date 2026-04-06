@@ -1,0 +1,982 @@
+//! QUIC-specific TLS 1.3 handshake (RFC 9001 §4).
+//!
+//! QUIC replaces the TLS record layer with QUIC CRYPTO frames. This module
+//! implements TLS 1.3 handshake message parsing and building for QUIC — no
+//! TLS record headers, no TLS-level AEAD. QUIC packet encryption provides
+//! the confidentiality that TLS records would normally provide.
+//!
+//! Key schedule follows RFC 8446 §7.1:
+//!
+//!   early_secret     = HKDF-Extract("", 0)
+//!   handshake_secret = HKDF-Extract(derive(early_secret), ecdhe_shared_key)
+//!   master_secret    = HKDF-Extract(derive(handshake_secret), 0)
+//!   traffic secrets  = HKDF-Expand-Label(secret, label, hash, 32)
+//!
+//! QUIC key derivation follows RFC 9001 §5.1:
+//!
+//!   quic_key = HKDF-Expand-Label(traffic_secret, "quic key", "", key_len)
+//!   quic_iv  = HKDF-Expand-Label(traffic_secret, "quic iv",  "", iv_len)
+//!   quic_hp  = HKDF-Expand-Label(traffic_secret, "quic hp",  "", key_len)
+
+const std = @import("std");
+const crypto = std.crypto;
+const keys_mod = @import("../crypto/keys.zig");
+const tls_vendor = @import("tls");
+
+const Sha256 = crypto.hash.sha2.Sha256;
+const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
+const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
+const X25519 = crypto.dh.X25519;
+const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
+const EcdsaP384Sha384 = crypto.sign.ecdsa.EcdsaP384Sha384;
+
+// TLS 1.3 handshake message types
+pub const MSG_CLIENT_HELLO: u8 = 0x01;
+pub const MSG_SERVER_HELLO: u8 = 0x02;
+pub const MSG_NEW_SESSION_TICKET: u8 = 0x04;
+pub const MSG_ENCRYPTED_EXTENSIONS: u8 = 0x08;
+pub const MSG_CERTIFICATE: u8 = 0x0b;
+pub const MSG_CERTIFICATE_VERIFY: u8 = 0x0f;
+pub const MSG_FINISHED: u8 = 0x14;
+
+// TLS extension types
+pub const EXT_SERVER_NAME: u16 = 0x0000;
+pub const EXT_ALPN: u16 = 0x0010;
+pub const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
+pub const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+pub const EXT_KEY_SHARE: u16 = 0x0033;
+pub const EXT_QUIC_TRANSPORT_PARAMS: u16 = 0xffa5;
+
+// TLS cipher suites
+pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+pub const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+pub const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+
+// Named groups
+pub const GROUP_X25519: u16 = 0x001d;
+pub const GROUP_SECP256R1: u16 = 0x0017;
+
+// TLS version
+pub const TLS_VERSION_13: u16 = 0x0304;
+pub const TLS_LEGACY_VERSION: u16 = 0x0303;
+
+// TLS 1.3 signature schemes
+pub const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+pub const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503;
+pub const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+
+// ALPN for HTTP/3
+pub const ALPN_H3 = "h3";
+pub const ALPN_H09 = "hq-interop";
+
+/// TLS 1.3 traffic secrets for QUIC key derivation.
+pub const TrafficSecrets = struct {
+    client_handshake: [32]u8 = [_]u8{0} ** 32,
+    server_handshake: [32]u8 = [_]u8{0} ** 32,
+    client_app: [32]u8 = [_]u8{0} ** 32,
+    server_app: [32]u8 = [_]u8{0} ** 32,
+};
+
+/// Fields from ClientHello relevant to QUIC handshake.
+pub const ClientHelloData = struct {
+    random: [32]u8 = [_]u8{0} ** 32,
+    session_id: [32]u8 = [_]u8{0} ** 32,
+    session_id_len: u8 = 0,
+    x25519_key: ?[32]u8 = null,
+    cipher_suite: u16 = TLS_AES_128_GCM_SHA256,
+    quic_transport_params: ?struct { offset: usize, len: usize } = null,
+    alpn_h3: bool = false,
+    alpn_h09: bool = false,
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn readU16(b: []const u8) u16 {
+    return std.mem.readInt(u16, b[0..2], .big);
+}
+
+fn readU24(b: []const u8) u32 {
+    return (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | @as(u32, b[2]);
+}
+
+fn writeU16(b: []u8, v: u16) void {
+    std.mem.writeInt(u16, b[0..2], v, .big);
+}
+
+fn writeU24(b: []u8, v: u32) void {
+    b[0] = @truncate(v >> 16);
+    b[1] = @truncate(v >> 8);
+    b[2] = @truncate(v);
+}
+
+/// Copy bytes into `out[pos..]`, return new pos.
+fn put(out: []u8, pos: usize, data: []const u8) usize {
+    @memcpy(out[pos .. pos + data.len], data);
+    return pos + data.len;
+}
+
+/// Write a TLS handshake message header: type(1) + length(3).
+fn writeHsMsgHeader(out: []u8, pos: usize, msg_type: u8, body_len: usize) usize {
+    out[pos] = msg_type;
+    writeU24(out[pos + 1 ..], @intCast(body_len));
+    return pos + 4;
+}
+
+/// Peek the SHA-256 transcript hash without consuming the state.
+pub fn peekHash(h: Sha256) [32]u8 {
+    var copy = h;
+    var out: [32]u8 = undefined;
+    copy.final(&out);
+    return out;
+}
+
+// ── TLS 1.3 key schedule ────────────────────────────────────────────────────
+
+/// Derive one step of the TLS 1.3 key schedule: expand "derived" then extract.
+fn deriveNextSecret(prev_secret: [32]u8, ikm: []const u8) [32]u8 {
+    var empty_hash: [32]u8 = undefined;
+    Sha256.hash("", &empty_hash, .{});
+    var derived: [32]u8 = undefined;
+    keys_mod.hkdfExpandLabel(&derived, &prev_secret, "derived", &empty_hash);
+    return HkdfSha256.extract(&derived, ikm);
+}
+
+/// Derive a traffic secret: HKDF-Expand-Label(secret, label, hash, 32).
+fn deriveTrafficSecret(secret: [32]u8, label: []const u8, hash: *const [32]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    keys_mod.hkdfExpandLabel(&out, &secret, label, hash);
+    return out;
+}
+
+/// Derive the handshake_secret from the ECDHE shared key.
+fn deriveHandshakeSecret(ecdhe_shared_key: [32]u8) [32]u8 {
+    const zeroes = [_]u8{0} ** 32;
+    const early_secret = HkdfSha256.extract(&[_]u8{0}, &zeroes);
+    return deriveNextSecret(early_secret, &ecdhe_shared_key);
+}
+
+/// Derive the master_secret from handshake_secret.
+fn deriveMasterSecret(hs_secret: [32]u8) [32]u8 {
+    const zeroes = [_]u8{0} ** 32;
+    return deriveNextSecret(hs_secret, &zeroes);
+}
+
+/// Compute the Finished verify_data: HMAC-SHA256(finished_key, transcript_hash).
+fn computeFinishedVerifyData(traffic_secret: [32]u8, transcript_hash: *const [32]u8) [32]u8 {
+    var finished_key: [32]u8 = undefined;
+    keys_mod.hkdfExpandLabel(&finished_key, &traffic_secret, "finished", "");
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, transcript_hash, &finished_key);
+    return mac;
+}
+
+// ── ClientHello parser ───────────────────────────────────────────────────────
+
+pub const ParseError = error{
+    TruncatedMessage,
+    BadMessageType,
+    BadVersion,
+    UnsupportedCipherSuites,
+    NoKeyShare,
+};
+
+/// Parse a raw ClientHello message (no record header).
+/// The caller retains ownership of `data`; `result.quic_transport_params` holds
+/// byte offsets into `data` if present.
+pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
+    if (data.len < 4) return error.TruncatedMessage;
+    if (data[0] != MSG_CLIENT_HELLO) return error.BadMessageType;
+
+    const body_len = readU24(data[1..4]);
+    if (data.len < 4 + body_len) return error.TruncatedMessage;
+    const body = data[4 .. 4 + body_len];
+    var p: usize = 0;
+
+    // legacy_version (2)
+    if (body.len < p + 2) return error.TruncatedMessage;
+    p += 2;
+
+    // random (32)
+    if (body.len < p + 32) return error.TruncatedMessage;
+    var result = ClientHelloData{};
+    @memcpy(&result.random, body[p .. p + 32]);
+    p += 32;
+
+    // legacy_session_id
+    if (body.len < p + 1) return error.TruncatedMessage;
+    const sid_len = body[p];
+    p += 1;
+    if (sid_len > 32 or body.len < p + sid_len) return error.TruncatedMessage;
+    result.session_id_len = sid_len;
+    if (sid_len > 0) @memcpy(result.session_id[0..sid_len], body[p .. p + sid_len]);
+    p += sid_len;
+
+    // cipher_suites
+    if (body.len < p + 2) return error.TruncatedMessage;
+    const cs_len = readU16(body[p..]);
+    p += 2;
+    if (body.len < p + cs_len) return error.TruncatedMessage;
+    var preferred: u16 = 0;
+    var i: usize = 0;
+    while (i + 1 < cs_len) : (i += 2) {
+        const cs = readU16(body[p + i ..]);
+        if (preferred == 0 and (cs == TLS_AES_128_GCM_SHA256 or
+            cs == TLS_AES_256_GCM_SHA384 or
+            cs == TLS_CHACHA20_POLY1305_SHA256))
+        {
+            preferred = cs;
+        }
+    }
+    if (preferred == 0) return error.UnsupportedCipherSuites;
+    result.cipher_suite = preferred;
+    p += cs_len;
+
+    // compression methods
+    if (body.len < p + 1) return error.TruncatedMessage;
+    const comp_len = body[p];
+    p += 1 + comp_len;
+
+    // extensions
+    if (body.len < p + 2) return error.TruncatedMessage;
+    const ext_total = readU16(body[p..]);
+    p += 2;
+    const ext_end = p + ext_total;
+    if (body.len < ext_end) return error.TruncatedMessage;
+
+    while (p + 4 <= ext_end) {
+        const ext_type = readU16(body[p..]);
+        const ext_len = readU16(body[p + 2 ..]);
+        p += 4;
+        if (p + ext_len > ext_end) break;
+        const ext_data = body[p .. p + ext_len];
+
+        switch (ext_type) {
+            EXT_KEY_SHARE => {
+                // key_share list: u16 total_len, then entries: u16 group, u16 key_len, key
+                if (ext_data.len >= 2) {
+                    const list_len = readU16(ext_data);
+                    var kp: usize = 2;
+                    while (kp + 4 <= 2 + list_len and kp + 4 <= ext_data.len) {
+                        const group = readU16(ext_data[kp..]);
+                        const klen = readU16(ext_data[kp + 2 ..]);
+                        kp += 4;
+                        if (kp + klen > ext_data.len) break;
+                        if (group == GROUP_X25519 and klen == 32) {
+                            result.x25519_key = ext_data[kp..][0..32].*;
+                        }
+                        kp += klen;
+                    }
+                }
+            },
+            EXT_QUIC_TRANSPORT_PARAMS => {
+                // Store offset into original data slice
+                const offset = (data.ptr + 4 + @as(usize, @intCast(body_len - (body.len - p)))) - data.ptr;
+                result.quic_transport_params = .{ .offset = offset, .len = ext_len };
+            },
+            EXT_ALPN => {
+                // u16 list_len, then u8 proto_len, proto
+                if (ext_data.len >= 2) {
+                    var ap: usize = 2;
+                    while (ap + 1 <= ext_data.len) {
+                        const plen = ext_data[ap];
+                        ap += 1;
+                        if (ap + plen > ext_data.len) break;
+                        const proto = ext_data[ap .. ap + plen];
+                        if (std.mem.eql(u8, proto, ALPN_H3)) result.alpn_h3 = true;
+                        if (std.mem.eql(u8, proto, ALPN_H09)) result.alpn_h09 = true;
+                        ap += plen;
+                    }
+                }
+            },
+            else => {},
+        }
+        p += ext_len;
+    }
+
+    if (result.x25519_key == null) return error.NoKeyShare;
+    return result;
+}
+
+// ── ServerHello builder ──────────────────────────────────────────────────────
+
+/// Build a TLS 1.3 ServerHello message (raw, no record header).
+/// Returns bytes written to `out`.
+pub fn buildServerHello(
+    out: []u8,
+    session_id: []const u8,
+    cipher_suite: u16,
+    server_x25519_pub: *const [32]u8,
+) !usize {
+    // Body: version(2) + random(32) + sid_len(1) + sid + cs(2) + comp(1) + exts
+    const server_random = blk: {
+        var r: [32]u8 = undefined;
+        crypto.random.bytes(&r);
+        break :blk r;
+    };
+
+    // Build extensions:
+    //   supported_versions: type(2)+len(2)+data(2+2) = total data = 2 bytes of TLS_VERSION_13
+    //   key_share: type(2)+len(2)+group(2)+key_len(2)+key(32) = 4+2+2+32 = 40 bytes total header+data
+    var ext_buf: [128]u8 = undefined;
+    var ep: usize = 0;
+    // supported_versions
+    writeU16(ext_buf[ep..], EXT_SUPPORTED_VERSIONS);
+    ep += 2;
+    writeU16(ext_buf[ep..], 2); // ext data length = 2
+    ep += 2;
+    writeU16(ext_buf[ep..], TLS_VERSION_13);
+    ep += 2;
+    // key_share: group(2) + key_len(2) + key(32) = 36 bytes of data
+    writeU16(ext_buf[ep..], EXT_KEY_SHARE);
+    ep += 2;
+    writeU16(ext_buf[ep..], 36); // ext data length
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+    writeU16(ext_buf[ep..], 32);
+    ep += 2;
+    @memcpy(ext_buf[ep .. ep + 32], server_x25519_pub);
+    ep += 32;
+
+    const body_len = 2 + 32 + 1 + session_id.len + 2 + 1 + 2 + ep;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_SERVER_HELLO, body_len);
+    // legacy_version = 0x0303
+    writeU16(out[pos..], TLS_LEGACY_VERSION);
+    pos += 2;
+    // random
+    @memcpy(out[pos .. pos + 32], &server_random);
+    pos += 32;
+    // session_id
+    out[pos] = @intCast(session_id.len);
+    pos += 1;
+    if (session_id.len > 0) {
+        @memcpy(out[pos .. pos + session_id.len], session_id);
+        pos += session_id.len;
+    }
+    // cipher_suite
+    writeU16(out[pos..], cipher_suite);
+    pos += 2;
+    // compression = 0
+    out[pos] = 0;
+    pos += 1;
+    // extensions length
+    writeU16(out[pos..], @intCast(ep));
+    pos += 2;
+    @memcpy(out[pos .. pos + ep], ext_buf[0..ep]);
+    pos += ep;
+
+    return pos;
+}
+
+// ── EncryptedExtensions builder ───────────────────────────────────────────────
+
+/// Build a TLS 1.3 EncryptedExtensions message (raw, no record header).
+pub fn buildEncryptedExtensions(
+    out: []u8,
+    quic_transport_params: []const u8,
+    alpn: ?[]const u8,
+) !usize {
+    // Extensions content
+    var ext_buf: [2048]u8 = undefined;
+    var ep: usize = 0;
+
+    // QUIC transport parameters extension
+    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
+    ep += 2;
+    writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
+    ep += 2;
+    @memcpy(ext_buf[ep .. ep + quic_transport_params.len], quic_transport_params);
+    ep += quic_transport_params.len;
+
+    // ALPN extension (if provided)
+    if (alpn) |a| {
+        writeU16(ext_buf[ep..], EXT_ALPN);
+        ep += 2;
+        // ext_data = u16_list_len(2) + u8_proto_len(1) + proto
+        const ext_data_len: u16 = @intCast(2 + 1 + a.len);
+        writeU16(ext_buf[ep..], ext_data_len);
+        ep += 2;
+        writeU16(ext_buf[ep..], @intCast(1 + a.len)); // list len
+        ep += 2;
+        ext_buf[ep] = @intCast(a.len);
+        ep += 1;
+        @memcpy(ext_buf[ep .. ep + a.len], a);
+        ep += a.len;
+    }
+
+    // Body = u16 ext list len + ext list
+    const body_len = 2 + ep;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_ENCRYPTED_EXTENSIONS, body_len);
+    writeU16(out[pos..], @intCast(ep));
+    pos += 2;
+    @memcpy(out[pos .. pos + ep], ext_buf[0..ep]);
+    pos += ep;
+    return pos;
+}
+
+// ── Certificate builder ───────────────────────────────────────────────────────
+
+/// Build a TLS 1.3 Certificate message with one DER certificate.
+pub fn buildCertificate(out: []u8, cert_der: []const u8) !usize {
+    // cert_list entry: u24 cert_data_len + cert_data + u16 extensions_len(0)
+    const entry_len = 3 + cert_der.len + 2;
+    // cert_list total length
+    const list_len = entry_len;
+    // body: request_context(1) + u24 cert_list_len + cert_list
+    const body_len = 1 + 3 + list_len;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_CERTIFICATE, body_len);
+    // request_context = empty
+    out[pos] = 0;
+    pos += 1;
+    // cert_list length
+    writeU24(out[pos..], @intCast(list_len));
+    pos += 3;
+    // cert data length
+    writeU24(out[pos..], @intCast(cert_der.len));
+    pos += 3;
+    // cert data
+    @memcpy(out[pos .. pos + cert_der.len], cert_der);
+    pos += cert_der.len;
+    // extensions for this cert entry = empty
+    writeU16(out[pos..], 0);
+    pos += 2;
+    return pos;
+}
+
+// ── CertificateVerify builder ─────────────────────────────────────────────────
+
+/// TLS 1.3 CertificateVerify content prefix: 64 spaces + context string + 0x00.
+const CV_PREFIX_SERVER = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
+const CV_PREFIX_CLIENT = " " ** 64 ++ "TLS 1.3, client CertificateVerify\x00";
+
+/// Build a TLS 1.3 CertificateVerify using the server's private key.
+/// `transcript_hash` is the SHA-256 of all messages through Certificate.
+pub fn buildCertificateVerify(
+    out: []u8,
+    transcript_hash: *const [32]u8,
+    private_key: *const tls_vendor.config.PrivateKey,
+) !usize {
+    // Content to sign
+    var to_sign: [64 + 34 + 32]u8 = undefined;
+    _ = put(&to_sign, 0, CV_PREFIX_SERVER);
+    @memcpy(to_sign[CV_PREFIX_SERVER.len..], transcript_hash);
+
+    // sig_der_buf is 104 bytes — max DER size for P-384 (P-256 is 72).
+    var sig_der_buf: [104]u8 = undefined;
+    var sig_der_len: usize = 0;
+    const sig_scheme = @intFromEnum(private_key.signature_scheme);
+    switch (private_key.signature_scheme) {
+        .ecdsa_secp256r1_sha256 => {
+            const sk = try EcdsaP256Sha256.SecretKey.fromBytes(private_key.key.ecdsa[0..32].*);
+            const kp = try EcdsaP256Sha256.KeyPair.fromSecretKey(sk);
+            var signer = try kp.signer(null);
+            signer.update(&to_sign);
+            const sig = try signer.finalize();
+            var p256_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+            const der = sig.toDer(&p256_buf);
+            @memcpy(sig_der_buf[0..der.len], der);
+            sig_der_len = der.len;
+        },
+        .ecdsa_secp384r1_sha384 => {
+            const sk = try EcdsaP384Sha384.SecretKey.fromBytes(private_key.key.ecdsa[0..48].*);
+            const kp = try EcdsaP384Sha384.KeyPair.fromSecretKey(sk);
+            var signer = try kp.signer(null);
+            signer.update(&to_sign);
+            const sig = try signer.finalize();
+            var p384_buf: [EcdsaP384Sha384.Signature.der_encoded_length_max]u8 = undefined;
+            const der = sig.toDer(&p384_buf);
+            @memcpy(sig_der_buf[0..der.len], der);
+            sig_der_len = der.len;
+        },
+        else => return error.UnsupportedSignatureScheme,
+    }
+    const sig_bytes = sig_der_buf[0..sig_der_len];
+
+    // CertificateVerify body: sig_scheme(2) + sig_len(2) + sig
+    const body_len = 2 + 2 + sig_bytes.len;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_CERTIFICATE_VERIFY, body_len);
+    writeU16(out[pos..], sig_scheme);
+    pos += 2;
+    writeU16(out[pos..], @intCast(sig_bytes.len));
+    pos += 2;
+    @memcpy(out[pos .. pos + sig_bytes.len], sig_bytes);
+    pos += sig_bytes.len;
+    return pos;
+}
+
+// ── Finished builder ─────────────────────────────────────────────────────────
+
+/// Build a TLS 1.3 Finished message.
+pub fn buildFinished(
+    out: []u8,
+    traffic_secret: [32]u8,
+    transcript_hash: *const [32]u8,
+) usize {
+    const verify_data = computeFinishedVerifyData(traffic_secret, transcript_hash);
+    const pos: usize = writeHsMsgHeader(out, 0, MSG_FINISHED, 32);
+    @memcpy(out[pos .. pos + 32], &verify_data);
+    return pos + 32;
+}
+
+// ── ClientHello builder ───────────────────────────────────────────────────────
+
+/// Build a TLS 1.3 ClientHello message for QUIC.
+pub fn buildClientHello(
+    out: []u8,
+    client_x25519_pub: *const [32]u8,
+    quic_transport_params: []const u8,
+    alpn: ?[]const u8,
+    server_name: ?[]const u8,
+) !usize {
+    var client_random: [32]u8 = undefined;
+    crypto.random.bytes(&client_random);
+
+    // Build extensions
+    var ext_buf: [2048]u8 = undefined;
+    var ep: usize = 0;
+
+    // server_name (SNI) extension if provided
+    if (server_name) |sn| {
+        writeU16(ext_buf[ep..], EXT_SERVER_NAME);
+        ep += 2;
+        const sni_data_len: u16 = @intCast(2 + 1 + 2 + sn.len);
+        writeU16(ext_buf[ep..], sni_data_len);
+        ep += 2;
+        writeU16(ext_buf[ep..], @intCast(1 + 2 + sn.len)); // list len
+        ep += 2;
+        ext_buf[ep] = 0; // host_name type
+        ep += 1;
+        writeU16(ext_buf[ep..], @intCast(sn.len));
+        ep += 2;
+        @memcpy(ext_buf[ep .. ep + sn.len], sn);
+        ep += sn.len;
+    }
+
+    // supported_versions: just TLS 1.3
+    writeU16(ext_buf[ep..], EXT_SUPPORTED_VERSIONS);
+    ep += 2;
+    writeU16(ext_buf[ep..], 3); // ext data len: 1 (list_len) + 2 (version)
+    ep += 2;
+    ext_buf[ep] = 2; // list byte len
+    ep += 1;
+    writeU16(ext_buf[ep..], TLS_VERSION_13);
+    ep += 2;
+
+    // supported_groups
+    writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
+    ep += 2;
+    writeU16(ext_buf[ep..], 4); // 2 (list_len) + 2 (group)
+    ep += 2;
+    writeU16(ext_buf[ep..], 2); // list len
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+
+    // key_share: X25519
+    writeU16(ext_buf[ep..], EXT_KEY_SHARE);
+    ep += 2;
+    writeU16(ext_buf[ep..], 38); // 2 (list_len) + 2 (group) + 2 (key_len) + 32 (key)
+    ep += 2;
+    writeU16(ext_buf[ep..], 36); // list len
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+    writeU16(ext_buf[ep..], 32);
+    ep += 2;
+    @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
+    ep += 32;
+
+    // QUIC transport params
+    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
+    ep += 2;
+    writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
+    ep += 2;
+    @memcpy(ext_buf[ep .. ep + quic_transport_params.len], quic_transport_params);
+    ep += quic_transport_params.len;
+
+    // ALPN (if any)
+    if (alpn) |a| {
+        writeU16(ext_buf[ep..], EXT_ALPN);
+        ep += 2;
+        const adata_len: u16 = @intCast(2 + 1 + a.len);
+        writeU16(ext_buf[ep..], adata_len);
+        ep += 2;
+        writeU16(ext_buf[ep..], @intCast(1 + a.len));
+        ep += 2;
+        ext_buf[ep] = @intCast(a.len);
+        ep += 1;
+        @memcpy(ext_buf[ep .. ep + a.len], a);
+        ep += a.len;
+    }
+
+    // Body: version(2) + random(32) + sid_len(1) + cs_list(4) + comp(2) + exts(2+ep)
+    // cipher suites: 2 (list_len) + 2 (TLS_AES_128_GCM_SHA256) = 4
+    const body_len = 2 + 32 + 1 + 4 + 2 + 2 + ep;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_CLIENT_HELLO, body_len);
+    writeU16(out[pos..], TLS_LEGACY_VERSION);
+    pos += 2;
+    @memcpy(out[pos .. pos + 32], &client_random);
+    pos += 32;
+    out[pos] = 0; // session_id = empty
+    pos += 1;
+    writeU16(out[pos..], 2); // cipher_suites list length
+    pos += 2;
+    writeU16(out[pos..], TLS_AES_128_GCM_SHA256);
+    pos += 2;
+    out[pos] = 1; // compression methods length
+    pos += 1;
+    out[pos] = 0; // no compression
+    pos += 1;
+    writeU16(out[pos..], @intCast(ep));
+    pos += 2;
+    @memcpy(out[pos .. pos + ep], ext_buf[0..ep]);
+    pos += ep;
+    return pos;
+}
+
+// ── Server handshake state machine ───────────────────────────────────────────
+
+/// Server-side TLS 1.3 handshake state for QUIC.
+pub const ServerHandshake = struct {
+    /// Ephemeral X25519 key pair (one per connection).
+    kp: X25519.KeyPair,
+    /// Rolling SHA-256 transcript of all handshake messages.
+    transcript: Sha256,
+    /// Derived traffic secrets (valid after processClientHello succeeds).
+    secrets: TrafficSecrets,
+    /// Intermediate handshake secret for app key derivation.
+    handshake_secret: [32]u8,
+    /// Saved ClientHello for reference (e.g., session_id echo).
+    ch: ClientHelloData,
+    /// True once server flight is built and client Finished is verified.
+    handshake_done: bool,
+
+    pub fn init() ServerHandshake {
+        return .{
+            .kp = X25519.KeyPair.generate(),
+            .transcript = Sha256.init(.{}),
+            .secrets = .{},
+            .handshake_secret = [_]u8{0} ** 32,
+            .ch = .{},
+            .handshake_done = false,
+        };
+    }
+
+    /// Process a received ClientHello.
+    /// Writes ServerHello bytes to `out_initial` (for Initial CRYPTO frame).
+    /// Returns bytes written.
+    pub fn processClientHello(
+        self: *ServerHandshake,
+        ch_bytes: []const u8,
+        out_initial: []u8,
+    ) !usize {
+        self.ch = try parseClientHello(ch_bytes);
+
+        // Add ClientHello to transcript
+        self.transcript.update(ch_bytes);
+
+        // ServerHello → Initial CRYPTO
+        const n = try buildServerHello(
+            out_initial,
+            self.ch.session_id[0..self.ch.session_id_len],
+            self.ch.cipher_suite,
+            &self.kp.public_key,
+        );
+
+        // Add ServerHello to transcript
+        self.transcript.update(out_initial[0..n]);
+
+        // Compute ECDHE
+        const shared = try X25519.scalarmult(
+            self.kp.secret_key,
+            self.ch.x25519_key.?,
+        );
+
+        // Derive handshake secrets
+        self.handshake_secret = deriveHandshakeSecret(shared);
+        const hello_hash = peekHash(self.transcript);
+        self.secrets.client_handshake = deriveTrafficSecret(
+            self.handshake_secret, "c hs traffic", &hello_hash,
+        );
+        self.secrets.server_handshake = deriveTrafficSecret(
+            self.handshake_secret, "s hs traffic", &hello_hash,
+        );
+
+        return n;
+    }
+
+    /// Build EncryptedExtensions + Certificate + CertificateVerify + Finished.
+    /// These are raw plaintext bytes for Handshake CRYPTO frames.
+    /// Also derives application traffic secrets.
+    pub fn buildServerFlight(
+        self: *ServerHandshake,
+        cert_der: []const u8,
+        private_key: *const tls_vendor.config.PrivateKey,
+        quic_tp: []const u8,
+        alpn: ?[]const u8,
+        out: []u8,
+    ) !usize {
+        var pos: usize = 0;
+
+        // EncryptedExtensions
+        const ee_len = try buildEncryptedExtensions(out[pos..], quic_tp, alpn);
+        self.transcript.update(out[pos .. pos + ee_len]);
+        pos += ee_len;
+
+        // Certificate
+        const cert_len = try buildCertificate(out[pos..], cert_der);
+        self.transcript.update(out[pos .. pos + cert_len]);
+        pos += cert_len;
+
+        // CertificateVerify (signs transcript through Certificate)
+        const cv_hash = peekHash(self.transcript);
+        const cv_len = try buildCertificateVerify(out[pos..], &cv_hash, private_key);
+        self.transcript.update(out[pos .. pos + cv_len]);
+        pos += cv_len;
+
+        // Finished
+        const fin_hash = peekHash(self.transcript);
+        const fin_len = buildFinished(out[pos..], self.secrets.server_handshake, &fin_hash);
+        self.transcript.update(out[pos .. pos + fin_len]);
+        pos += fin_len;
+
+        // Derive application secrets now (needed before client Finished)
+        const hs_hash = peekHash(self.transcript);
+        const master = deriveMasterSecret(self.handshake_secret);
+        self.secrets.client_app = deriveTrafficSecret(master, "c ap traffic", &hs_hash);
+        self.secrets.server_app = deriveTrafficSecret(master, "s ap traffic", &hs_hash);
+
+        return pos;
+    }
+
+    /// Verify the client's Finished message (raw bytes).
+    pub fn processClientFinished(self: *ServerHandshake, fin_bytes: []const u8) !void {
+        if (fin_bytes.len < 4) return error.TruncatedMessage;
+        if (fin_bytes[0] != MSG_FINISHED) return error.UnexpectedMessage;
+        const vd_len = readU24(fin_bytes[1..4]);
+        if (vd_len != 32) return error.BadFinishedLength;
+        if (fin_bytes.len < 4 + vd_len) return error.TruncatedMessage;
+        const verify_data = fin_bytes[4 .. 4 + vd_len];
+
+        const expected = computeFinishedVerifyData(
+            self.secrets.client_handshake,
+            &peekHash(self.transcript),
+        );
+        if (!std.mem.eql(u8, verify_data, &expected)) return error.BadFinishedMac;
+
+        self.transcript.update(fin_bytes);
+        self.handshake_done = true;
+    }
+};
+
+// ── Client handshake state machine ───────────────────────────────────────────
+
+/// Client-side TLS 1.3 handshake state for QUIC.
+pub const ClientHandshake = struct {
+    kp: X25519.KeyPair,
+    transcript: Sha256,
+    secrets: TrafficSecrets,
+    handshake_secret: [32]u8,
+    handshake_done: bool,
+
+    pub fn init() ClientHandshake {
+        return .{
+            .kp = X25519.KeyPair.generate(),
+            .transcript = Sha256.init(.{}),
+            .secrets = .{},
+            .handshake_secret = [_]u8{0} ** 32,
+            .handshake_done = false,
+        };
+    }
+
+    /// Build ClientHello bytes for Initial CRYPTO frame.
+    pub fn buildClientHelloMsg(
+        self: *ClientHandshake,
+        out: []u8,
+        quic_tp: []const u8,
+        alpn: ?[]const u8,
+        server_name: ?[]const u8,
+    ) !usize {
+        const n = try buildClientHello(out, &self.kp.public_key, quic_tp, alpn, server_name);
+        self.transcript.update(out[0..n]);
+        return n;
+    }
+
+    /// Process ServerHello bytes. Derives handshake secrets.
+    pub fn processServerHello(self: *ClientHandshake, sh_bytes: []const u8) !void {
+        if (sh_bytes.len < 4) return error.TruncatedMessage;
+        if (sh_bytes[0] != MSG_SERVER_HELLO) return error.BadMessageType;
+        const body_len = readU24(sh_bytes[1..4]);
+        const body = sh_bytes[4 .. 4 + body_len];
+
+        // Skip: version(2) + random(32) + sid_len(1) + sid + cs(2) + comp(1)
+        var p: usize = 2 + 32;
+        const sid_len = body[p];
+        p += 1 + sid_len;
+        p += 2 + 1; // cipher_suite + compression
+
+        // Parse extensions for key_share
+        const ext_total = readU16(body[p..]);
+        p += 2;
+        const ext_end = p + ext_total;
+        var server_x25519: ?[32]u8 = null;
+
+        while (p + 4 <= ext_end) {
+            const ext_type = readU16(body[p..]);
+            const ext_len = readU16(body[p + 2 ..]);
+            p += 4;
+            const ext_data = body[p .. p + ext_len];
+            if (ext_type == EXT_KEY_SHARE and ext_data.len >= 36) {
+                const group = readU16(ext_data);
+                if (group == GROUP_X25519) {
+                    const klen = readU16(ext_data[2..]);
+                    if (klen == 32) {
+                        server_x25519 = ext_data[4..36].*;
+                    }
+                }
+            }
+            p += ext_len;
+        }
+
+        if (server_x25519 == null) return error.NoKeyShare;
+        self.transcript.update(sh_bytes);
+
+        const shared = try X25519.scalarmult(
+            self.kp.secret_key,
+            server_x25519.?,
+        );
+        self.handshake_secret = deriveHandshakeSecret(shared);
+        const hello_hash = peekHash(self.transcript);
+        self.secrets.client_handshake = deriveTrafficSecret(
+            self.handshake_secret, "c hs traffic", &hello_hash,
+        );
+        self.secrets.server_handshake = deriveTrafficSecret(
+            self.handshake_secret, "s hs traffic", &hello_hash,
+        );
+    }
+
+    /// Process server Handshake messages (EncryptedExtensions, Certificate,
+    /// CertificateVerify, Finished). Certificate is NOT verified — accepts any.
+    /// Returns bytes of ClientFinished to send in Handshake CRYPTO frames.
+    pub fn processServerFlight(
+        self: *ClientHandshake,
+        hs_bytes: []const u8,
+        out_finished: []u8,
+    ) !usize {
+        // Walk through messages
+        var p: usize = 0;
+        var found_finished = false;
+        while (p + 4 <= hs_bytes.len) {
+            const msg_type = hs_bytes[p];
+            const msg_len = readU24(hs_bytes[p + 1 ..]);
+            const msg_end = p + 4 + msg_len;
+            if (msg_end > hs_bytes.len) break;
+
+            const msg = hs_bytes[p..msg_end];
+            switch (msg_type) {
+                MSG_ENCRYPTED_EXTENSIONS, MSG_CERTIFICATE, MSG_CERTIFICATE_VERIFY => {
+                    self.transcript.update(msg);
+                },
+                MSG_FINISHED => {
+                    // Verify server Finished
+                    const expected = computeFinishedVerifyData(
+                        self.secrets.server_handshake,
+                        &peekHash(self.transcript),
+                    );
+                    if (msg_len != 32) return error.BadFinishedLength;
+                    const vd = msg[4 .. 4 + msg_len];
+                    if (!std.mem.eql(u8, vd, &expected)) return error.BadFinishedMac;
+                    self.transcript.update(msg);
+
+                    // Derive app secrets
+                    const hs_hash = peekHash(self.transcript);
+                    const master = deriveMasterSecret(self.handshake_secret);
+                    self.secrets.client_app = deriveTrafficSecret(master, "c ap traffic", &hs_hash);
+                    self.secrets.server_app = deriveTrafficSecret(master, "s ap traffic", &hs_hash);
+
+                    found_finished = true;
+                },
+                else => {},
+            }
+            p = msg_end;
+        }
+
+        if (!found_finished) return error.NoServerFinished;
+
+        // Build client Finished
+        const client_fin_hash = peekHash(self.transcript);
+        const n = buildFinished(out_finished, self.secrets.client_handshake, &client_fin_hash);
+        self.transcript.update(out_finished[0..n]);
+        self.handshake_done = true;
+        return n;
+    }
+};
+
+// ── QUIC key material derivation ─────────────────────────────────────────────
+
+/// QUIC key material derived from a TLS 1.3 traffic secret.
+pub const QuicKeyMaterial = struct {
+    key: [16]u8, // AES-128-GCM key
+    iv: [12]u8, // AES-128-GCM IV (nonce base)
+    hp: [16]u8, // header protection key
+};
+
+/// Derive QUIC key material from a TLS 1.3 traffic secret (RFC 9001 §5.1).
+pub fn deriveQuicKeys(traffic_secret: [32]u8) QuicKeyMaterial {
+    var km: QuicKeyMaterial = undefined;
+    keys_mod.hkdfExpandLabel(&km.key, &traffic_secret, "quic key", "");
+    keys_mod.hkdfExpandLabel(&km.iv, &traffic_secret, "quic iv", "");
+    keys_mod.hkdfExpandLabel(&km.hp, &traffic_secret, "quic hp", "");
+    return km;
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+test "handshake: key schedule" {
+    const testing = std.testing;
+    // Just verify no crash for now; deeper vectors in integration test.
+    const ecdhe = [_]u8{0x42} ** 32;
+    const hs = deriveHandshakeSecret(ecdhe);
+    const master = deriveMasterSecret(hs);
+    const hello_hash = [_]u8{0xAB} ** 32;
+    const client_hs = deriveTrafficSecret(hs, "c hs traffic", &hello_hash);
+    const server_hs = deriveTrafficSecret(hs, "s hs traffic", &hello_hash);
+    const client_ap = deriveTrafficSecret(master, "c ap traffic", &hello_hash);
+    const server_ap = deriveTrafficSecret(master, "s ap traffic", &hello_hash);
+    // All should be distinct
+    try testing.expect(!std.mem.eql(u8, &client_hs, &server_hs));
+    try testing.expect(!std.mem.eql(u8, &client_ap, &server_ap));
+    try testing.expect(!std.mem.eql(u8, &client_hs, &client_ap));
+}
+
+test "handshake: build and parse ServerHello" {
+    const testing = std.testing;
+    var buf: [512]u8 = undefined;
+    const pub_key = [_]u8{0x55} ** 32;
+    const session_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const n = try buildServerHello(&buf, &session_id, TLS_AES_128_GCM_SHA256, &pub_key);
+    try testing.expect(n > 4);
+    try testing.expectEqual(MSG_SERVER_HELLO, buf[0]);
+}
+
+test "handshake: QUIC key derivation" {
+    const testing = std.testing;
+    const secret = [_]u8{0x77} ** 32;
+    const km = deriveQuicKeys(secret);
+    // Keys and IVs should be non-zero
+    try testing.expect(!std.mem.allEqual(u8, &km.key, 0));
+    try testing.expect(!std.mem.allEqual(u8, &km.iv, 0));
+    try testing.expect(!std.mem.allEqual(u8, &km.hp, 0));
+    // Key ≠ IV ≠ HP
+    try testing.expect(!std.mem.eql(u8, &km.key, &km.hp));
+}

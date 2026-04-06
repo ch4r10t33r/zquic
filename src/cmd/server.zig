@@ -21,6 +21,7 @@
 //!   --key-update      Perform a key update after the handshake
 
 const std = @import("std");
+const io_mod = @import("zquic").transport.io;
 
 const Config = struct {
     port: u16 = 443,
@@ -117,10 +118,28 @@ pub fn main() !void {
     if (cfg.key_update) std.debug.print("  key-update: enabled\n", .{});
     if (cfg.migrate) std.debug.print("  migration: enabled\n", .{});
 
-    // Full transport integration is wired up here. The individual
-    // modules (Endpoint, Connection, http09/http3 handlers) are imported
-    // and used; the complete I/O loop is left as the integration point
-    // between the library modules and the OS network stack.
-    std.debug.print("zquic server: transport integration pending — interop stubs active\n", .{});
-    std.process.exit(0);
+    const server_config = io_mod.ServerConfig{
+        .port = cfg.port,
+        .cert_path = cfg.cert,
+        .key_path = cfg.key,
+        .www_dir = cfg.www,
+        .keylog_path = cfg.keylog,
+        .retry_enabled = cfg.retry,
+        .resumption_enabled = cfg.resumption,
+        .http09 = cfg.http09,
+        .http3 = cfg.http3,
+        .key_update = cfg.key_update,
+        .migrate = cfg.migrate,
+    };
+
+    var server = io_mod.Server.init(allocator, server_config) catch |err| {
+        std.debug.print("server init failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer server.deinit();
+
+    server.run() catch |err| {
+        std.debug.print("server run error: {}\n", .{err});
+        std.process.exit(1);
+    };
 }

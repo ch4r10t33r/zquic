@@ -28,12 +28,16 @@ pub const loss = struct {
     pub const recovery = @import("loss/recovery.zig");
     pub const congestion = @import("loss/congestion.zig");
 };
+pub const tls = struct {
+    pub const handshake = @import("tls/handshake.zig");
+};
 pub const transport = struct {
     pub const connection = @import("transport/connection.zig");
     pub const endpoint = @import("transport/endpoint.zig");
     pub const flow_control = @import("transport/flow_control.zig");
     pub const stream_manager = @import("transport/stream_manager.zig");
     pub const migration = @import("transport/migration.zig");
+    pub const io = @import("transport/io.zig");
 };
 pub const http3 = struct {
     pub const frame = @import("http3/frame.zig");
