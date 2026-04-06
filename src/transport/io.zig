@@ -935,6 +935,13 @@ pub const Server = struct {
                 pos += 1;
                 continue;
             }
+            if (plaintext[pos] == 0x02 or plaintext[pos] == 0x03) {
+                const is_ecn = plaintext[pos] == 0x03;
+                pos += 1;
+                if (pos > pt_len) break;
+                pos += skipAckBody(plaintext[pos..pt_len], is_ecn);
+                continue;
+            }
             // Try to parse as CRYPTO frame
             if (plaintext[pos] == 0x06) {
                 pos += 1;
@@ -1209,11 +1216,11 @@ pub const Server = struct {
                 }
                 fpos += dlen;
             } else if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
-                // ACK frame — skip for now (just advance past it)
+                const is_ecn = plaintext[fpos] == 0x03;
                 fpos += 1;
-                _ = varint.decode(plaintext[fpos..]) catch break; // largest acked
-                fpos += (varint.decode(plaintext[fpos..]) catch break).len;
-                break; // simplification
+                if (fpos > pt_len) break;
+                fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                continue;
             } else {
                 break;
             }
@@ -2132,7 +2139,14 @@ pub const Client = struct {
                 fpos += 1;
                 continue;
             }
-            if (plaintext[fpos] != 0x06) break; // skip non-CRYPTO (e.g. ACK)
+            if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
+                const is_ecn = plaintext[fpos] == 0x03;
+                fpos += 1;
+                if (fpos > pt_len) break;
+                fpos += skipAckBody(plaintext[fpos..pt_len], is_ecn);
+                continue;
+            }
+            if (plaintext[fpos] != 0x06) break;
             fpos += 1;
             const off_r = varint.decode(plaintext[fpos..]) catch break;
             fpos += off_r.len;
