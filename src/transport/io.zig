@@ -26,6 +26,7 @@ const tls_vendor = @import("tls");
 const stream_frame_mod = @import("../frames/stream.zig");
 const http09_server = @import("../http09/server.zig");
 const http09_client = @import("../http09/client.zig");
+const retry_mod = @import("../packet/retry.zig");
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -305,6 +306,10 @@ pub const ConnState = struct {
 
     // CRYPTO stream offset tracking (in-order reassembly)
     init_crypto_offset: u64 = 0,
+
+    // Retry token (set when server sends Retry; included in next Initial)
+    retry_token: [64]u8 = [_]u8{0} ** 64,
+    retry_token_len: usize = 0,
     hs_crypto_offset: u64 = 0,
 
     // TLS handshake state machine (server side)
@@ -365,6 +370,8 @@ pub const Server = struct {
     cert_der: []u8,
     private_key: tls_vendor.config.PrivateKey,
     conns: [MAX_CONNECTIONS]?ConnState = [_]?ConnState{null} ** MAX_CONNECTIONS,
+    /// Random server token secret for Retry token HMAC-SHA256 verification.
+    retry_secret: [32]u8 = [_]u8{0} ** 32,
 
     /// Initialize server: load cert/key and create UDP socket.
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !Server {
@@ -391,12 +398,17 @@ pub const Server = struct {
 
         std.debug.print("io: server bound on 0.0.0.0:{d}\n", .{config.port});
 
+        // Generate a random Retry token secret for this server lifetime
+        var retry_secret: [32]u8 = undefined;
+        std.crypto.random.bytes(&retry_secret);
+
         return .{
             .allocator = allocator,
             .config = config,
             .sock = sock,
             .cert_der = cert_der,
             .private_key = pk,
+            .retry_secret = retry_secret,
         };
     }
 
@@ -491,6 +503,14 @@ pub const Server = struct {
     ) void {
         const ip = packet_mod.parseInitial(buf) catch return;
 
+        // Retry mode: if enabled and no valid token, send Retry and drop
+        if (self.config.retry_enabled) {
+            if (!self.verifyRetryToken(ip.token, ip.dcid.slice())) {
+                self.sendRetry(ip.dcid.slice(), ip.scid.slice(), src);
+                return;
+            }
+        }
+
         // Find or create connection
         var conn: *ConnState = self.findConn(ip.dcid) orelse blk: {
             // New connection from client
@@ -539,6 +559,45 @@ pub const Server = struct {
                 break; // unknown frame, stop
             }
         }
+    }
+
+    /// Build a Retry token: HMAC-SHA256(retry_secret, odcid).
+    fn mintRetryToken(self: *Server, odcid: []const u8, out: *[32]u8) void {
+        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.retry_secret);
+        hmac.update(odcid);
+        hmac.final(out);
+    }
+
+    /// Verify that `token` is a valid HMAC over `odcid` with our secret.
+    fn verifyRetryToken(self: *Server, token: []const u8, odcid: []const u8) bool {
+        if (token.len != 32) return false;
+        var expected: [32]u8 = undefined;
+        self.mintRetryToken(odcid, &expected);
+        return std.mem.eql(u8, token, &expected);
+    }
+
+    /// Send a Retry packet to the client.
+    fn sendRetry(self: *Server, odcid: []const u8, scid: []const u8, src: std.net.Address) void {
+        // New server SCID for the connection after Retry
+        var new_scid: [8]u8 = undefined;
+        std.crypto.random.bytes(&new_scid);
+
+        // Token = HMAC-SHA256(retry_secret, odcid)
+        var token: [32]u8 = undefined;
+        self.mintRetryToken(odcid, &token);
+
+        var buf: [256]u8 = undefined;
+        const n = retry_mod.buildRetryPacket(
+            &buf,
+            QUIC_VERSION_1,
+            scid, // DCID = client's SCID
+            &new_scid, // SCID = new server CID
+            &token,
+            odcid,
+        ) catch return;
+
+        _ = std.posix.sendto(self.sock, buf[0..n], 0, &src.any, src.getOsSockLen()) catch {};
+        std.debug.print("io: sent Retry to client\n", .{});
     }
 
     fn handleInitialCrypto(
@@ -1042,11 +1101,12 @@ pub const Client = struct {
         const payload_len = @max(crypto_len, min_payload);
 
         const init_km = self.conn.init_keys.?;
+        const token = self.conn.retry_token[0..self.conn.retry_token_len];
         const pkt_len = try buildInitialPacket(
             &pkt_buf,
             self.conn.remote_cid,
             self.conn.local_cid,
-            &.{},
+            token,
             frame_buf[0..payload_len],
             self.conn.init_pn,
             &init_km.client,
@@ -1064,11 +1124,37 @@ pub const Client = struct {
             switch (lh.header.packet_type) {
                 .initial => self.processInitialPacket(buf),
                 .handshake => self.processHandshakePacket(buf),
+                .retry => self.processRetryPacket(buf),
                 else => {},
             }
         } else {
             self.process1RttPacket(buf);
         }
+    }
+
+    fn processRetryPacket(self: *Client, buf: []const u8) void {
+        const rp = packet_mod.parseRetry(buf) catch return;
+
+        // Verify Retry integrity tag (odcid = our original DCID)
+        if (!retry_mod.verifyIntegrityTag(self.conn.remote_cid.slice(), buf)) {
+            std.debug.print("io: Retry integrity tag invalid\n", .{});
+            return;
+        }
+
+        std.debug.print("io: received Retry, re-sending Initial with token\n", .{});
+
+        // Store the token for the next Initial
+        const tlen = @min(rp.token.len, self.conn.retry_token.len);
+        @memcpy(self.conn.retry_token[0..tlen], rp.token[0..tlen]);
+        self.conn.retry_token_len = tlen;
+
+        // Update DCID to server's new SCID
+        self.conn.remote_cid = rp.scid;
+        // Re-derive Initial keys for new DCID
+        self.conn.init_keys = InitialSecrets.derive(rp.scid.slice());
+
+        // Send a new ClientHello Initial with the token
+        self.sendClientHello(self.conn.peer) catch {};
     }
 
     fn processInitialPacket(
