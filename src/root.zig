@@ -33,6 +33,7 @@ pub const transport = struct {
     pub const endpoint = @import("transport/endpoint.zig");
     pub const flow_control = @import("transport/flow_control.zig");
     pub const stream_manager = @import("transport/stream_manager.zig");
+    pub const migration = @import("transport/migration.zig");
 };
 pub const http3 = struct {
     pub const frame = @import("http3/frame.zig");
@@ -70,6 +71,7 @@ test {
     _ = @import("transport/endpoint.zig");
     _ = @import("transport/flow_control.zig");
     _ = @import("transport/stream_manager.zig");
+    _ = @import("transport/migration.zig");
     _ = @import("http3/frame.zig");
     _ = @import("http3/qpack.zig");
     _ = @import("http09/server.zig");
