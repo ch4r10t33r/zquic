@@ -489,6 +489,10 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     config: ServerConfig,
     sock: std.posix.socket_t,
+    /// Raw UDP socket for diagnostics — receives all incoming UDP datagrams
+    /// at the IP level (before UDP dispatch).  Lets us detect packets that
+    /// arrive at the NIC but never reach the main socket on port 443.
+    raw_sock: ?std.posix.socket_t = null,
     cert_der: []u8,
     private_key: tls_vendor.config.PrivateKey,
     conns: [MAX_CONNECTIONS]?ConnState = [_]?ConnState{null} ** MAX_CONNECTIONS,
@@ -520,6 +524,21 @@ pub const Server = struct {
 
         std.debug.print("io: server bound on 0.0.0.0:{d}\n", .{config.port});
 
+        // Diagnostic raw socket: capture all incoming UDP at IP level.
+        // If this sees packets that the main socket doesn't, it indicates
+        // a kernel-level filter is blocking delivery to port 443.
+        const raw_sock = std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.RAW,
+            17, // IPPROTO_UDP
+        ) catch |err| blk: {
+            std.debug.print("io: raw_sock create failed ({}), no raw diagnostics\n", .{err});
+            break :blk null;
+        };
+        if (raw_sock) |rs| {
+            std.debug.print("io: raw_sock created fd={}\n", .{rs});
+        }
+
         // Generate a random Retry token secret for this server lifetime
         var retry_secret: [32]u8 = undefined;
         std.crypto.random.bytes(&retry_secret);
@@ -528,6 +547,7 @@ pub const Server = struct {
             .allocator = allocator,
             .config = config,
             .sock = sock,
+            .raw_sock = raw_sock,
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
@@ -536,6 +556,7 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         std.posix.close(self.sock);
+        if (self.raw_sock) |rs| std.posix.close(rs);
         self.allocator.free(self.cert_der);
     }
 
@@ -545,14 +566,18 @@ pub const Server = struct {
         var idle_secs: u32 = 0;
 
         while (true) {
-            // Use poll with 2s timeout so we can print heartbeat messages when
-            // no packets arrive (helps diagnose CI networking issues).
-            var fds = [1]std.posix.pollfd{.{
-                .fd = self.sock,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = std.posix.poll(&fds, 2000) catch |err| {
+            // Poll both the main UDP socket and the diagnostic raw socket.
+            var nfds: usize = 1;
+            var fds = [2]std.posix.pollfd{
+                .{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            if (self.raw_sock) |rs| {
+                fds[1].fd = rs;
+                nfds = 2;
+            }
+
+            const ready = std.posix.poll(fds[0..nfds], 2000) catch |err| {
                 std.debug.print("io: poll error: {}\n", .{err});
                 continue;
             };
@@ -563,22 +588,52 @@ pub const Server = struct {
             }
             idle_secs = 0;
 
-            var src_addr: std.posix.sockaddr.storage = undefined;
-            var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-            const n = std.posix.recvfrom(
-                self.sock,
-                &recv_buf,
-                0,
-                @ptrCast(&src_addr),
-                &src_len,
-            ) catch |err| {
-                std.debug.print("io: recvfrom error: {}\n", .{err});
-                continue;
-            };
-            std.debug.print("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
+            // Check if the raw diagnostic socket got something.
+            if (nfds == 2 and fds[1].revents & std.posix.POLL.IN != 0) {
+                var raw_buf: [2048]u8 = undefined;
+                var raw_src: std.posix.sockaddr.storage = undefined;
+                var raw_src_len: std.posix.socklen_t = @sizeOf(@TypeOf(raw_src));
+                const rn = std.posix.recvfrom(
+                    self.raw_sock.?,
+                    &raw_buf,
+                    0,
+                    @ptrCast(&raw_src),
+                    &raw_src_len,
+                ) catch 0;
+                if (rn >= 20) { // at least IP header
+                    // IP header: src at bytes 12-15, dst at bytes 16-19, proto at byte 9
+                    const proto = raw_buf[9];
+                    const src_ip = raw_buf[12..16];
+                    const dst_ip = raw_buf[16..20];
+                    std.debug.print("io: raw_sock got {} bytes proto={} src={}.{}.{}.{} dst={}.{}.{}.{}\n", .{
+                        rn,        proto,
+                        src_ip[0], src_ip[1],
+                        src_ip[2], src_ip[3],
+                        dst_ip[0], dst_ip[1],
+                        dst_ip[2], dst_ip[3],
+                    });
+                }
+            }
 
-            const src = std.net.Address{ .any = @as(*const std.posix.sockaddr, @ptrCast(&src_addr)).* };
-            self.processPacket(recv_buf[0..n], src);
+            // Read from main UDP socket.
+            if (fds[0].revents & std.posix.POLL.IN != 0) {
+                var src_addr: std.posix.sockaddr.storage = undefined;
+                var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
+                const n = std.posix.recvfrom(
+                    self.sock,
+                    &recv_buf,
+                    0,
+                    @ptrCast(&src_addr),
+                    &src_len,
+                ) catch |err| {
+                    std.debug.print("io: recvfrom error: {}\n", .{err});
+                    continue;
+                };
+                std.debug.print("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
+
+                const src = std.net.Address{ .any = @as(*const std.posix.sockaddr, @ptrCast(&src_addr)).* };
+                self.processPacket(recv_buf[0..n], src);
+            }
         }
     }
 
