@@ -23,6 +23,8 @@ pub const crypto = struct {
 pub const transport = struct {
     pub const connection = @import("transport/connection.zig");
     pub const endpoint = @import("transport/endpoint.zig");
+    pub const flow_control = @import("transport/flow_control.zig");
+    pub const stream_manager = @import("transport/stream_manager.zig");
 };
 pub const frames = struct {
     pub const frame = @import("frames/frame.zig");
@@ -44,6 +46,8 @@ test {
     _ = @import("crypto/quic_tls.zig");
     _ = @import("transport/connection.zig");
     _ = @import("transport/endpoint.zig");
+    _ = @import("transport/flow_control.zig");
+    _ = @import("transport/stream_manager.zig");
     _ = @import("frames/frame.zig");
     _ = @import("frames/ack.zig");
     _ = @import("frames/crypto_frame.zig");
