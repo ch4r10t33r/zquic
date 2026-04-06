@@ -19,6 +19,13 @@ pub const crypto = struct {
     pub const aead = @import("crypto/aead.zig");
     pub const initial = @import("crypto/initial.zig");
 };
+pub const frames = struct {
+    pub const frame = @import("frames/frame.zig");
+    pub const ack = @import("frames/ack.zig");
+    pub const crypto_frame = @import("frames/crypto_frame.zig");
+    pub const stream = @import("frames/stream.zig");
+    pub const transport = @import("frames/transport.zig");
+};
 
 test {
     _ = @import("varint.zig");
@@ -29,4 +36,9 @@ test {
     _ = @import("crypto/keys.zig");
     _ = @import("crypto/aead.zig");
     _ = @import("crypto/initial.zig");
+    _ = @import("frames/frame.zig");
+    _ = @import("frames/ack.zig");
+    _ = @import("frames/crypto_frame.zig");
+    _ = @import("frames/stream.zig");
+    _ = @import("frames/transport.zig");
 }
