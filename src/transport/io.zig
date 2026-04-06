@@ -187,11 +187,24 @@ pub fn build1RttPacket(
     pn: u64,
     km: *const KeyMaterial,
 ) !usize {
+    return build1RttPacketWithPhase(out, dcid, payload, pn, km, false);
+}
+
+pub fn build1RttPacketWithPhase(
+    out: []u8,
+    dcid: ConnectionId,
+    payload: []const u8,
+    pn: u64,
+    km: *const KeyMaterial,
+    key_phase: bool,
+) !usize {
     var hdr_buf: [64]u8 = undefined;
     var hp: usize = 0;
 
-    // First byte: Header Form=0, Fixed Bit=1, Spin=0, Reserved=00, Key Phase=0, PN_len=0
-    hdr_buf[hp] = 0x40; // short header
+    // Header Form=0, Fixed Bit=1, Spin=0, Reserved=00, Key Phase bit, PN_len=0
+    var first: u8 = 0x40;
+    if (key_phase) first |= 0x04;
+    hdr_buf[hp] = first;
     hp += 1;
     @memcpy(hdr_buf[hp .. hp + dcid.len], dcid.slice());
     hp += dcid.len;
@@ -318,6 +331,15 @@ pub const ConnState = struct {
     retry_token: [64]u8 = [_]u8{0} ** 64,
     retry_token_len: usize = 0,
     hs_crypto_offset: u64 = 0,
+
+    // 1-RTT key phase tracking for key updates (RFC 9001 §6).
+    // Tracks the current key phase bit for outgoing short-header packets.
+    key_phase_bit: bool = false,
+    // Whether a key update is currently pending confirmation.
+    key_update_pending: bool = false,
+    // Tracks the key phase bit seen in the last successfully decrypted
+    // 1-RTT packet; used to detect peer-initiated key updates.
+    peer_key_phase: bool = false,
 
     // TLS handshake state machine (server side)
     tls: ServerHandshake = undefined,
@@ -823,6 +845,12 @@ pub const Server = struct {
         // Send Handshake ACK + 1-RTT HANDSHAKE_DONE
         self.sendHandshakeAck(conn, src);
         self.sendHandshakeDone(conn, src);
+
+        // Initiate a key update immediately after the handshake if enabled.
+        // This satisfies the quic-interop-runner "keyupdate" test case.
+        if (self.config.key_update) {
+            self.initiateKeyUpdate(conn, src);
+        }
     }
 
     fn sendHandshakeAck(self: *Server, conn: *ConnState, src: std.net.Address) void {
@@ -902,7 +930,14 @@ pub const Server = struct {
                 const candidate = ConnectionId.fromSlice(buf[1 .. 1 + cid_len]) catch continue;
                 if (!ConnectionId.eql(conn.local_cid, candidate)) continue;
 
-                // Try to decrypt
+                // Detect peer-initiated key update via key phase bit flip.
+                const incoming_phase = (buf[0] & 0x04) != 0;
+                if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
+                    // Rotate receive keys to match the peer's new phase.
+                    conn.app_client_km = conn.app_client_km.nextGen();
+                }
+
+                // Try to decrypt with current client app keys.
                 var plaintext: [4096]u8 = undefined;
                 const pn_start = 1 + cid_len;
                 const pt_len = initial_mod.unprotectInitialPacket(
@@ -913,11 +948,38 @@ pub const Server = struct {
                     &conn.app_client_km,
                 ) catch continue;
 
+                conn.peer_key_phase = incoming_phase;
+                conn.key_update_pending = false;
+
                 // Process application frames
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
                 return;
             }
         }
+    }
+
+    /// Trigger a local key update: rotate send keys and emit a packet with
+    /// the new key phase bit set.  Called after handshake when key_update
+    /// is enabled (quic-interop-runner "keyupdate" test case).
+    fn initiateKeyUpdate(self: *Server, conn: *ConnState, src: std.net.Address) void {
+        // Rotate to next generation keys.
+        conn.app_server_km = conn.app_server_km.nextGen();
+        conn.key_phase_bit = !conn.key_phase_bit;
+        conn.key_update_pending = true;
+
+        // Send a PING so the peer can verify the new keys.
+        const ping_frame = [_]u8{0x01};
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketWithPhase(
+            &send_buf,
+            conn.remote_cid,
+            &ping_frame,
+            conn.app_pn,
+            &conn.app_server_km,
+            conn.key_phase_bit,
+        ) catch return;
+        conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
     }
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
@@ -1489,6 +1551,13 @@ pub const Client = struct {
         const cid_len = self.conn.local_cid.len;
         if (buf.len < 1 + cid_len) return;
 
+        // Detect key phase flip from server (key update initiated by server).
+        const incoming_phase = (buf[0] & 0x04) != 0;
+        if (incoming_phase != self.conn.peer_key_phase and !self.conn.key_update_pending) {
+            // Server has rotated its send keys; rotate our receive keys to match.
+            self.conn.app_server_km = self.conn.app_server_km.nextGen();
+        }
+
         var plaintext: [4096]u8 = undefined;
         const pn_start = 1 + cid_len;
         const pt_len = initial_mod.unprotectInitialPacket(
@@ -1498,6 +1567,9 @@ pub const Client = struct {
             buf.len,
             &self.conn.app_server_km,
         ) catch return;
+
+        self.conn.peer_key_phase = incoming_phase;
+        self.conn.key_update_pending = false;
 
         var pos: usize = 0;
         while (pos < pt_len) {
