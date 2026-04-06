@@ -28,6 +28,8 @@ const http09_server = @import("../http09/server.zig");
 const http09_client = @import("../http09/client.zig");
 const retry_mod = @import("../packet/retry.zig");
 const session_mod = @import("../crypto/session.zig");
+const h3_frame = @import("../http3/frame.zig");
+const h3_qpack = @import("../http3/qpack.zig");
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -308,6 +310,9 @@ pub const ConnState = struct {
     // CRYPTO stream offset tracking (in-order reassembly)
     init_crypto_offset: u64 = 0,
     app_crypto_offset: u64 = 0,
+
+    // HTTP/3 state: whether the server control stream was sent
+    h3_settings_sent: bool = false,
 
     // Retry token (set when server sends Retry; included in next Initial)
     retry_token: [64]u8 = [_]u8{0} ** 64,
@@ -937,8 +942,16 @@ pub const Server = struct {
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+        if (self.config.http3) {
+            self.handleHttp3Stream(conn, sf, src);
+        } else {
+            self.handleHttp09Stream(conn, sf, src);
+        }
+    }
+
+    fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
         // Only unidirectional client-initiated streams carry HTTP/0.9 requests
-        if (sf.stream_id % 4 != 0 and sf.stream_id % 4 != 2) return; // bidi or server-initiated
+        if (sf.stream_id % 4 != 0 and sf.stream_id % 4 != 2) return;
         if (sf.data.len == 0) return;
 
         var req_buf: [http09_server.max_request_len]u8 = undefined;
@@ -954,7 +967,6 @@ pub const Server = struct {
         };
         defer file.close();
 
-        // Send file contents in STREAM frames
         var file_buf: [1024]u8 = undefined;
         var stream_offset: u64 = 0;
         while (true) {
@@ -986,6 +998,170 @@ pub const Server = struct {
 
             _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
         }
+    }
+
+    fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+        // Server control stream (stream_id=3 is server-initiated unidirectional)
+        // Client control stream (stream_id=2), QPACK encoder (stream_id=6)
+        // Request streams: client-initiated bidirectional (stream_id=0, 4, 8, ...)
+
+        // Send server control stream with SETTINGS if not done yet
+        if (!conn.h3_settings_sent) {
+            self.sendH3ControlStream(conn, src);
+            conn.h3_settings_sent = true;
+        }
+
+        // Ignore client-initiated unidirectional streams (control/QPACK)
+        if (sf.stream_id % 4 == 2) return; // unidirectional client-initiated
+
+        // Bidirectional request streams (stream_id % 4 == 0)
+        if (sf.stream_id % 4 != 0) return;
+        if (sf.data.len == 0) return;
+
+        // Parse HTTP/3 frames
+        var pos: usize = 0;
+        var method_buf: [8]u8 = undefined;
+        var path_buf: [512]u8 = undefined;
+        var method: []const u8 = "GET";
+        var path: []const u8 = "/";
+
+        while (pos < sf.data.len) {
+            const pr = h3_frame.parseFrame(sf.data[pos..]) catch break;
+            pos += pr.consumed;
+
+            switch (pr.frame) {
+                .headers => |hf| {
+                    // Decode QPACK
+                    var decoded = h3_qpack.DecodedHeaders{ .headers = undefined, .count = 0 };
+                    h3_qpack.decodeHeaders(hf.data[0..hf.len], &decoded) catch {};
+                    for (decoded.headers[0..decoded.count]) |f| {
+                        if (std.mem.eql(u8, f.name, ":method")) {
+                            const ml = @min(f.value.len, method_buf.len);
+                            @memcpy(method_buf[0..ml], f.value[0..ml]);
+                            method = method_buf[0..ml];
+                        } else if (std.mem.eql(u8, f.name, ":path")) {
+                            const pl = @min(f.value.len, path_buf.len);
+                            @memcpy(path_buf[0..pl], f.value[0..pl]);
+                            path = path_buf[0..pl];
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Only handle GET for now
+        if (!std.mem.eql(u8, method, "GET")) return;
+
+        // Serve the file
+        var fs_path_buf: [512]u8 = undefined;
+        const fs_path = http09_server.resolvePath(path, &fs_path_buf) catch return;
+
+        const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
+            self.sendH3Response(conn, sf.stream_id, 404, &.{}, src);
+            return;
+        };
+        defer file.close();
+
+        const file_size = file.getEndPos() catch 0;
+        var size_buf: [20]u8 = undefined;
+        const size_str = std.fmt.bufPrint(&size_buf, "{}", .{file_size}) catch "0";
+
+        // Build response headers
+        var header_block: [512]u8 = undefined;
+        const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
+            .{ .name = ":status", .value = "200" },
+            .{ .name = "content-length", .value = size_str },
+        }, &header_block) catch return;
+
+        // Send HEADERS frame
+        var headers_out: [600]u8 = undefined;
+        const headers_len = h3_frame.writeFrame(&headers_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch return;
+        self.sendStreamData(conn, sf.stream_id, headers_out[0..headers_len], false, src);
+
+        // Send DATA frames
+        var data_buf: [1024]u8 = undefined;
+        var data_out: [1100]u8 = undefined;
+        while (true) {
+            const n = file.read(&data_buf) catch break;
+            if (n == 0) break;
+            const data_len = h3_frame.writeFrame(&data_out, @intFromEnum(h3_frame.FrameType.data), data_buf[0..n]) catch break;
+            const eof = (file.getEndPos() catch 0) == (file.getPos() catch 1);
+            self.sendStreamData(conn, sf.stream_id, data_out[0..data_len], eof, src);
+        }
+    }
+
+    fn sendH3ControlStream(self: *Server, conn: *ConnState, src: std.net.Address) void {
+        // Server control stream: stream_id=3 (server-initiated unidirectional)
+        // First byte identifies stream type: 0x00 = control stream
+        var buf: [256]u8 = undefined;
+        buf[0] = 0x00; // stream type = control
+        var pos: usize = 1;
+
+        // SETTINGS frame
+        const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
+            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = 0 },
+            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = 0 },
+        }) catch return;
+        pos += settings_len;
+
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = 3, // server-initiated unidirectional
+            .offset = 0,
+            .data = buf[0..pos],
+            .fin = false,
+            .has_length = true,
+        };
+        var frame_buf: [300]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacket(
+            &send_buf,
+            conn.remote_cid,
+            frame_buf[0..frame_len],
+            conn.app_pn,
+            &conn.app_server_km,
+        ) catch return;
+        conn.app_pn += 1;
+
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+    }
+
+    fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: std.net.Address) void {
+        var status_buf: [4]u8 = undefined;
+        const status_str = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch "500";
+        var header_block: [256]u8 = undefined;
+        const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
+            .{ .name = ":status", .value = status_str },
+        }, &header_block) catch return;
+        var out: [300]u8 = undefined;
+        const out_len = h3_frame.writeFrame(&out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch return;
+        self.sendStreamData(conn, stream_id, out[0..out_len], true, src);
+    }
+
+    fn sendStreamData(self: *Server, conn: *ConnState, stream_id: u64, data: []const u8, fin: bool, src: std.net.Address) void {
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = stream_id,
+            .offset = 0,
+            .data = data,
+            .fin = fin,
+            .has_length = true,
+        };
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacket(
+            &send_buf,
+            conn.remote_cid,
+            frame_buf[0..frame_len],
+            conn.app_pn,
+            &conn.app_server_km,
+        ) catch return;
+        conn.app_pn += 1;
+
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
     }
 };
 
