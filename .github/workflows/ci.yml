@@ -102,14 +102,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Load the Docker image that was built and saved by the interop-image job.
+      # Download the image tar; the actual load happens after Docker is upgraded
+      # and the daemon is restarted with IPv6 enabled (see steps below).
       - name: Download image artifact
         uses: actions/download-artifact@v4
         with:
           name: zquic-interop-image
-
-      - name: Load Docker image
-        run: docker load < zquic-interop.tar.gz
 
       # Checkout the official quic-interop-runner.
       - name: Checkout quic-interop-runner
@@ -144,6 +142,28 @@ jobs:
           print("Registered zquic:", impls["zquic"])
           EOF
 
+      # The quic-interop-runner network simulator requires Docker Engine ≥ 28.1
+      # (for the interface_name feature).  ubuntu-latest ships with an older
+      # version, so we upgrade from the official Docker apt repository first.
+      - name: Upgrade Docker Engine to v28.1+
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ca-certificates curl
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+            -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+            https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin
+          docker --version
+
       # Enable IPv6 in Docker (required by the interop network simulator).
       - name: Enable IPv6 for Docker
         run: |
@@ -151,6 +171,8 @@ jobs:
           echo '{"ipv6": true, "fixed-cidr-v6": "2001:db8:1::/64"}' | \
             sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
+          # Reload the zquic image after Docker restart (daemon was restarted)
+          docker load < zquic-interop.tar.gz
 
       # Run the test suite against zquic acting as both client and server.
       # Test cases are ordered from most fundamental to most complex so
