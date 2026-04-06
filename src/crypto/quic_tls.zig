@@ -112,12 +112,9 @@ pub const TRANSPORT_PARAMS_EXT_TYPE: u16 = 0xffa5;
 /// Build a minimal QUIC transport parameters extension for the client.
 /// Returns bytes written to `out`.
 pub fn buildClientTransportParams(out: []u8) usize {
-    // Minimal client transport parameters:
-    // - max_idle_timeout: 30000 ms
-    // - initial_max_data: 1MB
-    // - initial_max_stream_data_bidi_local: 256KB
-    // - initial_max_stream_data_bidi_remote: 256KB
-    // - initial_max_streams_bidi: 100
+    // Transport parameters (also used in Encrypted Extensions for the server role).
+    // Flow-control limits must cover interop "transfer" (multi-megabyte files on
+    // several client-initiated bidirectional streams at once).
     var pos: usize = 0;
 
     const write_param = struct {
@@ -142,10 +139,12 @@ pub fn buildClientTransportParams(out: []u8) usize {
     }.call;
 
     pos = write_param(out, pos, 0x01, 30_000); // max_idle_timeout
-    pos = write_param(out, pos, 0x04, 1_048_576); // initial_max_data
-    pos = write_param(out, pos, 0x05, 262_144); // initial_max_stream_data_bidi_local
-    pos = write_param(out, pos, 0x06, 262_144); // initial_max_stream_data_bidi_remote
+    pos = write_param(out, pos, 0x04, 67_108_864); // initial_max_data (64 MiB)
+    pos = write_param(out, pos, 0x05, 16_777_216); // initial_max_stream_data_bidi_local (16 MiB)
+    pos = write_param(out, pos, 0x06, 16_777_216); // initial_max_stream_data_bidi_remote (16 MiB)
+    pos = write_param(out, pos, 0x07, 16_777_216); // initial_max_stream_data_uni (16 MiB)
     pos = write_param(out, pos, 0x08, 100); // initial_max_streams_bidi
+    pos = write_param(out, pos, 0x09, 100); // initial_max_streams_uni
     return pos;
 }
 

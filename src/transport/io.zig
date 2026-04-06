@@ -414,6 +414,30 @@ pub fn loadPrivateKey(allocator: std.mem.Allocator, path: []const u8) !tls_vendo
 
 // ── Per-connection state ──────────────────────────────────────────────────────
 
+/// One pending HTTP/0.9 file response (served incrementally from the event loop).
+const Http09OutSlot = struct {
+    active: bool = false,
+    stream_id: u64 = 0,
+    file: std.fs.File = undefined,
+    stream_offset: u64 = 0,
+    file_end: u64 = 0,
+
+    fn close(self: *Http09OutSlot) void {
+        if (self.active) {
+            self.file.close();
+            self.active = false;
+        }
+    }
+};
+
+const pending_1rtt_cap: usize = 8;
+
+/// Decrypted 1-RTT coalesced payload queued until the handshake is confirmed.
+const Pending1RttPayload = struct {
+    len: usize = 0,
+    data: [4096]u8 = undefined,
+};
+
 /// Connection lifecycle state.
 pub const ConnPhase = enum {
     /// Waiting for ClientHello Initial packet.
@@ -465,6 +489,13 @@ pub const ConnState = struct {
 
     // HTTP/3 state: whether the server control stream was sent
     h3_settings_sent: bool = false,
+
+    /// HTTP/0.9 responses in progress (parallel downloads per connection).
+    http09_slots: [8]Http09OutSlot = [_]Http09OutSlot{.{}} ** 8,
+
+    /// 1-RTT frames received while waiting for client Finished (reordering).
+    pending_1rtt: [pending_1rtt_cap]Pending1RttPayload = [_]Pending1RttPayload{.{}} ** pending_1rtt_cap,
+    pending_1rtt_n: usize = 0,
 
     // Retry token (set when server sends Retry; included in next Initial)
     retry_token: [64]u8 = [_]u8{0} ** 64,
@@ -593,6 +624,14 @@ pub const Server = struct {
         const addr = try std.net.Address.parseIp4("0.0.0.0", config.port);
         try std.posix.bind(sock, &addr.any, addr.getOsSockLen());
 
+        // Large buffers help bulk HTTP/0.9 transfers: without them, a tight send
+        // loop in handleHttp09Stream can fill the default SNDBUF and drop packets
+        // before the kernel pushes them onto the simulated link.
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+
         std.debug.print("io: server bound on 0.0.0.0:{d}\n", .{config.port});
 
         // Diagnostic raw socket: capture all incoming UDP at IP level.
@@ -648,13 +687,33 @@ pub const Server = struct {
                 nfds = 2;
             }
 
-            const ready = std.posix.poll(fds[0..nfds], 2000) catch |err| {
+            var poll_timeout_ms: i32 = 2000;
+            for (&self.conns) |*cslot| {
+                if (cslot.*) |*conn| {
+                    for (&conn.http09_slots) |*slot| {
+                        if (slot.active) {
+                            poll_timeout_ms = 50;
+                            break;
+                        }
+                    }
+                }
+                if (poll_timeout_ms == 50) break;
+            }
+
+            const ready = std.posix.poll(fds[0..nfds], poll_timeout_ms) catch |err| {
                 std.debug.print("io: poll error: {}\n", .{err});
+                self.flushPendingHttp09Responses();
                 continue;
             };
             if (ready == 0) {
-                idle_secs += 2;
-                std.debug.print("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
+                if (poll_timeout_ms >= 2000) {
+                    idle_secs += 2;
+                    std.debug.print("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
+                }
+                // Pending HTTP/0.9 bodies must keep draining even when the socket
+                // is not readable (poll timeout); otherwise we stall until the next
+                // inbound datagram and the transfer test starves.
+                self.flushPendingHttp09Responses();
                 continue;
             }
             idle_secs = 0;
@@ -686,25 +745,35 @@ pub const Server = struct {
                 }
             }
 
-            // Read from main UDP socket.
+            // Read from main UDP socket — first datagram blocking (matches POLL.IN),
+            // then drain the rest with DONTWAIT so ACK batches are not processed
+            // one wakeup per datagram.
             if (fds[0].revents & std.posix.POLL.IN != 0) {
-                var src_addr: std.posix.sockaddr.storage = undefined;
-                var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-                const n = std.posix.recvfrom(
-                    self.sock,
-                    &recv_buf,
-                    0,
-                    @ptrCast(&src_addr),
-                    &src_len,
-                ) catch |err| {
-                    std.debug.print("io: recvfrom error: {}\n", .{err});
-                    continue;
-                };
-                std.debug.print("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
+                var drained: usize = 0;
+                while (true) {
+                    var src_addr: std.posix.sockaddr.storage = undefined;
+                    var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
+                    const flags: u32 = if (drained == 0) 0 else std.posix.MSG.DONTWAIT;
+                    const n = std.posix.recvfrom(
+                        self.sock,
+                        &recv_buf,
+                        flags,
+                        @ptrCast(&src_addr),
+                        &src_len,
+                    ) catch |err| {
+                        if (drained > 0 and err == error.WouldBlock) break;
+                        std.debug.print("io: recvfrom error: {}\n", .{err});
+                        break;
+                    };
+                    drained += 1;
+                    std.debug.print("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
 
-                const src = std.net.Address{ .any = @as(*const std.posix.sockaddr, @ptrCast(&src_addr)).* };
-                self.processPacket(recv_buf[0..n], src);
+                    const src = std.net.Address{ .any = @as(*const std.posix.sockaddr, @ptrCast(&src_addr)).* };
+                    self.processPacket(recv_buf[0..n], src);
+                }
             }
+
+            self.flushPendingHttp09Responses();
         }
     }
 
@@ -1162,6 +1231,13 @@ pub const Server = struct {
         std.debug.print("io: handshake complete for connection\n", .{});
         conn.phase = .connected;
 
+        const pending_n = conn.pending_1rtt_n;
+        conn.pending_1rtt_n = 0;
+        for (0..pending_n) |i| {
+            const pl = conn.pending_1rtt[i];
+            self.processAppFrames(conn, pl.data[0..pl.len], conn.peer);
+        }
+
         if (self.config.keylog_path) |kpath| {
             writeKeylog(kpath, conn.tls.ch.random, &conn.tls.secrets);
         }
@@ -1237,7 +1313,7 @@ pub const Server = struct {
         // Find connection by scanning CID prefix
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
-                if (conn.phase != .connected) continue;
+                if (conn.phase != .connected and conn.phase != .waiting_finished) continue;
                 if (!conn.has_app_keys) continue;
                 const cid_len = conn.local_cid.len;
                 if (buf.len < 1 + cid_len) continue;
@@ -1252,19 +1328,49 @@ pub const Server = struct {
                 // Must remove HP first before reading bit 2 (RFC 9001 §5.4.1).
                 const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &conn.app_client_km, conn.use_chacha20) orelse continue;
                 const incoming_phase = (unprotected_first & 0x04) != 0;
-                if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
-                    conn.app_client_km = conn.app_client_km.nextGen();
-                }
-                const pt_len = unprotect1RttPacket(
-                    &plaintext,
-                    buf,
-                    pn_start,
-                    &conn.app_client_km,
-                    conn.use_chacha20,
-                ) catch continue;
+
+                // Try current recv keys first. Only use next key generation when the
+                // current keys fail and the Key Phase bit indicates an update — avoids
+                // mis-sampled HP flipping keys before the first post-handshake packet.
+                const pt_len: usize = decrypt: {
+                    if (unprotect1RttPacket(
+                        &plaintext,
+                        buf,
+                        pn_start,
+                        &conn.app_client_km,
+                        conn.use_chacha20,
+                    )) |n| {
+                        break :decrypt n;
+                    } else |_| {}
+                    if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
+                        var nk = conn.app_client_km.nextGen();
+                        if (unprotect1RttPacket(
+                            &plaintext,
+                            buf,
+                            pn_start,
+                            &nk,
+                            conn.use_chacha20,
+                        )) |n| {
+                            conn.app_client_km = nk;
+                            break :decrypt n;
+                        } else |_| {}
+                    }
+                    continue;
+                };
 
                 conn.peer_key_phase = incoming_phase;
                 conn.key_update_pending = false;
+
+                if (conn.phase == .waiting_finished) {
+                    // Client Finished may still be in flight; 1-RTT can arrive first.
+                    if (conn.pending_1rtt_n < pending_1rtt_cap) {
+                        const slotp = &conn.pending_1rtt[conn.pending_1rtt_n];
+                        slotp.len = pt_len;
+                        @memcpy(slotp.data[0..pt_len], plaintext[0..pt_len]);
+                        conn.pending_1rtt_n += 1;
+                    }
+                    return;
+                }
 
                 // Process application frames
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
@@ -1312,6 +1418,21 @@ pub const Server = struct {
             if (ft == 0x02 or ft == 0x03) {
                 // ACK frame — parse and skip all variable-length fields.
                 pos += skipAckBody(frames[pos..], ft == 0x03);
+                continue;
+            }
+            if (ft == 0x10) {
+                const v = varint.decode(frames[pos..]) catch return;
+                pos += v.len;
+                continue;
+            }
+            if (ft == 0x11) {
+                const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
+                pos += r.consumed;
+                continue;
+            }
+            if (ft == 0x12 or ft == 0x13) {
+                const v = varint.decode(frames[pos..]) catch return;
+                pos += v.len;
                 continue;
             }
             if (ft == 0x1a) {
@@ -1373,6 +1494,55 @@ pub const Server = struct {
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch {};
     }
 
+    /// Send the next STREAM chunk for one queued HTTP/0.9 response.
+    fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
+        var file_buf: [1200]u8 = undefined;
+        const n = slot.file.read(&file_buf) catch {
+            slot.close();
+            return;
+        };
+        if (n == 0) {
+            slot.close();
+            return;
+        }
+        const fin = slot.stream_offset + @as(u64, @intCast(n)) >= slot.file_end;
+        const sf_out = stream_frame_mod.StreamFrame{
+            .stream_id = slot.stream_id,
+            .offset = slot.stream_offset,
+            .data = file_buf[0..n],
+            .fin = fin,
+            .has_length = true,
+        };
+        slot.stream_offset += @intCast(n);
+        var frame_buf: [2048]u8 = undefined;
+        const frame_len = sf_out.serialize(&frame_buf) catch {
+            slot.close();
+            return;
+        };
+        self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
+        if (fin) slot.close();
+    }
+
+    /// Drain queued HTTP/0.9 bodies a little at a time so recv/ACK processing can run.
+    fn flushPendingHttp09Responses(self: *Server) void {
+        var budget: usize = 256;
+        while (budget > 0) {
+            var progressed = false;
+            for (&self.conns) |*cslot| {
+                if (cslot.*) |*conn| {
+                    for (&conn.http09_slots) |*slot| {
+                        if (!slot.active) continue;
+                        if (budget == 0) return;
+                        self.http09SendNextChunk(conn, slot);
+                        progressed = true;
+                        budget -= 1;
+                    }
+                }
+            }
+            if (!progressed) break;
+        }
+    }
+
     /// Send a PATH_CHALLENGE frame to validate a new peer address.
     fn sendPathChallenge(self: *Server, conn: *ConnState, data: [8]u8, dst: std.net.Address) void {
         var frame_buf: [64]u8 = undefined;
@@ -1396,9 +1566,14 @@ pub const Server = struct {
     }
 
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+        _ = src;
         // Only unidirectional client-initiated streams carry HTTP/0.9 requests
         if (sf.stream_id % 4 != 0 and sf.stream_id % 4 != 2) return;
         if (sf.data.len == 0) return;
+
+        for (&conn.http09_slots) |*slot| {
+            if (slot.active and slot.stream_id == sf.stream_id) return;
+        }
 
         var req_buf: [http09_server.max_request_len]u8 = undefined;
         @memcpy(req_buf[0..sf.data.len], sf.data);
@@ -1411,28 +1586,24 @@ pub const Server = struct {
             std.debug.print("io: file not found: {s}\n", .{fs_path});
             return;
         };
-        defer file.close();
+        const file_end = file.getEndPos() catch {
+            file.close();
+            return;
+        };
 
-        var file_buf: [1024]u8 = undefined;
-        var stream_offset: u64 = 0;
-        while (true) {
-            const n = file.read(&file_buf) catch break;
-            if (n == 0) break;
-
-            const fin = (file.getEndPos() catch 0) == (file.getPos() catch 1);
-            const sf_out = stream_frame_mod.StreamFrame{
+        for (&conn.http09_slots) |*slot| {
+            if (slot.active) continue;
+            slot.* = .{
+                .active = true,
                 .stream_id = sf.stream_id,
-                .offset = stream_offset,
-                .data = file_buf[0..n],
-                .fin = fin,
-                .has_length = true,
+                .file = file,
+                .stream_offset = 0,
+                .file_end = file_end,
             };
-            stream_offset += n;
-
-            var frame_buf: [1200]u8 = undefined;
-            const frame_len = sf_out.serialize(&frame_buf) catch break;
-            self.send1Rtt(conn, frame_buf[0..frame_len], src);
+            return;
         }
+        std.debug.print("io: http/0.9 out slots full\n", .{});
+        file.close();
     }
 
     fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
@@ -1627,6 +1798,11 @@ pub const Client = struct {
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
         const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
         errdefer std.posix.close(sock);
+
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
 
         var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
         const dcid = ConnectionId.random(prng.random(), 8);
@@ -2252,7 +2428,7 @@ pub const Client = struct {
 
         // Wait for all downloads to complete (receive STREAM data + FIN)
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const deadline = std.time.milliTimestamp() + 30_000;
+        const deadline = std.time.milliTimestamp() + 60_000;
         while (std.time.milliTimestamp() < deadline) {
             if (self.streams_done >= self.config.urls.len) break;
 
@@ -2261,10 +2437,18 @@ pub const Client = struct {
             if (ready == 0) continue;
             if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
-            var src_addr: std.posix.sockaddr.storage = undefined;
-            var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-            const n = std.posix.recvfrom(self.sock, &recv_buf, 0, @ptrCast(&src_addr), &src_len) catch continue;
-            self.processPacket(recv_buf[0..n]);
+            var drained: usize = 0;
+            while (true) {
+                var src_addr: std.posix.sockaddr.storage = undefined;
+                var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
+                const flags: u32 = if (drained == 0) 0 else std.posix.MSG.DONTWAIT;
+                const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
+                    if (drained > 0 and err == error.WouldBlock) break;
+                    break;
+                };
+                drained += 1;
+                self.processPacket(recv_buf[0..n]);
+            }
         }
 
         // Close all stream files
