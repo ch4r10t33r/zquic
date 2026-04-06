@@ -211,6 +211,18 @@ pub fn build1RttPacketWithPhase(
     km: *const KeyMaterial,
     key_phase: bool,
 ) !usize {
+    return build1RttPacketFull(out, dcid, payload, pn, km, key_phase, false);
+}
+
+pub fn build1RttPacketFull(
+    out: []u8,
+    dcid: ConnectionId,
+    payload: []const u8,
+    pn: u64,
+    km: *const KeyMaterial,
+    key_phase: bool,
+    chacha20: bool,
+) !usize {
     var hdr_buf: [64]u8 = undefined;
     var hp: usize = 0;
 
@@ -222,7 +234,24 @@ pub fn build1RttPacketWithPhase(
     @memcpy(hdr_buf[hp .. hp + dcid.len], dcid.slice());
     hp += dcid.len;
 
+    if (chacha20) {
+        return initial_mod.protectPacketChaCha20(out, hdr_buf[0..hp], pn, 0, payload, km);
+    }
     return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
+}
+
+/// Decrypt a 1-RTT packet, selecting AES or ChaCha20 based on the cipher flag.
+pub fn unprotect1RttPacket(
+    dst: []u8,
+    buf: []const u8,
+    pn_start: usize,
+    km: *const KeyMaterial,
+    chacha20: bool,
+) !usize {
+    if (chacha20) {
+        return initial_mod.unprotectPacketChaCha20(dst, buf, pn_start, buf.len, km);
+    }
+    return initial_mod.unprotectInitialPacket(dst, buf, pn_start, buf.len, km);
 }
 
 // ── QUIC packet decryption ────────────────────────────────────────────────────
@@ -358,6 +387,9 @@ pub const ConnState = struct {
     // Non-null while waiting for a PATH_RESPONSE from the new address.
     path_challenge_data: ?[8]u8 = null,
 
+    // Cipher suite in use for 1-RTT packets (true = ChaCha20-Poly1305).
+    use_chacha20: bool = false,
+
     // TLS handshake state machine (server side)
     tls: ServerHandshake = undefined,
     tls_inited: bool = false,
@@ -405,6 +437,7 @@ pub const ServerConfig = struct {
     http3: bool = false,
     key_update: bool = false,
     migrate: bool = false,
+    chacha20: bool = false,
 };
 
 // ── QUIC Server ───────────────────────────────────────────────────────────────
@@ -678,6 +711,11 @@ pub const Server = struct {
         // (secrets are now available after processClientHello)
         conn.deriveHandshakeKeys(&conn.tls.secrets);
 
+        // Set cipher based on what was negotiated with the client.
+        if (conn.tls.ch.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
+            conn.use_chacha20 = true;
+        }
+
         // Build and send server flight
         self.buildAndSendServerFlight(conn, src);
     }
@@ -923,17 +961,7 @@ pub const Server = struct {
             }
         }
 
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacket(
-            &send_buf,
-            conn.remote_cid,
-            frames_buf[0..fp],
-            conn.app_pn,
-            &conn.app_server_km,
-        ) catch return;
-        conn.app_pn += 1;
-
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+        self.send1Rtt(conn, frames_buf[0..fp], src);
     }
 
     fn process1RttPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
@@ -957,12 +985,12 @@ pub const Server = struct {
                 // Try to decrypt with current client app keys.
                 var plaintext: [4096]u8 = undefined;
                 const pn_start = 1 + cid_len;
-                const pt_len = initial_mod.unprotectInitialPacket(
+                const pt_len = unprotect1RttPacket(
                     &plaintext,
                     buf,
                     pn_start,
-                    buf.len,
                     &conn.app_client_km,
+                    conn.use_chacha20,
                 ) catch continue;
 
                 conn.peer_key_phase = incoming_phase;
@@ -986,17 +1014,7 @@ pub const Server = struct {
 
         // Send a PING so the peer can verify the new keys.
         const ping_frame = [_]u8{0x01};
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacketWithPhase(
-            &send_buf,
-            conn.remote_cid,
-            &ping_frame,
-            conn.app_pn,
-            &conn.app_server_km,
-            conn.key_phase_bit,
-        ) catch return;
-        conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+        self.send1Rtt(conn, &ping_frame, src);
     }
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
@@ -1056,24 +1074,34 @@ pub const Server = struct {
         }
     }
 
+    /// Encrypt and send a 1-RTT packet, selecting AES or ChaCha20 per conn.
+    fn send1Rtt(self: *Server, conn: *ConnState, payload: []const u8, dst: std.net.Address) void {
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            conn.remote_cid,
+            payload,
+            conn.app_pn,
+            &conn.app_server_km,
+            conn.key_phase_bit,
+            conn.use_chacha20,
+        ) catch return;
+        conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch {};
+    }
+
     /// Send a PATH_CHALLENGE frame to validate a new peer address.
     fn sendPathChallenge(self: *Server, conn: *ConnState, data: [8]u8, dst: std.net.Address) void {
         var frame_buf: [64]u8 = undefined;
         const frame_len = transport_frames.PathChallenge.serialize(.{ .data = data }, &frame_buf) catch return;
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacket(&send_buf, conn.remote_cid, frame_buf[0..frame_len], conn.app_pn, &conn.app_server_km) catch return;
-        conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch {};
+        self.send1Rtt(conn, frame_buf[0..frame_len], dst);
     }
 
     /// Send a PATH_RESPONSE echoing the challenge data back to the sender.
     fn sendPathResponse(self: *Server, conn: *ConnState, data: [8]u8, dst: std.net.Address) void {
         var frame_buf: [64]u8 = undefined;
         const frame_len = transport_frames.PathResponse.serialize(.{ .data = data }, &frame_buf) catch return;
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacket(&send_buf, conn.remote_cid, frame_buf[0..frame_len], conn.app_pn, &conn.app_server_km) catch return;
-        conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch {};
+        self.send1Rtt(conn, frame_buf[0..frame_len], dst);
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
@@ -1120,18 +1148,7 @@ pub const Server = struct {
 
             var frame_buf: [1200]u8 = undefined;
             const frame_len = sf_out.serialize(&frame_buf) catch break;
-
-            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacket(
-                &send_buf,
-                conn.remote_cid,
-                frame_buf[0..frame_len],
-                conn.app_pn,
-                &conn.app_server_km,
-            ) catch break;
-            conn.app_pn += 1;
-
-            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+            self.send1Rtt(conn, frame_buf[0..frame_len], src);
         }
     }
 
@@ -1249,18 +1266,7 @@ pub const Server = struct {
         };
         var frame_buf: [300]u8 = undefined;
         const frame_len = sf.serialize(&frame_buf) catch return;
-
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacket(
-            &send_buf,
-            conn.remote_cid,
-            frame_buf[0..frame_len],
-            conn.app_pn,
-            &conn.app_server_km,
-        ) catch return;
-        conn.app_pn += 1;
-
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+        self.send1Rtt(conn, frame_buf[0..frame_len], src);
     }
 
     fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: std.net.Address) void {
@@ -1285,18 +1291,7 @@ pub const Server = struct {
         };
         var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const frame_len = sf.serialize(&frame_buf) catch return;
-
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacket(
-            &send_buf,
-            conn.remote_cid,
-            frame_buf[0..frame_len],
-            conn.app_pn,
-            &conn.app_server_km,
-        ) catch return;
-        conn.app_pn += 1;
-
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch {};
+        self.send1Rtt(conn, frame_buf[0..frame_len], src);
     }
 };
 
@@ -1313,6 +1308,7 @@ pub const ClientConfig = struct {
     key_update: bool = false,
     http09: bool = false,
     http3: bool = false,
+    chacha20: bool = false,
 };
 
 // ── Stream download tracker ───────────────────────────────────────────────────
@@ -1429,7 +1425,10 @@ pub const Client = struct {
         var quic_tp_buf: [128]u8 = undefined;
         const quic_tp = buildClientTransportParams(&quic_tp_buf);
 
-        const ch_len = try self.tls.buildClientHelloMsg(&ch_buf, quic_tp, alpn, self.config.host);
+        const ch_len = if (self.config.chacha20)
+            try self.tls.buildClientHelloMsgChaCha20(&ch_buf, quic_tp, alpn, self.config.host)
+        else
+            try self.tls.buildClientHelloMsg(&ch_buf, quic_tp, alpn, self.config.host);
 
         // CRYPTO frame
         const crypto_len = try buildCryptoFrame(&frame_buf, 0, ch_buf[0..ch_len]);
@@ -1527,14 +1526,18 @@ pub const Client = struct {
             const dlen: usize = @intCast(dlen_r.value);
             if (pos + dlen > pt_len) break;
             const cdata = plaintext[pos .. pos + dlen];
-            if (cdata.len >= 4 and cdata[0] == tls_hs.MSG_SERVER_HELLO) {
-                self.tls.processServerHello(cdata) catch |err| {
-                    std.debug.print("io: processServerHello failed: {}\n", .{err});
-                    return;
-                };
-                // Now we have handshake secrets — derive QUIC keys
-                self.conn.deriveHandshakeKeys(&self.tls.secrets);
-            }
+                if (cdata.len >= 4 and cdata[0] == tls_hs.MSG_SERVER_HELLO) {
+                    self.tls.processServerHello(cdata) catch |err| {
+                        std.debug.print("io: processServerHello failed: {}\n", .{err});
+                        return;
+                    };
+                    // Now we have handshake secrets — derive QUIC keys
+                    self.conn.deriveHandshakeKeys(&self.tls.secrets);
+                    // Set cipher based on what the server negotiated.
+                    if (self.tls.cipher_suite == tls_hs.TLS_CHACHA20_POLY1305_SHA256) {
+                        self.conn.use_chacha20 = true;
+                    }
+                }
             pos += dlen;
         }
     }
@@ -1633,12 +1636,12 @@ pub const Client = struct {
 
         var plaintext: [4096]u8 = undefined;
         const pn_start = 1 + cid_len;
-        const pt_len = initial_mod.unprotectInitialPacket(
+        const pt_len = unprotect1RttPacket(
             &plaintext,
             buf,
             pn_start,
-            buf.len,
             &self.conn.app_server_km,
+            self.conn.use_chacha20,
         ) catch return;
 
         self.conn.peer_key_phase = incoming_phase;
@@ -1753,7 +1756,15 @@ pub const Client = struct {
         var frame_buf: [64]u8 = undefined;
         const frame_len = transport_frames.PathResponse.serialize(.{ .data = data }, &frame_buf) catch return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build1RttPacket(&send_buf, self.conn.remote_cid, frame_buf[0..frame_len], self.conn.app_pn, &self.conn.app_client_km) catch return;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            frame_buf[0..frame_len],
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch return;
         self.conn.app_pn += 1;
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
     }
@@ -1829,12 +1840,14 @@ pub const Client = struct {
             const frame_len = sf.serialize(&frame_buf) catch continue;
 
             var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacket(
+            const pkt_len = build1RttPacketFull(
                 &send_buf,
                 self.conn.remote_cid,
                 frame_buf[0..frame_len],
                 self.conn.app_pn,
                 &self.conn.app_client_km,
+                self.conn.key_phase_bit,
+                self.conn.use_chacha20,
             ) catch continue;
             self.conn.app_pn += 1;
 

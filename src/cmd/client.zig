@@ -13,6 +13,7 @@
 //!   --qlog-dir <dir>  qlog output directory
 //!   --http09          Use HTTP/0.9 (for transfer test case)
 //!   --http3           Use HTTP/3
+//!   --chacha20        Prefer ChaCha20-Poly1305 cipher suite
 //!   --retry           Expect and handle a Retry packet
 //!   --resumption      Attempt session resumption
 //!   --early-data      Send 0-RTT early data
@@ -42,6 +43,7 @@ const Config = struct {
     migrate: bool = false,
     rebind: bool = false,
     key_update: bool = false,
+    chacha20: bool = false,
 };
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -91,6 +93,8 @@ fn parseArgs(args: []const []const u8) !Config {
             cfg.rebind = true;
         } else if (std.mem.eql(u8, arg, "--key-update")) {
             cfg.key_update = true;
+        } else if (std.mem.eql(u8, arg, "--chacha20")) {
+            cfg.chacha20 = true;
         } else {
             std.debug.print("Unknown flag: {s}\n", .{arg});
             return error.UnknownFlag;
@@ -127,6 +131,7 @@ pub fn main() !void {
         .key_update = cfg.key_update,
         .http09 = cfg.http09,
         .http3 = cfg.http3,
+        .chacha20 = cfg.chacha20,
     };
 
     var client = io_mod.Client.init(allocator, client_config) catch |err| {

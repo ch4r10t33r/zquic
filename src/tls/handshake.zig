@@ -536,6 +536,29 @@ pub fn buildClientHello(
     alpn: ?[]const u8,
     server_name: ?[]const u8,
 ) !usize {
+    return buildClientHelloInner(out, client_x25519_pub, quic_transport_params, alpn, server_name, false);
+}
+
+/// Build a ClientHello that advertises ChaCha20-Poly1305 as the preferred
+/// cipher suite, followed by AES-128-GCM as fallback.
+pub fn buildClientHelloChaCha20(
+    out: []u8,
+    client_x25519_pub: *const [32]u8,
+    quic_transport_params: []const u8,
+    alpn: ?[]const u8,
+    server_name: ?[]const u8,
+) !usize {
+    return buildClientHelloInner(out, client_x25519_pub, quic_transport_params, alpn, server_name, true);
+}
+
+fn buildClientHelloInner(
+    out: []u8,
+    client_x25519_pub: *const [32]u8,
+    quic_transport_params: []const u8,
+    alpn: ?[]const u8,
+    server_name: ?[]const u8,
+    prefer_chacha20: bool,
+) !usize {
     var client_random: [32]u8 = undefined;
     crypto.random.bytes(&client_random);
 
@@ -617,9 +640,11 @@ pub fn buildClientHello(
         ep += a.len;
     }
 
-    // Body: version(2) + random(32) + sid_len(1) + cs_list(4) + comp(2) + exts(2+ep)
-    // cipher suites: 2 (list_len) + 2 (TLS_AES_128_GCM_SHA256) = 4
-    const body_len = 2 + 32 + 1 + 4 + 2 + 2 + ep;
+    // Body: version(2) + random(32) + sid_len(1) + cs_list + comp(2) + exts(2+ep)
+    // cipher suites: 2 (list_len) + 2*num_suites (suite values)
+    // When prefer_chacha20 is true, advertise both suites (4 bytes of data).
+    const cs_data_len: usize = if (prefer_chacha20) 4 else 2;
+    const body_len = 2 + 32 + 1 + (2 + cs_data_len) + 2 + 2 + ep;
     if (out.len < 4 + body_len) return error.BufferTooSmall;
 
     var pos: usize = writeHsMsgHeader(out, 0, MSG_CLIENT_HELLO, body_len);
@@ -629,10 +654,17 @@ pub fn buildClientHello(
     pos += 32;
     out[pos] = 0; // session_id = empty
     pos += 1;
-    writeU16(out[pos..], 2); // cipher_suites list length
+    writeU16(out[pos..], @intCast(cs_data_len)); // cipher_suites list byte length
     pos += 2;
-    writeU16(out[pos..], TLS_AES_128_GCM_SHA256);
-    pos += 2;
+    if (prefer_chacha20) {
+        writeU16(out[pos..], TLS_CHACHA20_POLY1305_SHA256);
+        pos += 2;
+        writeU16(out[pos..], TLS_AES_128_GCM_SHA256);
+        pos += 2;
+    } else {
+        writeU16(out[pos..], TLS_AES_128_GCM_SHA256);
+        pos += 2;
+    }
     out[pos] = 1; // compression methods length
     pos += 1;
     out[pos] = 0; // no compression
@@ -795,6 +827,8 @@ pub const ClientHandshake = struct {
     secrets: TrafficSecrets,
     handshake_secret: [32]u8,
     handshake_done: bool,
+    /// Cipher suite chosen by the server (set after processServerHello).
+    cipher_suite: u16 = TLS_AES_128_GCM_SHA256,
 
     pub fn init() ClientHandshake {
         return .{
@@ -819,6 +853,19 @@ pub const ClientHandshake = struct {
         return n;
     }
 
+    /// Variant that advertises ChaCha20-Poly1305 as the preferred cipher suite.
+    pub fn buildClientHelloMsgChaCha20(
+        self: *ClientHandshake,
+        out: []u8,
+        quic_tp: []const u8,
+        alpn: ?[]const u8,
+        server_name: ?[]const u8,
+    ) !usize {
+        const n = try buildClientHelloChaCha20(out, &self.kp.public_key, quic_tp, alpn, server_name);
+        self.transcript.update(out[0..n]);
+        return n;
+    }
+
     /// Process ServerHello bytes. Derives handshake secrets.
     pub fn processServerHello(self: *ClientHandshake, sh_bytes: []const u8) !void {
         if (sh_bytes.len < 4) return error.TruncatedMessage;
@@ -830,6 +877,9 @@ pub const ClientHandshake = struct {
         var p: usize = 2 + 32;
         const sid_len = body[p];
         p += 1 + sid_len;
+        if (p + 3 <= body.len) {
+            self.cipher_suite = readU16(body[p..]);
+        }
         p += 2 + 1; // cipher_suite + compression
 
         // Parse extensions for key_share
