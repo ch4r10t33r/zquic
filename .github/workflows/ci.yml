@@ -162,7 +162,7 @@ jobs:
           python3 run.py \
             --client zquic \
             --server zquic \
-            --test handshake,transfer,retry,resumption,zerortt,http3,keyupdate,connectionmigration,multiconnect \
+            --test handshake,transfer,retry,resumption,zerortt,http3,chacha20,keyupdate,connectionmigration,multiplexing \
             --log-dir ../interop-results/logs \
             --json ../interop-results/results.json \
             --debug
