@@ -31,6 +31,7 @@ const session_mod = @import("../crypto/session.zig");
 const h3_frame = @import("../http3/frame.zig");
 const h3_qpack = @import("../http3/qpack.zig");
 const transport_frames = @import("../frames/transport.zig");
+const version_neg_mod = @import("../packet/version_negotiation.zig");
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -533,6 +534,14 @@ pub const Server = struct {
         if (buf[0] & 0x80 != 0) {
             // Long header
             const lh = header_mod.parseLong(buf) catch return;
+            // RFC 9000 §6.1: respond with Version Negotiation for any
+            // unsupported version so that readiness probes (wait-for-it-quic
+            // sends version 0x57415449 "WAIT") get a proper reply and do not
+            // consume connection slots.
+            if (lh.header.version != version_neg_mod.QUIC_V1) {
+                self.sendVersionNegotiation(lh.header.scid.slice(), lh.header.dcid.slice(), src);
+                return;
+            }
             switch (lh.header.packet_type) {
                 .initial => self.processInitialPacket(buf, src),
                 .handshake => self.processHandshakePacket(buf, src),
@@ -656,6 +665,16 @@ pub const Server = struct {
     }
 
     /// Send a Retry packet to the client.
+    /// RFC 9000 §6: send a Version Negotiation packet advertising QUIC v1.
+    /// `client_scid` and `client_dcid` are from the client's packet; the VN
+    /// packet echoes them back swapped (server DCID = client SCID, server SCID
+    /// = client DCID) so the client can match the response.
+    fn sendVersionNegotiation(self: *Server, client_scid: []const u8, client_dcid: []const u8, dst: std.net.Address) void {
+        var buf: [64]u8 = undefined;
+        const n = version_neg_mod.build(&buf, client_scid, client_dcid, &[_]u32{version_neg_mod.QUIC_V1}) catch return;
+        _ = std.posix.sendto(self.sock, buf[0..n], 0, &dst.any, dst.getOsSockLen()) catch {};
+    }
+
     fn sendRetry(self: *Server, odcid: []const u8, scid: []const u8, src: std.net.Address) void {
         // New server SCID for the connection after Retry
         var new_scid: [8]u8 = undefined;
