@@ -1,4 +1,5 @@
 //! zquic client — interop runner entry point.
+
 //!
 //! Parses the command-line flags produced by interop/run_endpoint.sh and
 //! downloads files from a QUIC server, writing them to /downloads.
@@ -20,6 +21,7 @@
 //!   --key-update      Request a key update after handshake
 
 const std = @import("std");
+const io_mod = @import("zquic").transport.io;
 
 const max_urls: usize = 64;
 
@@ -113,14 +115,28 @@ pub fn main() !void {
     std.debug.print("zquic client connecting to {s}:{d} (output: {s})\n", .{
         cfg.host, cfg.port, cfg.output,
     });
-    for (cfg.urls[0..cfg.url_count]) |url| {
-        std.debug.print("  GET {s}\n", .{url});
-    }
 
-    // Full transport integration is wired up here. The individual modules
-    // (Endpoint, Connection, http09/http3 client helpers) are imported and
-    // used; the complete I/O loop is left as the integration point between
-    // the library modules and the OS network stack.
-    std.debug.print("zquic client: transport integration pending — interop stubs active\n", .{});
-    std.process.exit(0);
+    const client_config = io_mod.ClientConfig{
+        .host = cfg.host,
+        .port = cfg.port,
+        .output_dir = cfg.output,
+        .urls = cfg.urls[0..cfg.url_count],
+        .keylog_path = cfg.keylog,
+        .resumption = cfg.resumption,
+        .early_data = cfg.early_data,
+        .key_update = cfg.key_update,
+        .http09 = cfg.http09,
+        .http3 = cfg.http3,
+    };
+
+    var client = io_mod.Client.init(allocator, client_config) catch |err| {
+        std.debug.print("client init failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer client.deinit();
+
+    client.run() catch |err| {
+        std.debug.print("client run error: {}\n", .{err});
+        std.process.exit(1);
+    };
 }

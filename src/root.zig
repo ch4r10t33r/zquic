@@ -28,12 +28,16 @@ pub const loss = struct {
     pub const recovery = @import("loss/recovery.zig");
     pub const congestion = @import("loss/congestion.zig");
 };
+pub const tls = struct {
+    pub const handshake = @import("tls/handshake.zig");
+};
 pub const transport = struct {
     pub const connection = @import("transport/connection.zig");
     pub const endpoint = @import("transport/endpoint.zig");
     pub const flow_control = @import("transport/flow_control.zig");
     pub const stream_manager = @import("transport/stream_manager.zig");
     pub const migration = @import("transport/migration.zig");
+    pub const io = @import("transport/io.zig");
 };
 pub const http3 = struct {
     pub const frame = @import("http3/frame.zig");
@@ -65,6 +69,7 @@ test {
     _ = @import("crypto/quic_tls.zig");
     _ = @import("crypto/session.zig");
     _ = @import("crypto/key_update.zig");
+    _ = @import("tls/handshake.zig");
     _ = @import("loss/recovery.zig");
     _ = @import("loss/congestion.zig");
     _ = @import("transport/connection.zig");
@@ -72,6 +77,7 @@ test {
     _ = @import("transport/flow_control.zig");
     _ = @import("transport/stream_manager.zig");
     _ = @import("transport/migration.zig");
+    _ = @import("transport/io.zig");
     _ = @import("http3/frame.zig");
     _ = @import("http3/qpack.zig");
     _ = @import("http09/server.zig");
