@@ -1,33 +1,25 @@
-# zquic interop runner image
+# zquic interop runner image — self-contained local build
 #
-# Compatible with quic-interop-runner (https://github.com/quic-interop/quic-interop-runner).
+# Downloads Zig at build time, compiles the binaries, then packages them
+# into a slim runtime image. Use this for local docker builds.
 #
-# ── Local build (multi-stage, downloads Zig at build time) ──────────────────
 #   docker build -t zquic-interop -f interop/Dockerfile .
 #
-# ── CI build (pre-built binaries supplied via --build-context) ──────────────
-#   zig build -Doptimize=ReleaseFast
-#   docker build -t zquic-interop \
-#     --build-arg PREBUILT=1 \
-#     -f interop/Dockerfile .
-#
-# The quic-interop-runner will invoke:
-#   docker run --network <...> -e TESTCASE=<...> -e ROLE=<server|client> \
-#              -e SSLKEYLOGFILE=<path> -e QLOGDIR=<path> \
-#              -v /www:/www -v /downloads:/downloads -v /certs:/certs \
-#              zquic-interop
+# For CI builds where binaries are pre-compiled on the runner, use
+# interop/Dockerfile.prebuilt instead.
 
-ARG PREBUILT=0
+# ── Stage 1: compile ────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS builder
 
-# ── Stage 1a: build with local Zig download (PREBUILT=0) ────────────────────
-FROM debian:bookworm-slim AS builder-download
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Download latest Zig 0.15.x dev tarball via the official JSON index.
+# Fetch the latest 0.15.x dev tarball URL from the official JSON index so
+# we do not hardcode a version path that may not exist yet.
 RUN set -eux; \
-    ZIG_URL=$(curl -fsSL https://ziglang.org/download/index.json \
+    INDEX=$(curl -fsSL https://ziglang.org/download/index.json); \
+    ZIG_URL=$(echo "$INDEX" \
         | grep -o '"x86_64-linux":[^}]*' \
         | grep -o '"tarball":"[^"]*"' \
         | head -1 \
@@ -44,15 +36,7 @@ WORKDIR /build
 COPY . .
 RUN zig build -Doptimize=ReleaseFast
 
-# ── Stage 1b: pre-built binaries already on disk (PREBUILT=1) ───────────────
-FROM debian:bookworm-slim AS builder-prebuilt
-WORKDIR /build
-COPY zig-out/ zig-out/
-
-# ── Stage selector ──────────────────────────────────────────────────────────
-FROM builder-${PREBUILT:-download} AS builder
-
-# ── Stage 2: minimal runtime image ──────────────────────────────────────────
+# ── Stage 2: minimal runtime ────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -64,5 +48,4 @@ COPY --from=builder /build/zig-out/bin/client /usr/local/bin/zquic-client
 COPY interop/run_endpoint.sh /run_endpoint.sh
 RUN chmod +x /run_endpoint.sh
 
-# quic-interop-runner convention: entrypoint is /run_endpoint.sh
 ENTRYPOINT ["/run_endpoint.sh"]

@@ -60,15 +60,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Pass PREBUILT=1 so the Dockerfile skips the Zig download stage and
-      # copies the pre-built binaries from zig-out/ directly.
+      # Use Dockerfile.prebuilt which simply COPYs zig-out/bin/* — no Zig
+      # toolchain download needed inside Docker at all.
       - name: Build interop image (no push)
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: interop/Dockerfile
-          build-args: |
-            PREBUILT=1
+          file: interop/Dockerfile.prebuilt
           push: false
           tags: zquic-interop:ci
           cache-from: type=gha
