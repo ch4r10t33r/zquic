@@ -21,9 +21,9 @@ const std = @import("std");
 const keys = @import("keys.zig");
 
 /// Maximum bytes we buffer for a single crypto level's send queue.
-pub const send_buf_len = 16 * 1024;
+pub const send_buf_len = 4096;
 /// Maximum bytes we buffer for a single crypto level's recv queue.
-pub const recv_buf_len = 16 * 1024;
+pub const recv_buf_len = 4096;
 
 /// TLS content-type for Handshake messages (RFC 8446 §5.1)
 const TLS_CONTENT_HANDSHAKE: u8 = 0x16;
