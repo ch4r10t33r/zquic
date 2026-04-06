@@ -18,10 +18,13 @@ jobs:
         with:
           version: "0.15.0"
 
-      - name: Build
+      - name: Build library and binaries
         run: zig build
 
-      - name: Test
+      - name: Build examples
+        run: zig build examples
+
+      - name: Run unit tests
         run: zig build test --summary all
 
   lint:
@@ -41,14 +44,15 @@ jobs:
   interop-image:
     name: Interop Docker Image
     runs-on: ubuntu-latest
-    # Only build the Docker image on pushes to master and on PRs to master.
+    # Build the Docker image on every push to master and on every PR
+    # targeting master so images are always ready for interop testing.
     if: github.ref == 'refs/heads/master' || github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
 
-      # Build the Zig binaries on the runner (avoids downloading Zig inside
-      # the Docker build context, which fails when ziglang.org blocks or when
-      # the version is still a dev build).
+      # Build the Zig binaries on the Actions runner. This avoids
+      # downloading Zig inside the Docker build context (which fails when
+      # ziglang.org is unreachable or the version is a pre-release).
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -60,8 +64,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Use Dockerfile.prebuilt which simply COPYs zig-out/bin/* — no Zig
-      # toolchain download needed inside Docker at all.
+      # Dockerfile.prebuilt simply COPYs zig-out/bin/* — no Zig toolchain
+      # download happens inside Docker.
       - name: Build interop image (no push)
         uses: docker/build-push-action@v5
         with:
@@ -71,3 +75,54 @@ jobs:
           tags: zquic-interop:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ── Interop runner ──────────────────────────────────────────────────────────
+  # Runs the actual quic-interop-runner test suite against the built image.
+  # Triggered only on pushes to master (not on PRs) because:
+  #   • The runner needs Docker images from two implementations to compare.
+  #   • It takes ~10–30 minutes per test case.
+  #   • PRs get the image build above as a fast sanity check.
+  #
+  # To enable: set the INTEROP_RUNNER_ENABLED repository variable to "true"
+  # and ensure the runner host has docker-compose and quic-interop-runner
+  # checked out at $QUIC_INTEROP_RUNNER_PATH.
+  #
+  # Uncomment the block below once the UDP I/O loop is wired up and the
+  # implementation can complete a real handshake.
+  #
+  # interop-run:
+  #   name: Interop Runner
+  #   runs-on: [self-hosted, interop]
+  #   needs: [test, interop-image]
+  #   if: >
+  #     github.ref == 'refs/heads/master' &&
+  #     vars.INTEROP_RUNNER_ENABLED == 'true'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Setup Zig
+  #       uses: mlugg/setup-zig@v2
+  #       with:
+  #         version: "0.15.0"
+  #
+  #     - name: Build release binaries
+  #       run: zig build -Doptimize=ReleaseFast
+  #
+  #     - name: Build and tag interop image
+  #       run: |
+  #         docker build -t zquic -f interop/Dockerfile.prebuilt .
+  #
+  #     - name: Run quic-interop-runner
+  #       working-directory: ${{ env.QUIC_INTEROP_RUNNER_PATH }}
+  #       run: |
+  #         python3 run.py \
+  #           --client zquic \
+  #           --server zquic \
+  #           --test handshake,transfer,retry,resumption,zerortt,http3,keyupdate,connectionmigration,multiconnect \
+  #           --output results/
+  #
+  #     - name: Upload interop results
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: interop-results
+  #         path: ${{ env.QUIC_INTEROP_RUNNER_PATH }}/results/
