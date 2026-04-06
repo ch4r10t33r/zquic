@@ -83,17 +83,25 @@ pub const InitialSecrets = struct {
 };
 
 /// Key material for one direction: key, IV, and header protection key.
+///
+/// `key` (16 bytes) is used for AES-128-GCM.
+/// `key32` (32 bytes) is used for ChaCha20-Poly1305.
+/// Both are derived unconditionally so the struct can serve either suite.
 pub const KeyMaterial = struct {
     secret: [Sha256.digest_length]u8 = undefined,
     key: [16]u8 = undefined,
+    key32: [32]u8 = undefined,
     iv: [12]u8 = undefined,
     hp: [16]u8 = undefined,
+    hp32: [32]u8 = undefined,
 
     /// Derive key, IV, and HP from the secret using HKDF-Expand-Label.
     pub fn expand(self: *KeyMaterial) void {
         hkdfExpandLabel(&self.key, &self.secret, "quic key", "");
+        hkdfExpandLabel(&self.key32, &self.secret, "quic key", "");
         hkdfExpandLabel(&self.iv, &self.secret, "quic iv", "");
         hkdfExpandLabel(&self.hp, &self.secret, "quic hp", "");
+        hkdfExpandLabel(&self.hp32, &self.secret, "quic hp", "");
     }
 
     /// Derive the next-generation key material for key updates (RFC 9001 §6).

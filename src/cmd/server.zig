@@ -19,6 +19,7 @@
 //!   --migrate         Support connection migration
 //!   --rebind          Rebind to a new port after connection established
 //!   --key-update      Perform a key update after the handshake
+//!   --chacha20        Prefer ChaCha20-Poly1305 cipher suite
 
 const std = @import("std");
 const io_mod = @import("zquic").transport.io;
@@ -39,6 +40,7 @@ const Config = struct {
     migrate: bool = false,
     rebind: bool = false,
     key_update: bool = false,
+    chacha20: bool = false,
 };
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -86,6 +88,8 @@ fn parseArgs(args: []const []const u8) !Config {
             cfg.rebind = true;
         } else if (std.mem.eql(u8, arg, "--key-update")) {
             cfg.key_update = true;
+        } else if (std.mem.eql(u8, arg, "--chacha20")) {
+            cfg.chacha20 = true;
         } else {
             std.debug.print("Unknown flag: {s}\n", .{arg});
             return error.UnknownFlag;
@@ -117,6 +121,7 @@ pub fn main() !void {
     if (cfg.http3) std.debug.print("  http/3: enabled\n", .{});
     if (cfg.key_update) std.debug.print("  key-update: enabled\n", .{});
     if (cfg.migrate) std.debug.print("  migration: enabled\n", .{});
+    if (cfg.chacha20) std.debug.print("  chacha20: enabled\n", .{});
 
     const server_config = io_mod.ServerConfig{
         .port = cfg.port,
@@ -130,6 +135,7 @@ pub fn main() !void {
         .http3 = cfg.http3,
         .key_update = cfg.key_update,
         .migrate = cfg.migrate,
+        .chacha20 = cfg.chacha20,
     };
 
     var server = io_mod.Server.init(allocator, server_config) catch |err| {

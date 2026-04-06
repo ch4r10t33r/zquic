@@ -138,6 +138,103 @@ pub fn unprotectInitialPacket(
     return plaintext_len;
 }
 
+/// Encrypt a QUIC 1-RTT packet payload using ChaCha20-Poly1305 and apply
+/// ChaCha20-based header protection (RFC 9001 §5.3, §5.4.4).
+pub fn protectPacketChaCha20(
+    dst: []u8,
+    header: []const u8,
+    pn: u64,
+    pn_len: u2,
+    plaintext: []const u8,
+    km: *const KeyMaterial,
+) aead.AeadError!usize {
+    const actual_pn_len: usize = @as(usize, pn_len) + 1;
+    const ct_and_tag_len = plaintext.len + 16; // Poly1305 tag
+
+    if (dst.len < header.len + actual_pn_len + ct_and_tag_len) return error.BufferTooSmall;
+
+    @memcpy(dst[0..header.len], header);
+    var pos = header.len;
+
+    var pn_buf: [4]u8 = undefined;
+    var i: usize = 0;
+    while (i < actual_pn_len) : (i += 1) {
+        pn_buf[actual_pn_len - 1 - i] = @truncate(pn >> @intCast(i * 8));
+    }
+    @memcpy(dst[pos .. pos + actual_pn_len], pn_buf[0..actual_pn_len]);
+    pos += actual_pn_len;
+
+    const aad_slice = dst[0..pos];
+    const nonce = aead.buildNonce(km.iv, pn);
+
+    try aead.encryptChaCha20Poly1305(dst[pos .. pos + ct_and_tag_len], plaintext, aad_slice, km.key32, nonce);
+    pos += ct_and_tag_len;
+
+    const pn_start = header.len;
+    const sample_start = pn_start + hp_sample_offset;
+    if (pos < sample_start + hp_sample_len) return error.BufferTooSmall;
+    var sample: [hp_sample_len]u8 = undefined;
+    @memcpy(&sample, dst[sample_start .. sample_start + hp_sample_len]);
+
+    const pn_bytes_slice = dst[pn_start .. pn_start + actual_pn_len];
+    const first_byte_mask: u8 = if (dst[0] & 0x80 != 0) 0x0f else 0x1f;
+    aead.HeaderProtection.applyChaCha20(km.hp32, sample, &dst[0], pn_bytes_slice, first_byte_mask);
+
+    return pos;
+}
+
+/// Remove ChaCha20-based header protection and decrypt a QUIC packet payload.
+pub fn unprotectPacketChaCha20(
+    dst: []u8,
+    buf: []const u8,
+    pn_start: usize,
+    payload_end: usize,
+    km: *const KeyMaterial,
+) (aead.AeadError || error{BufferTooShort})!usize {
+    if (buf.len < pn_start + hp_sample_offset + hp_sample_len) return error.BufferTooShort;
+
+    const sample_start = pn_start + hp_sample_offset;
+    var sample: [hp_sample_len]u8 = undefined;
+    @memcpy(&sample, buf[sample_start .. sample_start + hp_sample_len]);
+
+    var header_copy: [1600]u8 = undefined;
+    if (buf.len > header_copy.len) return error.BufferTooShort;
+    @memcpy(header_copy[0..buf.len], buf);
+
+    const first_byte_mask: u8 = if (header_copy[0] & 0x80 != 0) 0x0f else 0x1f;
+
+    // Derive ChaCha20 mask: counter = sample[0..4], nonce = sample[4..16]
+    const counter = std.mem.readInt(u32, sample[0..4], .little);
+    const cc_nonce = sample[4..16].*;
+    var full_mask: [64]u8 = undefined;
+    std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
+
+    header_copy[0] ^= full_mask[0] & first_byte_mask;
+    const actual_pn_len: usize = (header_copy[0] & 0x03) + 1;
+
+    const pn_bytes = header_copy[pn_start .. pn_start + actual_pn_len];
+    for (pn_bytes, 0..) |*b, i| {
+        b.* ^= full_mask[1 + i];
+    }
+
+    var pn: u64 = 0;
+    for (pn_bytes) |b| {
+        pn = (pn << 8) | b;
+    }
+
+    const aad_end = pn_start + actual_pn_len;
+    const aad_slice = header_copy[0..aad_end];
+    const nonce = aead.buildNonce(km.iv, pn);
+    const ciphertext = buf[aad_end..payload_end];
+
+    if (ciphertext.len < 16) return error.BufferTooShort;
+    const plaintext_len = ciphertext.len - 16;
+    if (dst.len < plaintext_len) return error.BufferTooSmall;
+
+    try aead.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad_slice, km.key32, nonce);
+    return plaintext_len;
+}
+
 test "initial: encrypt/decrypt round-trip" {
     const testing = std.testing;
     const dcid = "\x83\x94\xc8\xf0\x3e\x51\x57\x08";
