@@ -404,6 +404,12 @@ pub const ConnState = struct {
     // updated remote_cid to the server's SCID (RFC 9000 §7.2).
     server_cid_confirmed: bool = false,
 
+    // Stored Handshake (Finished) packet for retransmission.
+    // Written in sendClientFinished; retransmitted by the run loop.
+    finished_pkt: [MAX_DATAGRAM_SIZE]u8 = [_]u8{0} ** MAX_DATAGRAM_SIZE,
+    finished_pkt_len: usize = 0,
+    finished_sent_ms: i64 = 0,
+
     // 1-RTT key phase tracking for key updates (RFC 9001 §6).
     // Tracks the current key phase bit for outgoing short-header packets.
     key_phase_bit: bool = false,
@@ -600,6 +606,21 @@ pub const Server = struct {
         return null;
     }
 
+    /// Find an existing connection by the peer's UDP address (for retransmit detection).
+    fn findConnByPeer(self: *Server, peer: std.net.Address) ?*ConnState {
+        for (&self.conns) |*slot| {
+            if (slot.*) |*c| {
+                // Compare family, port, and IP address bytes
+                if (c.peer.any.family == peer.any.family and
+                    std.mem.eql(u8, c.peer.any.data[0..6], peer.any.data[0..6]))
+                {
+                    return c;
+                }
+            }
+        }
+        return null;
+    }
+
     /// Create a new server-side connection.
     fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: std.net.Address) ?*ConnState {
         for (&self.conns) |*slot| {
@@ -635,9 +656,24 @@ pub const Server = struct {
             }
         }
 
-        // Find or create connection
-        var conn: *ConnState = self.findConn(ip.dcid) orelse blk: {
-            // New connection from client
+        // Find or create connection.
+        // First check by DCID (the server's assigned CID once established).
+        // Then check by peer address — a retransmitted Initial from the same
+        // client arrives before the client knows the server's CID (RFC 9002 §6.2).
+        var conn: *ConnState = blk: {
+            if (self.findConn(ip.dcid)) |c| break :blk c;
+
+            if (self.findConnByPeer(src)) |existing| {
+                // Retransmitted Initial: re-send the server flight so the client
+                // can make progress even if our first response was lost.
+                if (existing.phase == .waiting_finished or existing.phase == .connected) {
+                    self.sendInitialServerHello(existing, src);
+                    self.sendHandshakeServerFlight(existing, src);
+                }
+                return;
+            }
+
+            // Truly new connection
             const c = self.newConn(ip.dcid, ip.scid, src) orelse return;
             break :blk c;
         };
@@ -886,8 +922,15 @@ pub const Server = struct {
 
         // Find connection by DCID
         const conn = self.findConn(lh.header.dcid) orelse return;
-        if (conn.phase != .waiting_finished) return;
         if (!conn.has_hs_keys) return;
+
+        // If already connected, the client may be retransmitting its Finished because
+        // our HANDSHAKE_DONE was lost. Re-send it so the client can make progress.
+        if (conn.phase == .connected) {
+            self.sendHandshakeDone(conn, src);
+            return;
+        }
+        if (conn.phase != .waiting_finished) return;
 
         // Parse the Handshake packet: after Long Header = length(varint) + pn + payload
         var pos = lh.consumed;
@@ -1404,6 +1447,13 @@ pub const Client = struct {
     streams_done: usize = 0,
     ticket_store: session_mod.TicketStore = .{},
 
+    // Stored Initial packet for retransmission.
+    // On the first sendClientHello call, the packet is built and stored here.
+    // Subsequent retransmit calls resend this exact buffer to avoid adding the
+    // ClientHello to the TLS transcript a second time.
+    initial_pkt: [MAX_DATAGRAM_SIZE]u8 = [_]u8{0} ** MAX_DATAGRAM_SIZE,
+    initial_pkt_len: usize = 0,
+
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
         const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
         errdefer std.posix.close(sock);
@@ -1442,20 +1492,57 @@ pub const Client = struct {
 
         // Send ClientHello Initial packet
         try self.sendClientHello(server_addr);
+        var last_initial_ms = std.time.milliTimestamp();
 
         // Event loop: receive and process packets
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         var deadline = std.time.milliTimestamp() + 10_000; // 10 second timeout
 
         while (std.time.milliTimestamp() < deadline) {
-            // Poll with 100ms timeout
+            // Poll with 100ms timeout so retransmit timers fire promptly.
             var fds = [1]std.posix.pollfd{.{
                 .fd = self.sock,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
             const ready = std.posix.poll(&fds, 100) catch 0;
+
+            // Retransmit any unacknowledged packets (RFC 9002 §6.2).
+            // Runs unconditionally: poll may return immediately with POLLERR
+            // (e.g. ICMP port-unreachable) before the server is bound, which
+            // would prevent the retransmit timer from ever being reached if the
+            // check were inside the `ready == 0` branch.
+            const now = std.time.milliTimestamp();
+            if (self.conn.phase == .initial and now - last_initial_ms >= 500) {
+                self.sendClientHello(server_addr) catch {};
+                last_initial_ms = now;
+            }
+            if (self.conn.has_hs_keys and self.conn.phase != .connected and
+                self.conn.finished_pkt_len > 0 and now - self.conn.finished_sent_ms >= 500)
+            {
+                _ = std.posix.sendto(
+                    self.sock,
+                    self.conn.finished_pkt[0..self.conn.finished_pkt_len],
+                    0,
+                    &server_addr.any,
+                    server_addr.getOsSockLen(),
+                ) catch {};
+                self.conn.finished_sent_ms = now;
+            }
+
             if (ready == 0) continue;
+
+            // Drain a pending ICMP/socket error (e.g. port-unreachable when
+            // the server is not yet bound) so the next poll() is not
+            // immediately woken by POLLERR again.
+            if (fds[0].revents & std.posix.POLL.ERR != 0) {
+                var dummy: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                var dummy_addr: std.posix.sockaddr.storage = undefined;
+                var dummy_len: std.posix.socklen_t = @sizeOf(@TypeOf(dummy_addr));
+                _ = std.posix.recvfrom(self.sock, &dummy, 0, @ptrCast(&dummy_addr), &dummy_len) catch {};
+                continue;
+            }
+
             if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
             var src_addr: std.posix.sockaddr.storage = undefined;
@@ -1486,11 +1573,24 @@ pub const Client = struct {
     }
 
     fn sendClientHello(self: *Client, server: std.net.Address) !void {
+        // Retransmit: resend the already-built packet without touching the
+        // TLS transcript. buildClientHelloMsg updates the transcript hash;
+        // calling it again would corrupt the handshake keys.
+        if (self.initial_pkt_len > 0) {
+            _ = try std.posix.sendto(
+                self.sock,
+                self.initial_pkt[0..self.initial_pkt_len],
+                0,
+                &server.any,
+                server.getOsSockLen(),
+            );
+            return;
+        }
+
+        // First send: build the ClientHello, updating the transcript once.
         var ch_buf: [2048]u8 = undefined;
         var frame_buf: [2200]u8 = undefined;
-        var pkt_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
-        // Build ClientHello
         const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
         var quic_tp_buf: [128]u8 = undefined;
         const quic_tp = buildClientTransportParams(&quic_tp_buf);
@@ -1512,7 +1612,7 @@ pub const Client = struct {
         const init_km = self.conn.init_keys.?;
         const token = self.conn.retry_token[0..self.conn.retry_token_len];
         const pkt_len = try buildInitialPacket(
-            &pkt_buf,
+            &self.initial_pkt,
             self.conn.remote_cid,
             self.conn.local_cid,
             token,
@@ -1521,8 +1621,9 @@ pub const Client = struct {
             &init_km.client,
         );
         self.conn.init_pn += 1;
+        self.initial_pkt_len = pkt_len;
 
-        _ = try std.posix.sendto(self.sock, pkt_buf[0..pkt_len], 0, &server.any, server.getOsSockLen());
+        _ = try std.posix.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
     }
 
     fn processPacket(self: *Client, buf: []const u8) void {
@@ -1561,6 +1662,9 @@ pub const Client = struct {
         self.conn.remote_cid = rp.scid;
         // Re-derive Initial keys for new DCID
         self.conn.init_keys = InitialSecrets.derive(rp.scid.slice());
+
+        // Force a fresh build for the new Initial (with token and new DCID).
+        self.initial_pkt_len = 0;
 
         // Send a new ClientHello Initial with the token
         self.sendClientHello(self.conn.peer) catch {};
@@ -1709,11 +1813,10 @@ pub const Client = struct {
         if (!self.conn.has_hs_keys) return;
 
         var frame_buf: [256]u8 = undefined;
-        var pkt_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
 
         const crypto_len = buildCryptoFrame(&frame_buf, 0, fin_bytes) catch return;
         const pkt_len = buildHandshakePacket(
-            &pkt_buf,
+            &self.conn.finished_pkt,
             self.conn.remote_cid,
             self.conn.local_cid,
             frame_buf[0..crypto_len],
@@ -1721,10 +1824,12 @@ pub const Client = struct {
             &self.conn.hs_client_km,
         ) catch return;
         self.conn.hs_pn += 1;
+        self.conn.finished_pkt_len = pkt_len;
+        self.conn.finished_sent_ms = std.time.milliTimestamp();
 
         _ = std.posix.sendto(
             self.sock,
-            pkt_buf[0..pkt_len],
+            self.conn.finished_pkt[0..pkt_len],
             0,
             &self.conn.peer.any,
             self.conn.peer.getOsSockLen(),
