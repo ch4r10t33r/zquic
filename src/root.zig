@@ -18,6 +18,7 @@ pub const crypto = struct {
     pub const keys = @import("crypto/keys.zig");
     pub const aead = @import("crypto/aead.zig");
     pub const initial = @import("crypto/initial.zig");
+    pub const quic_tls = @import("crypto/quic_tls.zig");
 };
 pub const frames = struct {
     pub const frame = @import("frames/frame.zig");
@@ -36,6 +37,7 @@ test {
     _ = @import("crypto/keys.zig");
     _ = @import("crypto/aead.zig");
     _ = @import("crypto/initial.zig");
+    _ = @import("crypto/quic_tls.zig");
     _ = @import("frames/frame.zig");
     _ = @import("frames/ack.zig");
     _ = @import("frames/crypto_frame.zig");
