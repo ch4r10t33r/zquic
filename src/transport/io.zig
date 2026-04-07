@@ -710,7 +710,13 @@ pub const Server = struct {
     http09_last_flush_ms: i64 = 0,
 
     /// Initialize server: load cert/key and create UDP socket.
-    pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !Server {
+    pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !*Server {
+        // Heap-allocate the Server to avoid blowing the stack: the conns array
+        // (16 × ConnState, each ≈220 KB) totals ~3.5 MB — too large for a stack
+        // local in main().
+        const self = try allocator.create(Server);
+        errdefer allocator.destroy(self);
+
         // Load certificate DER bytes
         const cert_der = loadCertDer(allocator, config.cert_path) catch |err| {
             std.debug.print("io: cert load failed ({s}): {}\n", .{ config.cert_path, err });
@@ -761,7 +767,7 @@ pub const Server = struct {
         var retry_secret: [32]u8 = undefined;
         std.crypto.random.bytes(&retry_secret);
 
-        return .{
+        self.* = .{
             .allocator = allocator,
             .config = config,
             .sock = sock,
@@ -770,12 +776,14 @@ pub const Server = struct {
             .private_key = pk,
             .retry_secret = retry_secret,
         };
+        return self;
     }
 
     pub fn deinit(self: *Server) void {
         std.posix.close(self.sock);
         if (self.raw_sock) |rs| std.posix.close(rs);
         self.allocator.free(self.cert_der);
+        self.allocator.destroy(self);
     }
 
     /// Run the server event loop (blocking).

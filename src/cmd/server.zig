@@ -138,7 +138,7 @@ pub fn main() !void {
         .chacha20 = cfg.chacha20,
     };
 
-    var server = io_mod.Server.init(allocator, server_config) catch |err| {
+    const server = io_mod.Server.init(allocator, server_config) catch |err| {
         std.debug.print("server init failed: {}\n", .{err});
         std.process.exit(1);
     };
