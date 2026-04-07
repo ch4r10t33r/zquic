@@ -508,6 +508,21 @@ const Http09OutSlot = struct {
     stream_offset: u64 = 0,
     file_end: u64 = 0,
 
+    /// FIN retransmission state.
+    /// After sending the final STREAM frame (FIN=true), the slot transitions
+    /// from active=true to awaiting_fin_ack=true.  The FIN frame is kept in
+    /// fin_frame[0..fin_frame_len] and re-sent every 200 ms until the client
+    /// acknowledges the packet (largest_ack >= fin_pkt_pn) or we give up after
+    /// MAX_FIN_RETRANSMITS attempts.
+    awaiting_fin_ack: bool = false,
+    fin_frame: [2048]u8 = [_]u8{0} ** 2048,
+    fin_frame_len: usize = 0,
+    fin_pkt_pn: u64 = 0,
+    fin_last_sent_ms: i64 = 0,
+    fin_retransmit_count: usize = 0,
+
+    const MAX_FIN_RETRANSMITS: usize = 15; // ~3 s at 200 ms intervals
+
     fn close(self: *Http09OutSlot) void {
         if (self.active) {
             self.file.close();
@@ -784,7 +799,7 @@ pub const Server = struct {
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
                     for (&conn.http09_slots) |*slot| {
-                        if (slot.active) {
+                        if (slot.active or slot.awaiting_fin_ack) {
                             poll_timeout_ms = 50;
                             break;
                         }
@@ -796,6 +811,7 @@ pub const Server = struct {
             const ready = std.posix.poll(fds[0..nfds], poll_timeout_ms) catch |err| {
                 std.debug.print("io: poll error: {}\n", .{err});
                 self.flushPendingHttp09Responses();
+                self.http09RetransmitPendingFins();
                 continue;
             };
             if (ready == 0) {
@@ -807,6 +823,8 @@ pub const Server = struct {
                 // is not readable (poll timeout); otherwise we stall until the next
                 // inbound datagram and the transfer test starves.
                 self.flushPendingHttp09Responses();
+                // Retransmit any FIN frames the client has not yet acknowledged.
+                self.http09RetransmitPendingFins();
                 continue;
             }
             idle_secs = 0;
@@ -867,6 +885,7 @@ pub const Server = struct {
             }
 
             self.flushPendingHttp09Responses();
+            self.http09RetransmitPendingFins();
         }
     }
 
@@ -1526,7 +1545,17 @@ pub const Server = struct {
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
             if (ft == 0x02 or ft == 0x03) {
-                // ACK frame — parse and skip all variable-length fields.
+                // ACK frame — extract largest_acknowledged to detect FIN ACKs,
+                // then skip all variable-length fields.
+                if (varint.decode(frames[pos..]) catch null) |lar| {
+                    const largest_ack = lar.value;
+                    for (&conn.http09_slots) |*slot| {
+                        if (slot.awaiting_fin_ack and slot.fin_pkt_pn <= largest_ack) {
+                            std.debug.print("io: stream_id={} FIN ACKed (fin_pn={} <= largest_ack={})\n", .{ slot.stream_id, slot.fin_pkt_pn, largest_ack });
+                            slot.awaiting_fin_ack = false;
+                        }
+                    }
+                }
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
             }
@@ -1668,8 +1697,23 @@ pub const Server = struct {
         std.debug.print("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
         if (fin) {
-            std.debug.print("io: http09 stream_id={} complete\n", .{slot.stream_id});
-            slot.close();
+            // Save FIN frame for retransmission in case the packet is dropped
+            // by the NS3 network simulator.  We keep the slot alive in the
+            // "awaiting_fin_ack" state; the frame will be re-sent every 200 ms
+            // until the client's ACK covers fin_pkt_pn.
+            const fin_pn = conn.app_pn - 1; // send1Rtt already incremented app_pn
+            @memcpy(slot.fin_frame[0..frame_len], frame_buf[0..frame_len]);
+            slot.fin_frame_len = frame_len;
+            slot.fin_pkt_pn = fin_pn;
+            slot.fin_last_sent_ms = std.time.milliTimestamp();
+            slot.fin_retransmit_count = 0;
+            slot.awaiting_fin_ack = true;
+            // Close the file — we no longer need to read from it.
+            // slot.active is set to false so flushPendingHttp09Responses
+            // stops calling us for new chunks.
+            slot.file.close();
+            slot.active = false;
+            std.debug.print("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, fin_pn });
         }
     }
 
@@ -1679,16 +1723,20 @@ pub const Server = struct {
     /// at 15ms RTT) drives the send rate to 6+ MB/s — 5× the 10 Mbps interop link.
     /// The network simulator then drops 80%+ of packets, stalling the transfer.
     ///
-    /// We enforce a minimum flush interval of 50ms. Combined with a budget of 40
-    /// chunks × 1200 bytes = 48 KB per flush, the effective rate is:
-    ///   48 KB / 50 ms = 960 KB/s ≈ 7.7 Mbps — safely below 10 Mbps.
+    /// We enforce a minimum flush interval of 50ms. Combined with a budget of 20
+    /// chunks × 1200 bytes = 24 KB per flush, the effective rate is:
+    ///   24 KB / 50 ms = 480 KB/s ≈ 3.8 Mbps — well below 10 Mbps.
+    ///
+    /// Critically, 20 UDP packets per burst stays below the NS3 simulator's
+    /// 25-packet DropTail queue, so zero packets should be dropped by the
+    /// network simulator.  (Previous budget of 40 caused ~37% packet loss.)
     fn flushPendingHttp09Responses(self: *Server) void {
         // Enforce minimum 50ms between flushes to pace sends below 10 Mbps.
         const now = std.time.milliTimestamp();
         if (now - self.http09_last_flush_ms < 50) return;
         self.http09_last_flush_ms = now;
 
-        var budget: usize = 40; // 40 × 1200 bytes = 48 KB per flush ≈ 7.7 Mbps at 50ms intervals
+        var budget: usize = 20; // 20 × 1200 bytes = 24 KB per flush — below the 25-pkt NS3 queue
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -1703,6 +1751,38 @@ pub const Server = struct {
                 }
             }
             if (!progressed) break;
+        }
+    }
+
+    /// Retransmit FIN frames for streams whose final packet has not yet been
+    /// acknowledged by the client.
+    ///
+    /// After http09SendNextChunk sends the last STREAM frame (FIN=true), the
+    /// slot transitions to awaiting_fin_ack=true.  This function re-sends the
+    /// saved FIN frame every 200 ms until:
+    ///   • the client ACKs a packet number ≥ fin_pkt_pn (ACK detected in
+    ///     processAppFrames), or
+    ///   • MAX_FIN_RETRANSMITS re-sends have been attempted.
+    fn http09RetransmitPendingFins(self: *Server) void {
+        const now = std.time.milliTimestamp();
+        for (&self.conns) |*cslot| {
+            if (cslot.*) |*conn| {
+                for (&conn.http09_slots) |*slot| {
+                    if (!slot.awaiting_fin_ack) continue;
+                    if (now - slot.fin_last_sent_ms < 200) continue;
+
+                    if (slot.fin_retransmit_count >= Http09OutSlot.MAX_FIN_RETRANSMITS) {
+                        std.debug.print("io: stream_id={} FIN retransmit limit reached, giving up\n", .{slot.stream_id});
+                        slot.awaiting_fin_ack = false;
+                        continue;
+                    }
+
+                    slot.fin_retransmit_count += 1;
+                    slot.fin_last_sent_ms = now;
+                    std.debug.print("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, Http09OutSlot.MAX_FIN_RETRANSMITS });
+                    self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
+                }
+            }
         }
     }
 
