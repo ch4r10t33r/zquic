@@ -602,6 +602,12 @@ pub const ConnState = struct {
     // Retry token (set when server sends Retry; included in next Initial)
     retry_token: [64]u8 = [_]u8{0} ** 64,
     retry_token_len: usize = 0,
+
+    // original_destination_connection_id (RFC 9000 §7.3): set on the server
+    // when a valid Retry token is accepted.  Included in server transport params
+    // so the client can verify it matches the DCID from its first Initial.
+    retry_odcid: [20]u8 = [_]u8{0} ** 20,
+    retry_odcid_len: usize = 0,
     hs_crypto_offset: u64 = 0,
 
     // Set once client has seen the server's first Initial packet and has
@@ -1000,9 +1006,13 @@ pub const Server = struct {
     ) void {
         const ip = packet_mod.parseInitial(buf) catch return;
 
-        // Retry mode: if enabled and no valid token, send Retry and drop
+        // Retry mode: if enabled and no valid token, send Retry and drop.
+        // An empty token means this is the first Initial (pre-Retry); a non-empty
+        // token must pass HMAC verification before the handshake proceeds.
+        var verified_odcid: ?[]const u8 = null;
         if (self.config.retry_enabled) {
-            if (!self.verifyRetryToken(ip.token, ip.dcid.slice())) {
+            verified_odcid = self.verifyRetryToken(ip.token);
+            if (verified_odcid == null) {
                 self.sendRetry(ip.dcid.slice(), ip.scid.slice(), src);
                 return;
             }
@@ -1029,6 +1039,13 @@ pub const Server = struct {
             const c = self.newConn(ip.dcid, ip.scid, src) orelse return;
             break :blk c;
         };
+
+        // Store the original DCID for the transport parameters (RFC 9000 §7.3).
+        if (verified_odcid) |odcid| {
+            const olen = @min(odcid.len, conn.retry_odcid.len);
+            @memcpy(conn.retry_odcid[0..olen], odcid[0..olen]);
+            conn.retry_odcid_len = olen;
+        }
 
         if (conn.init_keys == null) conn.deriveInitialKeys(ip.dcid);
         const init_km = &conn.init_keys.?;
@@ -1080,19 +1097,41 @@ pub const Server = struct {
         }
     }
 
-    /// Build a Retry token: HMAC-SHA256(retry_secret, odcid).
-    fn mintRetryToken(self: *Server, odcid: []const u8, out: *[32]u8) void {
+    /// Build a Retry token that encodes the original DCID so the server can
+    /// recover it at verification time without external state.
+    ///
+    /// Token format (max 53 bytes):
+    ///   [0]      odcid length (1 byte)
+    ///   [1..n]   odcid bytes
+    ///   [n..n+32] HMAC-SHA256(retry_secret, odcid)
+    ///
+    /// Returns the number of bytes written into `out`.
+    fn mintRetryToken(self: *Server, odcid: []const u8, out: *[53]u8) usize {
+        out[0] = @intCast(odcid.len);
+        @memcpy(out[1..][0..odcid.len], odcid);
         var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.retry_secret);
         hmac.update(odcid);
-        hmac.final(out);
+        var mac: [32]u8 = undefined;
+        hmac.final(&mac);
+        @memcpy(out[1 + odcid.len ..][0..32], &mac);
+        return 1 + odcid.len + 32;
     }
 
-    /// Verify that `token` is a valid HMAC over `odcid` with our secret.
-    fn verifyRetryToken(self: *Server, token: []const u8, odcid: []const u8) bool {
-        if (token.len != 32) return false;
-        var expected: [32]u8 = undefined;
-        self.mintRetryToken(odcid, &expected);
-        return std.mem.eql(u8, token, &expected);
+    /// Verify a Retry token.  The original DCID is encoded inside the token
+    /// itself (see mintRetryToken), so no external odcid parameter is needed.
+    /// Returns the original DCID slice on success, or null on failure.
+    fn verifyRetryToken(self: *Server, token: []const u8) ?[]const u8 {
+        if (token.len < 1 + 32) return null;
+        const odcid_len: usize = token[0];
+        if (token.len < 1 + odcid_len + 32) return null;
+        const odcid = token[1..][0..odcid_len];
+        const received_mac = token[1 + odcid_len ..][0..32];
+        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.retry_secret);
+        hmac.update(odcid);
+        var expected_mac: [32]u8 = undefined;
+        hmac.final(&expected_mac);
+        if (!std.mem.eql(u8, received_mac, &expected_mac)) return null;
+        return odcid;
     }
 
     /// Send a Retry packet to the client.
@@ -1111,9 +1150,9 @@ pub const Server = struct {
         var new_scid: [8]u8 = undefined;
         std.crypto.random.bytes(&new_scid);
 
-        // Token = HMAC-SHA256(retry_secret, odcid)
-        var token: [32]u8 = undefined;
-        self.mintRetryToken(odcid, &token);
+        // Token encodes odcid + HMAC (max 53 bytes: 1 + 20 + 32)
+        var token_buf: [53]u8 = undefined;
+        const token_len = self.mintRetryToken(odcid, &token_buf);
 
         var buf: [256]u8 = undefined;
         const n = retry_mod.buildRetryPacket(
@@ -1121,7 +1160,7 @@ pub const Server = struct {
             QUIC_VERSION_1,
             scid, // DCID = client's SCID
             &new_scid, // SCID = new server CID
-            &token,
+            token_buf[0..token_len],
             odcid,
         ) catch return;
 
@@ -1170,9 +1209,21 @@ pub const Server = struct {
     }
 
     fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: std.net.Address) void {
-        // Build server transport parameters into a separate scratch buffer
+        // Build server transport parameters into a separate scratch buffer.
+        // Append original_destination_connection_id (id=0x00) when a Retry was
+        // accepted — RFC 9000 §7.3 requires it so the client can verify.
         var tp_buf: [512]u8 = undefined;
-        const tp_len = quic_tls_mod.buildClientTransportParams(&tp_buf);
+        var tp_len = quic_tls_mod.buildClientTransportParams(&tp_buf);
+        if (conn.retry_odcid_len > 0) {
+            const odcid = conn.retry_odcid[0..conn.retry_odcid_len];
+            // Encode: id=0x00 (1 byte) | length varint (1 byte) | odcid bytes
+            tp_buf[tp_len] = 0x00; // TP id
+            tp_len += 1;
+            tp_buf[tp_len] = @intCast(odcid.len); // length (odcid ≤ 20 bytes, fits in 1 varint byte)
+            tp_len += 1;
+            @memcpy(tp_buf[tp_len..][0..odcid.len], odcid);
+            tp_len += odcid.len;
+        }
         const quic_tp = tp_buf[0..tp_len];
 
         const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
