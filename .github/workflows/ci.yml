@@ -109,14 +109,11 @@ jobs:
         with:
           name: zquic-interop-image
 
-      # Checkout quic-interop-runner from ch4r10t33r fork (with increased timeouts for transfer tests).
-      # This fork includes changes to handle network simulator overhead in the interop tests.
-      # See: https://github.com/ch4r10t33r/quic-interop-runner/tree/fix/increase-transfer-test-timeout
+      # Checkout the official quic-interop-runner.
       - name: Checkout quic-interop-runner
         uses: actions/checkout@v4
         with:
-          repository: ch4r10t33r/quic-interop-runner
-          ref: fix/increase-transfer-test-timeout
+          repository: quic-interop/quic-interop-runner
           path: quic-interop-runner
 
       - name: Set up Python
