@@ -164,6 +164,15 @@ jobs:
             docker-buildx-plugin docker-compose-plugin
           docker --version
 
+      # Install TShark (required by quic-interop-runner to verify pcap traces).
+      # Without TShark every test is marked FAILED regardless of actual outcome.
+      # DEBIAN_FRONTEND=noninteractive suppresses the interactive "should
+      # non-superusers be able to capture packets?" prompt during install.
+      - name: Install TShark
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tshark
+          tshark --version | head -1
+
       # Enable IPv6 in Docker (required by the interop network simulator).
       - name: Enable IPv6 for Docker
         run: |
