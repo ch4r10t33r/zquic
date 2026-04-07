@@ -6,7 +6,7 @@
 //! Supported flags:
 //!   --host <host>     Server hostname or IP
 //!   --port <n>        UDP port (default 443)
-//!   --url <url>       URL to fetch (can be repeated; max 64)
+//!   --url <url>       URL to fetch (can be repeated; max 1024)
 //!   --output <dir>    Directory to write downloads (default /downloads)
 //!   --keylog <path>   TLS key log file path
 //!   --qlog-dir <dir>  qlog output directory
@@ -23,7 +23,7 @@
 const std = @import("std");
 const io_mod = @import("zquic").transport.io;
 
-const max_urls: usize = 64;
+const max_urls: usize = 1024;
 
 const Config = struct {
     host: []const u8 = "localhost",
