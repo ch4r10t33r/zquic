@@ -515,7 +515,7 @@ const Http09OutSlot = struct {
     /// acknowledges the packet (largest_ack >= fin_pkt_pn) or we give up after
     /// MAX_FIN_RETRANSMITS attempts.
     awaiting_fin_ack: bool = false,
-    fin_frame: [2048]u8 = [_]u8{0} ** 2048,
+    fin_frame: [1300]u8 = [_]u8{0} ** 1300,
     fin_frame_len: usize = 0,
     fin_pkt_pn: u64 = 0,
     fin_last_sent_ms: i64 = 0,
@@ -593,7 +593,7 @@ pub const ConnState = struct {
     h3_settings_sent: bool = false,
 
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
-    http09_slots: [8]Http09OutSlot = [_]Http09OutSlot{.{}} ** 8,
+    http09_slots: [128]Http09OutSlot = [_]Http09OutSlot{.{}} ** 128,
 
     /// 1-RTT frames received while waiting for client Finished (reordering).
     pending_1rtt: [pending_1rtt_cap]Pending1RttPayload = [_]Pending1RttPayload{.{}} ** pending_1rtt_cap,
@@ -1849,7 +1849,7 @@ pub const Server = struct {
         };
 
         for (&conn.http09_slots) |*slot| {
-            if (slot.active) continue;
+            if (slot.active or slot.awaiting_fin_ack) continue;
             slot.* = .{
                 .active = true,
                 .stream_id = sf.stream_id,
@@ -2026,7 +2026,7 @@ pub const ClientConfig = struct {
 // ── Stream download tracker ───────────────────────────────────────────────────
 
 /// Maps a QUIC stream ID to an open output file for download accumulation.
-const MAX_STREAMS = 64;
+const MAX_STREAMS = 128;
 
 const StreamDownload = struct {
     stream_id: u64,
