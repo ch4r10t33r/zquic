@@ -1626,9 +1626,7 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
-        // Increased from 1200 to 1350 to fit more data per QUIC packet (MTU ~1500)
-        // while leaving room for QUIC/frame headers (~100-150 bytes)
-        var file_buf: [1350]u8 = undefined;
+        var file_buf: [1200]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
             std.debug.print("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             slot.close();
@@ -1671,11 +1669,7 @@ pub const Server = struct {
 
     /// Drain queued HTTP/0.9 bodies a little at a time so recv/ACK processing can run.
     fn flushPendingHttp09Responses(self: *Server) void {
-        // Increased budget from 256 to 1024 to improve throughput for large file transfers.
-        // With 3 concurrent streams, the old 256 budget allowed only ~307 KB per flush.
-        // The new budget of 1024 allows ~1.3 MB per flush (still respects poll timeouts
-        // for fair scheduling with receive/ACK processing).
-        var budget: usize = 1024;
+        var budget: usize = 256;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
