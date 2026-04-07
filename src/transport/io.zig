@@ -687,6 +687,12 @@ pub const Server = struct {
     conns: [MAX_CONNECTIONS]?ConnState = [_]?ConnState{null} ** MAX_CONNECTIONS,
     /// Random server token secret for Retry token HMAC-SHA256 verification.
     retry_secret: [32]u8 = [_]u8{0} ** 32,
+    /// Timestamp of the last HTTP/0.9 response flush (milliseconds).
+    /// Used to enforce a minimum flush interval so we don't flood the network
+    /// by flushing after every incoming ACK packet. Without pacing, the server
+    /// can send 6+ MB/s into a 10 Mbps (1.25 MB/s) simulated link, causing
+    /// the network simulator to drop 80%+ of packets and stalling transfers.
+    http09_last_flush_ms: i64 = 0,
 
     /// Initialize server: load cert/key and create UDP socket.
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !Server {
@@ -1667,9 +1673,22 @@ pub const Server = struct {
         }
     }
 
-    /// Drain queued HTTP/0.9 bodies a little at a time so recv/ACK processing can run.
+    /// Drain queued HTTP/0.9 bodies with pacing to avoid flooding the network.
+    ///
+    /// Without pacing, flushing after every incoming ACK (which arrives ~every 30ms
+    /// at 15ms RTT) drives the send rate to 6+ MB/s — 5× the 10 Mbps interop link.
+    /// The network simulator then drops 80%+ of packets, stalling the transfer.
+    ///
+    /// We enforce a minimum flush interval of 50ms. Combined with a budget of 40
+    /// chunks × 1200 bytes = 48 KB per flush, the effective rate is:
+    ///   48 KB / 50 ms = 960 KB/s ≈ 7.7 Mbps — safely below 10 Mbps.
     fn flushPendingHttp09Responses(self: *Server) void {
-        var budget: usize = 256;
+        // Enforce minimum 50ms between flushes to pace sends below 10 Mbps.
+        const now = std.time.milliTimestamp();
+        if (now - self.http09_last_flush_ms < 50) return;
+        self.http09_last_flush_ms = now;
+
+        var budget: usize = 40; // 40 × 1200 bytes = 48 KB per flush ≈ 7.7 Mbps at 50ms intervals
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
