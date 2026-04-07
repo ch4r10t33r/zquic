@@ -2436,7 +2436,7 @@ pub const Client = struct {
             self.conn.app_recv_pn,
         ) catch |err| {
             if (buf.len == 834) {
-                std.debug.print("io: client FAILED TO DECRYPT 834-byte FIN packet! error={} expected_pn={?}\n", .{err, self.conn.app_recv_pn});
+                std.debug.print("io: client FAILED TO DECRYPT 834-byte FIN packet! error={} expected_pn={?}\n", .{ err, self.conn.app_recv_pn });
             }
             return;
         };

@@ -27,10 +27,10 @@ pub fn decompressPacketNumber(truncated_pn: u64, expected_pn: ?u64, pn_len_bits:
 
     const expected = expected_pn.?;
     const pn_range: u64 = switch (pn_len_bits) {
-        0 => 0x100,        // 1 byte  = 256
-        1 => 0x10000,      // 2 bytes = 65536
-        2 => 0x1000000,    // 3 bytes = 16777216
-        3 => 0x100000000,  // 4 bytes = 4294967296
+        0 => 0x100, // 1 byte  = 256
+        1 => 0x10000, // 2 bytes = 65536
+        2 => 0x1000000, // 3 bytes = 16777216
+        3 => 0x100000000, // 4 bytes = 4294967296
         else => 0x100,
     };
 
