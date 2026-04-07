@@ -56,6 +56,20 @@ If the network simulator **drops** packets, behavior depends on **ACK handling**
 
 ## 6. Local interop hygiene (environment, not stack)
 
+### Python / quic-interop-runner (not on PyPI)
+
+**Do not** run `pip install quic-interop-runner` — there is **no such package** on PyPI.
+
+```sh
+git clone https://github.com/quic-interop/quic-interop-runner.git
+cd quic-interop-runner
+pip3 install -r requirements.txt   # or: python3 -m pip install -r requirements.txt
+```
+
+Then run tests from that directory with `python3 run.py ...` (see upstream README).
+
+### macOS + Docker image
+
 For **macOS** + **`Dockerfile.prebuilt`**:
 
 - Binaries in **`zig-out/bin/`** must be **Linux ELF** inside the image, not **Mach-O**. Example:  

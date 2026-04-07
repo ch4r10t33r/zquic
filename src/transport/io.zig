@@ -313,6 +313,92 @@ pub fn build1RttPacketFull(
 }
 
 /// Decrypt a 1-RTT packet, selecting AES or ChaCha20 based on the cipher flag.
+/// Decrypt a 1-RTT packet with proper packet number decompression
+/// expected_recv_pn: the last received packet number in this packet number space (null if first packet)
+/// Returns both plaintext length and the decompressed packet number.
+fn unprotect1RttPacketWithPnTracking(
+    dst: []u8,
+    buf: []const u8,
+    pn_start: usize,
+    km: *const KeyMaterial,
+    chacha20: bool,
+    expected_recv_pn: ?u64,
+) !struct { pt_len: usize, pn: u64 } {
+    if (buf.len < pn_start + initial_mod.hp_sample_offset + initial_mod.hp_sample_len) return error.BufferTooShort;
+
+    // Sample for header protection removal
+    const sample_start = pn_start + initial_mod.hp_sample_offset;
+    var sample: [initial_mod.hp_sample_len]u8 = undefined;
+    @memcpy(&sample, buf[sample_start .. sample_start + initial_mod.hp_sample_len]);
+
+    // Work on a mutable copy to unmask
+    var header_copy: [1600]u8 = undefined;
+    if (buf.len > header_copy.len) return error.BufferTooShort;
+    @memcpy(header_copy[0..buf.len], buf);
+
+    // Unmask first byte to discover actual PN length
+    const first_byte_mask: u8 = 0x1f; // short header
+    var temp_first = header_copy[0];
+
+    if (chacha20) {
+        // For ChaCha20, we need to use chacha20 header protection
+        const counter = std.mem.readInt(u32, sample[0..4], .little);
+        const cc_nonce = sample[4..16].*;
+        var full_mask: [64]u8 = undefined;
+        std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
+        temp_first ^= full_mask[0] & first_byte_mask;
+    } else {
+        var mask: [16]u8 = undefined;
+        const aes_ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
+        aes_ctx.encrypt(&mask, &sample);
+        temp_first ^= mask[0] & first_byte_mask;
+    }
+
+    const actual_pn_len: usize = (temp_first & 0x03) + 1;
+
+    // Now unmask PN bytes (recompute mask for actual PN bytes)
+    var pn_mask: [16]u8 = undefined;
+    if (chacha20) {
+        const counter = std.mem.readInt(u32, sample[0..4], .little);
+        const cc_nonce = sample[4..16].*;
+        var full_mask: [64]u8 = undefined;
+        std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
+        @memcpy(&pn_mask, full_mask[0..16]);
+    } else {
+        const aes_ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
+        aes_ctx.encrypt(&pn_mask, &sample);
+    }
+
+    const pn_bytes = header_copy[pn_start .. pn_start + actual_pn_len];
+    for (pn_bytes, 0..) |*b, i| {
+        b.* ^= pn_mask[1 + i];
+    }
+    header_copy[0] ^= pn_mask[0] & first_byte_mask;
+
+    // Extract truncated packet number
+    var truncated_pn: u64 = 0;
+    for (pn_bytes) |b| {
+        truncated_pn = (truncated_pn << 8) | b;
+    }
+
+    // Decompress packet number
+    const pn_len_bits: u3 = @intCast(actual_pn_len - 1);
+    const pn = initial_mod.decompressPacketNumber(truncated_pn, expected_recv_pn, pn_len_bits);
+
+    // AAD = everything up to and including PN
+    const aad_end = pn_start + actual_pn_len;
+    const aad = header_copy[0..aad_end];
+    const nonce = aead_mod.buildNonce(km.iv, pn);
+    const ciphertext = buf[aad_end..];
+
+    if (ciphertext.len < 16) return error.BufferTooShort;
+    const plaintext_len = ciphertext.len - 16;
+    if (dst.len < plaintext_len) return error.BufferTooSmall;
+
+    try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+    return .{ .pt_len = plaintext_len, .pn = pn };
+}
+
 pub fn unprotect1RttPacket(
     dst: []u8,
     buf: []const u8,
@@ -482,6 +568,7 @@ pub const ConnState = struct {
     // Received packet numbers (last seen for ACK)
     init_recv_pn: ?u64 = null,
     hs_recv_pn: ?u64 = null,
+    app_recv_pn: ?u64 = null,
 
     // CRYPTO stream offset tracking (in-order reassembly)
     init_crypto_offset: u64 = 0,
@@ -1502,6 +1589,16 @@ pub const Server = struct {
             @memset(padded_payload_buf[payload.len..min_len], 0x00);
             break :blk padded_payload_buf[0..min_len];
         } else payload;
+
+        // Check if payload contains FIN frames (0x0b, 0x0d, or 0x0f type)
+        var has_fin = false;
+        if (payload.len > 0) {
+            const first_byte = payload[0];
+            if ((first_byte >= 0x08 and first_byte <= 0x0f) and (first_byte & 0x01) != 0) {
+                has_fin = true;
+            }
+        }
+
         const pkt_len = build1RttPacketFull(
             &send_buf,
             conn.remote_cid,
@@ -1515,9 +1612,16 @@ pub const Server = struct {
             return;
         };
         conn.app_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch |err| {
+        if (has_fin) {
+            std.debug.print("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
+        }
+        const send_result = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch |err| {
             std.debug.print("io: sendto error pkt_len={}: {}\n", .{ pkt_len, err });
+            return;
         };
+        if (has_fin) {
+            std.debug.print("io: server FIN PACKET sent {} bytes\n", .{send_result});
+        }
     }
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
@@ -1534,6 +1638,12 @@ pub const Server = struct {
             return;
         }
         const fin = slot.stream_offset + @as(u64, @intCast(n)) >= slot.file_end;
+        if (slot.stream_offset % 10000 == 0 or fin) {
+            std.debug.print("io: http09 stream_id={} send chunk offset={} n={} file_end={} fin={} (offset+n={})\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end, fin, slot.stream_offset + @as(u64, @intCast(n)) });
+        }
+        if (fin) {
+            std.debug.print("io: http09SendNextChunk stream_id={} creating FIN frame offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
+        }
         const sf_out = stream_frame_mod.StreamFrame{
             .stream_id = slot.stream_id,
             .offset = slot.stream_offset,
@@ -1835,6 +1945,7 @@ pub const Client = struct {
     conn: ConnState,
     streams: [MAX_STREAMS]StreamDownload = [_]StreamDownload{.{ .stream_id = 0, .file = undefined, .active = false }} ** MAX_STREAMS,
     streams_done: usize = 0,
+    requested: bool = false,
     ticket_store: session_mod.TicketStore = .{},
 
     // Stored Initial packet for retransmission.
@@ -1892,23 +2003,33 @@ pub const Client = struct {
 
         // Event loop: receive and process packets
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        var deadline = std.time.milliTimestamp() + 10_000; // 10 second timeout
+        var deadline = std.time.milliTimestamp() + 60_000; // 60 second timeout for transfer
 
         while (std.time.milliTimestamp() < deadline) {
+            const now = std.time.milliTimestamp();
+            const remaining = deadline - now;
+            if (remaining < 0) {
+                std.debug.print("io: client deadline exceeded, {} ms remaining\n", .{remaining});
+                break;
+            }
+
             // Poll with 100ms timeout so retransmit timers fire promptly.
             var fds = [1]std.posix.pollfd{.{
                 .fd = self.sock,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = std.posix.poll(&fds, 100) catch 0;
+            const poll_timeout: i32 = @intCast(@min(100, @max(0, remaining)));
+            const ready = std.posix.poll(&fds, poll_timeout) catch 0;
+            if (ready > 0) {
+                std.debug.print("io: client poll ready={} revents=0x{x}\n", .{ ready, fds[0].revents });
+            }
 
             // Retransmit any unacknowledged packets (RFC 9002 §6.2).
             // Runs unconditionally: poll may return immediately with POLLERR
             // (e.g. ICMP port-unreachable) before the server is bound, which
             // would prevent the retransmit timer from ever being reached if the
             // check were inside the `ready == 0` branch.
-            const now = std.time.milliTimestamp();
             if (self.conn.phase == .initial and now - last_initial_ms >= 500) {
                 self.sendClientHello(server_addr) catch {};
                 last_initial_ms = now;
@@ -1951,11 +2072,45 @@ pub const Client = struct {
                 &src_len,
             ) catch continue;
 
+            // Check if packet likely contains FIN frames (look for 0x0f, 0x0d, 0x0b frame types)
+            var has_fin_type = false;
+            if (n > 0) {
+                // Skip past packet header to find frame types
+                // This is a rough check - actual frame parsing happens in processPacket
+                var pos: usize = 1; // skip first byte (header form + fixed bit)
+                var frame_count: u32 = 0;
+                while (pos < n and frame_count < 10) {
+                    const frame_type = recv_buf[pos];
+                    if ((frame_type & 0x0f) == 0x0b or (frame_type & 0x0f) == 0x0d or (frame_type & 0x0f) == 0x0f) {
+                        has_fin_type = true;
+                    }
+                    if ((frame_type & 0x08) != 0) {
+                        frame_count += 1;
+                        pos += 1; // rough skip, not accurate but enough for detection
+                        if (pos >= n) break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if (has_fin_type) {
+                std.debug.print("io: client RECEIVED POSSIBLE FIN PACKET {} bytes\n", .{n});
+            } else {
+                std.debug.print("io: client recv {} bytes (no FIN type)\n", .{n});
+            }
             self.processPacket(recv_buf[0..n]);
 
-            if (self.conn.phase == .connected) {
-                // Send requests and download
-                try self.downloadUrls(server_addr);
+            // On first connection, send requests
+            if (self.conn.phase == .connected and !self.requested) {
+                if (self.config.urls.len > 0) {
+                    try self.downloadUrls(server_addr);
+                }
+                self.requested = true;
+            }
+
+            // Wait until all streams complete
+            if (self.conn.phase == .connected and self.streams_done >= self.config.urls.len) {
+                std.debug.print("io: client all streams done\n", .{});
                 break;
             }
 
@@ -1966,6 +2121,8 @@ pub const Client = struct {
             std.debug.print("io: client handshake timed out\n", .{});
             return error.HandshakeTimeout;
         }
+
+        std.debug.print("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.config.urls.len });
     }
 
     fn sendClientHello(self: *Client, server: std.net.Address) !void {
@@ -2240,6 +2397,9 @@ pub const Client = struct {
     }
 
     fn process1RttPacket(self: *Client, buf: []const u8) void {
+        if (buf.len == 834) {
+            std.debug.print("io: client process1RttPacket 834-byte packet starting\n", .{});
+        }
         if (!self.conn.has_app_keys) return;
         const cid_len = self.conn.local_cid.len;
         if (buf.len < 1 + cid_len) return;
@@ -2250,19 +2410,46 @@ pub const Client = struct {
         // Detect key phase flip from server using the UNPROTECTED header byte.
         // The Key Phase bit (0x04) is masked by header protection, so we must
         // remove HP first before reading it (RFC 9001 §5.4.1).
-        const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &self.conn.app_server_km, self.conn.use_chacha20) orelse return;
+        const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &self.conn.app_server_km, self.conn.use_chacha20) orelse {
+            if (buf.len == 834) {
+                std.debug.print("io: client 834-byte packet FAILED peekUnprotectedFirstByte!\n", .{});
+            }
+            return;
+        };
         const incoming_phase = (unprotected_first & 0x04) != 0;
+        if (buf.len == 834) {
+            std.debug.print("io: client 834-byte packet key phase: incoming={} current_peer={}\n", .{ incoming_phase, self.conn.peer_key_phase });
+        }
         if (incoming_phase != self.conn.peer_key_phase and !self.conn.key_update_pending) {
             // Server has rotated its send keys; rotate our receive keys to match.
+            if (buf.len == 834) {
+                std.debug.print("io: client 834-byte packet rotating to next key generation\n", .{});
+            }
             self.conn.app_server_km = self.conn.app_server_km.nextGen();
         }
-        const pt_len = unprotect1RttPacket(
+        const decrypt_result = unprotect1RttPacketWithPnTracking(
             &plaintext,
             buf,
             pn_start,
             &self.conn.app_server_km,
             self.conn.use_chacha20,
-        ) catch return;
+            self.conn.app_recv_pn,
+        ) catch |err| {
+            if (buf.len == 834) {
+                std.debug.print("io: client FAILED TO DECRYPT 834-byte FIN packet! error={} expected_pn={?}\n", .{err, self.conn.app_recv_pn});
+            }
+            return;
+        };
+        const pt_len = decrypt_result.pt_len;
+        const decompressed_pn = decrypt_result.pn;
+
+        // Update the last received packet number for next decompression
+        if (decompressed_pn > (self.conn.app_recv_pn orelse 0)) {
+            self.conn.app_recv_pn = decompressed_pn;
+            if (buf.len == 834) {
+                std.debug.print("io: client 834-byte packet updated app_recv_pn to {}\n", .{decompressed_pn});
+            }
+        }
 
         self.conn.peer_key_phase = incoming_phase;
         self.conn.key_update_pending = false;
@@ -2321,8 +2508,13 @@ pub const Client = struct {
             }
             if (ft >= 0x08 and ft <= 0x0f) {
                 // STREAM frame — write data to download file
-                const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[pos..pt_len], ft) catch return;
+                std.debug.print("io: client received STREAM frame type=0x{x:0>2} fin_bit={}\n", .{ ft, (ft & 0x01) != 0 });
+                const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[pos..pt_len], ft) catch |err| {
+                    std.debug.print("io: client STREAM parse error: {}\n", .{err});
+                    return;
+                };
                 pos += sf_r.consumed;
+                std.debug.print("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
                 self.handleStreamResponse(&sf_r.frame);
                 continue;
             }
@@ -2398,18 +2590,32 @@ pub const Client = struct {
     }
 
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
+        std.debug.print("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
+
+        // Debug: dump all registered streams
+        var active_count: usize = 0;
+        for (&self.streams) |*s| {
+            if (s.active) {
+                std.debug.print("  active stream_id={}\n", .{s.stream_id});
+                active_count += 1;
+            }
+        }
+        std.debug.print("  active streams: {}\n", .{active_count});
+
         for (&self.streams) |*s| {
             if (s.active and s.stream_id == sf.stream_id) {
+                std.debug.print("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
                 _ = s.file.write(sf.data) catch {};
                 if (sf.fin) {
                     s.file.close();
                     s.active = false;
                     self.streams_done += 1;
-                    std.debug.print("io: stream {} download complete\n", .{sf.stream_id});
+                    std.debug.print("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.config.urls.len });
                 }
                 return;
             }
         }
+        std.debug.print("io: client stream {} not found (active={}, received_fin={})\n", .{ sf.stream_id, false, sf.fin });
     }
 
     fn downloadUrls(self: *Client, server: std.net.Address) !void {
@@ -2436,6 +2642,7 @@ pub const Client = struct {
 
             // Allocate stream ID: client-initiated bidirectional = 4*i
             const stream_id: u64 = @as(u64, i) * 4;
+            std.debug.print("io: downloadUrl[{}] path={s} stream_id={}\n", .{ i, path, stream_id });
 
             // Open output file
             var dl_path_buf: [512]u8 = undefined;
@@ -2449,10 +2656,12 @@ pub const Client = struct {
             for (&self.streams) |*s| {
                 if (!s.active) {
                     s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                    std.debug.print("io: registered stream {} for download\n", .{stream_id});
                     break;
                 }
             } else {
                 out_file.close();
+                std.debug.print("io: streams array full\n", .{});
                 continue;
             }
 
@@ -2483,16 +2692,35 @@ pub const Client = struct {
         }
 
         // Wait for all downloads to complete (receive STREAM data + FIN)
+        std.debug.print("io: downloadUrls waiting for downloads (deadline=60s)\n", .{});
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const deadline = std.time.milliTimestamp() + 60_000;
-        while (std.time.milliTimestamp() < deadline) {
-            if (self.streams_done >= self.config.urls.len) break;
+        const dl_deadline = std.time.milliTimestamp() + 60_000;
+        var dl_iter: u32 = 0;
+        while (true) {
+            dl_iter += 1;
+            const now = std.time.milliTimestamp();
+            const remaining = dl_deadline - now;
+
+            if (remaining <= 0) {
+                std.debug.print("io: downloadUrls DEADLINE EXCEEDED remaining={}\n", .{remaining});
+                break;
+            }
+
+            if (dl_iter % 100 == 0) {
+                std.debug.print("io: downloadUrls iteration {} streams_done={} remaining={}ms\n", .{ dl_iter, self.streams_done, remaining });
+            }
+            if (self.streams_done >= self.config.urls.len) {
+                std.debug.print("io: downloadUrls all streams done\n", .{});
+                break;
+            }
 
             var fds = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&fds, 200) catch 0;
+            const poll_timeout: i32 = @intCast(@min(200, @max(0, remaining)));
+            const ready = std.posix.poll(&fds, poll_timeout) catch 0;
             if (ready == 0) continue;
             if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
+            std.debug.print("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
             var drained: usize = 0;
             while (true) {
                 var src_addr: std.posix.sockaddr.storage = undefined;
@@ -2500,12 +2728,15 @@ pub const Client = struct {
                 const flags: u32 = if (drained == 0) 0 else std.posix.MSG.DONTWAIT;
                 const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
                     if (drained > 0 and err == error.WouldBlock) break;
+                    std.debug.print("io: downloadUrls recvfrom error: {}\n", .{err});
                     break;
                 };
                 drained += 1;
+                std.debug.print("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
                 self.processPacket(recv_buf[0..n]);
             }
         }
+        std.debug.print("io: downloadUrls done iter={} streams_done={}/{}\n", .{ dl_iter, self.streams_done, self.config.urls.len });
 
         // Close all stream files
         for (&self.streams) |*s| {

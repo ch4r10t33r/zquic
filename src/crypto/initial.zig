@@ -18,6 +18,44 @@ pub const hp_sample_len = 16;
 /// Since the PN can be 1–4 bytes, we always sample at offset `max_pn_len(4)`.
 pub const hp_sample_offset = 4;
 
+/// Decompress a truncated packet number to the expected packet number range.
+/// RFC 9000 §17.1: The packet number encoding reveals 8, 16, or 24 bits. The packet
+/// number is between the largest packet number before this packet and the largest
+/// possible value in the truncated encoding.
+pub fn decompressPacketNumber(truncated_pn: u64, expected_pn: ?u64, pn_len_bits: u3) u64 {
+    if (expected_pn == null) return truncated_pn;
+
+    const expected = expected_pn.?;
+    const pn_range: u64 = switch (pn_len_bits) {
+        0 => 0x100,        // 1 byte  = 256
+        1 => 0x10000,      // 2 bytes = 65536
+        2 => 0x1000000,    // 3 bytes = 16777216
+        3 => 0x100000000,  // 4 bytes = 4294967296
+        else => 0x100,
+    };
+
+    // Reconstruct the packet number: highest bits from expected, lowest bits from wire
+    const expected_next = expected + 1;
+    const range_half = pn_range / 2;
+
+    // The received packet number is in range [expected_next - range_half, expected_next + range_half)
+    // If truncated_pn is in the lower half, add pn_range to get the correct value
+    const candidate_pn = (expected_next & ~(pn_range - 1)) | truncated_pn;
+
+    // Check if we need to adjust by ±pn_range
+    // Handle underflow by checking if expected_next > range_half
+    const lower_bound: u64 = if (expected_next > range_half) expected_next - range_half else 0;
+    const upper_bound = expected_next + range_half;
+
+    if (candidate_pn < lower_bound) {
+        return candidate_pn + pn_range;
+    }
+    if (candidate_pn >= upper_bound) {
+        return candidate_pn - pn_range;
+    }
+    return candidate_pn;
+}
+
 /// Encrypt a QUIC Initial packet payload and apply header protection.
 ///
 /// `header` must contain the full QUIC long header (up to but not including
