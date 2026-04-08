@@ -2330,6 +2330,8 @@ pub const Client = struct {
     ticket_store: session_mod.TicketStore = .{},
     /// HTTP/3: whether we have sent the client control stream (stream_id=2).
     h3_client_control_sent: bool = false,
+    /// Connection migration: true once the socket has been rebound to a new port.
+    migrate_done: bool = false,
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -2587,6 +2589,17 @@ pub const Client = struct {
                 std.debug.print("io: client recv {} bytes (no FIN type)\n", .{n});
             }
             self.processPacket(recv_buf[0..n]);
+
+            // Connection migration: after the handshake, rebind to a new local
+            // UDP port.  Sending any 1-RTT packet from the new address causes
+            // the server to detect the address change and send a PATH_CHALLENGE;
+            // the existing processAppFrames handler responds with PATH_RESPONSE,
+            // the server validates and updates conn.peer, and subsequent STREAM
+            // responses are delivered to the new address (RFC 9000 §9).
+            if (self.conn.phase == .connected and self.config.migrate and !self.migrate_done) {
+                self.migrate_done = true;
+                self.rebindMigrateSocket(server_addr);
+            }
 
             // On connection established, send requests
             if (self.conn.phase == .connected and !self.requested) {
@@ -3233,6 +3246,50 @@ pub const Client = struct {
         }
     }
 
+    /// Connection migration: open a new UDP socket (new ephemeral local port) and
+    /// send a PING from it.  The server sees the packet from a new source address,
+    /// detects the migration, and sends a PATH_CHALLENGE.  The existing
+    /// processAppFrames handler responds with PATH_RESPONSE; the server validates
+    /// and updates conn.peer to the new address.  Subsequent STREAM responses then
+    /// arrive at our new socket (RFC 9000 §9.2).
+    fn rebindMigrateSocket(self: *Client, server: std.net.Address) void {
+        const new_sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch |err| {
+            std.debug.print("io: migrate: new socket failed: {}\n", .{err});
+            return;
+        };
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(new_sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(new_sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+
+        std.posix.close(self.sock);
+        self.sock = new_sock;
+
+        // Send a PING (frame type 0x01) on the new socket.  The server detects the
+        // new source address and initiates path validation (PATH_CHALLENGE →
+        // PATH_RESPONSE).  No packet body needed for PING.
+        const ping_frame = [_]u8{0x01};
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            &ping_frame,
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch |err| {
+            std.debug.print("io: migrate: PING build failed: {}\n", .{err});
+            return;
+        };
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(new_sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch |err| {
+            std.debug.print("io: migrate: PING send failed: {}\n", .{err});
+            return;
+        };
+        std.debug.print("io: migrate: rebound to new socket, PING sent to trigger PATH_CHALLENGE\n", .{});
+    }
+
     /// Send the HTTP/3 client control stream (stream_id=2, client-initiated unidirectional).
     /// Carries a SETTINGS frame with QPACK table size = 0 (static table only).
     fn sendH3ClientControlStream(self: *Client, server: std.net.Address) void {
@@ -3447,10 +3504,17 @@ fn extractPacketNumber(buf: []const u8, pn_start: usize) ?u64 {
     return @as(u64, buf[pn_start]);
 }
 
-/// Resolve a hostname to an IPv6 or IPv4-mapped address.
+/// Resolve a hostname to an IPv4 address (prefers AF.INET since we only create
+/// IPv4 UDP sockets).  The connectionmigration test uses the dual-stack hostname
+/// "server46" which returns both IPv4 and IPv6 addresses; without the preference
+/// the first address is often IPv6 and sendto() silently fails on our IPv4 socket.
 fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
     const list = try std.net.getAddressList(allocator, host, port);
     defer list.deinit();
     if (list.addrs.len == 0) return error.HostNotFound;
+    // Prefer IPv4 — our sockets are AF.INET only.
+    for (list.addrs) |addr| {
+        if (addr.any.family == std.posix.AF.INET) return addr;
+    }
     return list.addrs[0];
 }
