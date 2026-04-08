@@ -131,6 +131,7 @@ pub fn main() !void {
         .http09 = cfg.http09,
         .http3 = cfg.http3,
         .chacha20 = cfg.chacha20,
+        .migrate = cfg.migrate,
     };
 
     var client = io_mod.Client.init(allocator, client_config) catch |err| {

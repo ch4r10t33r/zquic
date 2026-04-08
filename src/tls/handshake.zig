@@ -1231,10 +1231,16 @@ pub const ClientHandshake = struct {
 // ── QUIC key material derivation ─────────────────────────────────────────────
 
 /// QUIC key material derived from a TLS 1.3 traffic secret.
+///
+/// Both AES-128-GCM (16-byte key) and ChaCha20-Poly1305 (32-byte key) are
+/// derived unconditionally so the struct can serve either cipher suite.
+/// RFC 9001 §5.1: key_len = 16 for AES-128-GCM, 32 for ChaCha20-Poly1305.
 pub const QuicKeyMaterial = struct {
-    key: [16]u8, // AES-128-GCM key
-    iv: [12]u8, // AES-128-GCM IV (nonce base)
-    hp: [16]u8, // header protection key
+    key: [16]u8, // AES-128-GCM key (16 bytes)
+    key32: [32]u8, // ChaCha20-Poly1305 key (32 bytes)
+    iv: [12]u8, // nonce base (same length for both suites)
+    hp: [16]u8, // header protection key for AES-128 HP
+    hp32: [32]u8, // header protection key for ChaCha20 HP (32 bytes)
 };
 
 /// Build a TLS 1.3 NewSessionTicket message.
@@ -1287,11 +1293,19 @@ pub fn buildNewSessionTicket(
 }
 
 /// Derive QUIC key material from a TLS 1.3 traffic secret (RFC 9001 §5.1).
+///
+/// Both the 16-byte AES key and the 32-byte ChaCha20 key are derived from the
+/// same "quic key" label — HKDF-Expand-Label simply outputs the requested
+/// number of bytes, so the 32-byte version is a superset of the 16-byte one.
+/// Deriving both unconditionally avoids branching on cipher suite here and
+/// lets callers choose the correct field at use time.
 pub fn deriveQuicKeys(traffic_secret: [32]u8) QuicKeyMaterial {
     var km: QuicKeyMaterial = undefined;
     keys_mod.hkdfExpandLabel(&km.key, &traffic_secret, "quic key", "");
+    keys_mod.hkdfExpandLabel(&km.key32, &traffic_secret, "quic key", "");
     keys_mod.hkdfExpandLabel(&km.iv, &traffic_secret, "quic iv", "");
     keys_mod.hkdfExpandLabel(&km.hp, &traffic_secret, "quic hp", "");
+    keys_mod.hkdfExpandLabel(&km.hp32, &traffic_secret, "quic hp", "");
     return km;
 }
 
@@ -1353,10 +1367,16 @@ test "handshake: QUIC key derivation" {
     const testing = std.testing;
     const secret = [_]u8{0x77} ** 32;
     const km = deriveQuicKeys(secret);
-    // Keys and IVs should be non-zero
+    // AES-128-GCM keys and IVs should be non-zero
     try testing.expect(!std.mem.allEqual(u8, &km.key, 0));
     try testing.expect(!std.mem.allEqual(u8, &km.iv, 0));
     try testing.expect(!std.mem.allEqual(u8, &km.hp, 0));
     // Key ≠ IV ≠ HP
     try testing.expect(!std.mem.eql(u8, &km.key, &km.hp));
+    // ChaCha20-Poly1305 fields should be non-zero
+    try testing.expect(!std.mem.allEqual(u8, &km.key32, 0));
+    try testing.expect(!std.mem.allEqual(u8, &km.hp32, 0));
+    // key32 and hp32 are independently derived with length=32 in HkdfLabel
+    // (different from key/hp which use length=16) — just verify they're distinct
+    try testing.expect(!std.mem.eql(u8, &km.key32, &km.hp32));
 }

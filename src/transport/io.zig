@@ -404,7 +404,11 @@ fn unprotect1RttPacketWithPnTracking(
     const plaintext_len = ciphertext.len - 16;
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
-    try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+    if (chacha20) {
+        try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
+    } else {
+        try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+    }
     return .{ .pt_len = plaintext_len, .pn = pn };
 }
 
@@ -666,8 +670,8 @@ pub const ConnState = struct {
         const hs_client_qkm = tls_hs.deriveQuicKeys(secrets.client_handshake);
         const hs_server_qkm = tls_hs.deriveQuicKeys(secrets.server_handshake);
 
-        self.hs_client_km = .{ .key = hs_client_qkm.key, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .secret = secrets.client_handshake };
-        self.hs_server_km = .{ .key = hs_server_qkm.key, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .secret = secrets.server_handshake };
+        self.hs_client_km = .{ .key = hs_client_qkm.key, .key32 = hs_client_qkm.key32, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .hp32 = hs_client_qkm.hp32, .secret = secrets.client_handshake };
+        self.hs_server_km = .{ .key = hs_server_qkm.key, .key32 = hs_server_qkm.key32, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .hp32 = hs_server_qkm.hp32, .secret = secrets.server_handshake };
 
         self.has_hs_keys = true;
     }
@@ -678,8 +682,8 @@ pub const ConnState = struct {
         const app_client_qkm = tls_hs.deriveQuicKeys(secrets.client_app);
         const app_server_qkm = tls_hs.deriveQuicKeys(secrets.server_app);
 
-        self.app_client_km = .{ .key = app_client_qkm.key, .iv = app_client_qkm.iv, .hp = app_client_qkm.hp, .secret = secrets.client_app };
-        self.app_server_km = .{ .key = app_server_qkm.key, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .secret = secrets.server_app };
+        self.app_client_km = .{ .key = app_client_qkm.key, .key32 = app_client_qkm.key32, .iv = app_client_qkm.iv, .hp = app_client_qkm.hp, .hp32 = app_client_qkm.hp32, .secret = secrets.client_app };
+        self.app_server_km = .{ .key = app_server_qkm.key, .key32 = app_server_qkm.key32, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .hp32 = app_server_qkm.hp32, .secret = secrets.server_app };
 
         self.has_app_keys = true;
     }
@@ -2091,6 +2095,7 @@ pub const ClientConfig = struct {
     http09: bool = false,
     http3: bool = false,
     chacha20: bool = false,
+    migrate: bool = false,
 };
 
 // ── Stream download tracker ───────────────────────────────────────────────────
