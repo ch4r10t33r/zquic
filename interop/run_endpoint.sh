@@ -42,6 +42,19 @@ echo "Endpoint IPv4: ${IP}, gateway: ${GATEWAY}"
 route add -net 193.167.0.0 netmask 255.255.0.0 gw "${GATEWAY}" 2>/dev/null || true
 route del -net "${UNNEEDED_ROUTE}" netmask 255.255.255.0 2>/dev/null || true
 
+# Flush any stale ARP cache entries in the NS3 network simulator.
+#
+# The NS3 sim container is kept alive across test cases, but the client and
+# server containers are recreated for every test (new MAC addresses, same
+# IPs).  Without an explicit gratuitous ARP announcement the sim's cached
+# <IP → old-MAC> entry causes every packet from test N+1 onward to be
+# delivered to the now-dead container from test N, so the server never
+# receives the client's Initial packets.
+#
+# Sending an unsolicited ARP reply (-U) forces every L2 peer (including NS3)
+# to update its ARP table with our current MAC address.
+arping -c 3 -U -I eth0 "${IP}" 2>/dev/null || true
+
 # IPv6 equivalent
 IPV6=$(hostname -I | cut -f2 -d" " 2>/dev/null || true)
 if [[ -n "${IPV6}" && "${IPV6}" =~ ":" ]]; then

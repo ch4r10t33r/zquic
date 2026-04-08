@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         ethtool \
         iproute2 \
+        iputils-arping \
         net-tools \
     && rm -rf /var/lib/apt/lists/*
 
