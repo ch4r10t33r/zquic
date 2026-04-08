@@ -631,6 +631,10 @@ pub const ConnState = struct {
     // Connection IDs
     local_cid: ConnectionId,
     remote_cid: ConnectionId,
+    // The client's original DCID from the first Initial packet.
+    // Stored so that 0-RTT packets (which carry this DCID, not local_cid)
+    // can be matched back to the right ConnState.
+    init_dcid: ?ConnectionId = null,
 
     // Peer UDP address
     peer: std.net.Address,
@@ -1072,6 +1076,19 @@ pub const Server = struct {
         return null;
     }
 
+    /// Find an existing connection by the client's original Initial DCID.
+    /// Used for 0-RTT packets, which carry this ID rather than local_cid.
+    fn findConnByInitDcid(self: *Server, dcid: ConnectionId) ?*ConnState {
+        for (&self.conns) |*slot| {
+            if (slot.*) |*c| {
+                if (c.init_dcid) |id| {
+                    if (ConnectionId.eql(id, dcid)) return c;
+                }
+            }
+        }
+        return null;
+    }
+
     /// Create a new server-side connection.
     fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: std.net.Address) ?*ConnState {
         for (&self.conns) |*slot| {
@@ -1082,6 +1099,7 @@ pub const Server = struct {
                     .local_cid = local_cid,
                     .remote_cid = scid,
                     .peer = peer,
+                    .init_dcid = dcid,
                 };
                 const conn = &(slot.*.?);
                 conn.deriveInitialKeys(dcid);
@@ -1194,7 +1212,14 @@ pub const Server = struct {
     /// early keys (if available) and dispatches STREAM frames to handleStreamData.
     fn process0RttPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
         const lh = header_mod.parseLong(buf) catch return;
-        const conn = self.findConn(lh.header.dcid) orelse return;
+        // 0-RTT packets carry the client's original Initial DCID, not the server's
+        // local_cid (which is assigned randomly after the Initial arrives).
+        // Try findConn first (in case local_cid happens to match), then fall back
+        // to a lookup by init_dcid.
+        const conn = self.findConn(lh.header.dcid) orelse self.findConnByInitDcid(lh.header.dcid) orelse {
+            std.debug.print("io: 0-RTT dropped — no connection for dcid\n", .{});
+            return;
+        };
         if (!conn.has_early_keys) {
             std.debug.print("io: 0-RTT dropped — no early keys for connection\n", .{});
             return;
