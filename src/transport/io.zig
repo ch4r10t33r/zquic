@@ -2113,6 +2113,13 @@ pub const Client = struct {
     initial_pkt: [MAX_DATAGRAM_SIZE]u8 = [_]u8{0} ** MAX_DATAGRAM_SIZE,
     initial_pkt_len: usize = 0,
 
+    // Stored raw TLS ClientHello bytes (set on the first build).
+    // After a Retry the Initial packet must be rebuilt with the new DCID
+    // and token, but the TLS ClientHello must NOT be added to the transcript
+    // a second time.  This buffer lets us reuse the original bytes.
+    client_hello_bytes: [2048]u8 = [_]u8{0} ** 2048,
+    client_hello_len: usize = 0,
+
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) !Client {
         const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
         errdefer std.posix.close(sock);
@@ -2298,21 +2305,30 @@ pub const Client = struct {
             return;
         }
 
-        // First send: build the ClientHello, updating the transcript once.
-        var ch_buf: [2048]u8 = undefined;
+        // Build (or reuse) the TLS ClientHello.
+        // After a Retry the QUIC Initial wrapper must be rebuilt (new DCID,
+        // new keys, retry token), but buildClientHelloMsg must NOT be called
+        // again — it would append a second ClientHello to the TLS transcript,
+        // causing a Finished MAC mismatch with the server.
         var frame_buf: [2200]u8 = undefined;
-
-        const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
-        var quic_tp_buf: [128]u8 = undefined;
-        const quic_tp = buildClientTransportParams(&quic_tp_buf);
-
-        const ch_len = if (self.config.chacha20)
-            try self.tls.buildClientHelloMsgChaCha20(&ch_buf, quic_tp, alpn, self.config.host)
-        else
-            try self.tls.buildClientHelloMsg(&ch_buf, quic_tp, alpn, self.config.host);
+        const ch_len: usize = if (self.client_hello_len > 0) blk: {
+            // Post-Retry: reuse the already-built TLS ClientHello bytes.
+            break :blk self.client_hello_len;
+        } else blk: {
+            // First send: build the ClientHello and save it for any future rebuild.
+            const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
+            var quic_tp_buf: [128]u8 = undefined;
+            const quic_tp = buildClientTransportParams(&quic_tp_buf);
+            const len = if (self.config.chacha20)
+                try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
+            else
+                try self.tls.buildClientHelloMsg(&self.client_hello_bytes, quic_tp, alpn, self.config.host);
+            self.client_hello_len = len;
+            break :blk len;
+        };
 
         // CRYPTO frame
-        const crypto_len = try buildCryptoFrame(&frame_buf, 0, ch_buf[0..ch_len]);
+        const crypto_len = try buildCryptoFrame(&frame_buf, 0, self.client_hello_bytes[0..ch_len]);
         // Pad to 1200 bytes minimum (RFC 9000 §14.1)
         const min_payload = 1200 - 100; // leave room for headers
         if (crypto_len < min_payload) {
