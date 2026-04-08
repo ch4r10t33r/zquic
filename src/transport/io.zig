@@ -544,6 +544,35 @@ const Http09OutSlot = struct {
     }
 };
 
+/// One pending HTTP/3 file response (served incrementally from the event loop).
+/// Like Http09OutSlot but wraps file content in HTTP/3 DATA frames and tracks
+/// the QUIC stream offset independently (HEADERS frame bytes are counted too).
+const Http3OutSlot = struct {
+    active: bool = false,
+    stream_id: u64 = 0,
+    file: std.fs.File = undefined,
+    /// Byte offset in the QUIC stream (includes the HEADERS frame already sent).
+    stream_offset: u64 = 0,
+    file_end: u64 = 0,
+
+    /// FIN retransmission state — same pattern as Http09OutSlot.
+    awaiting_fin_ack: bool = false,
+    fin_frame: [1300]u8 = [_]u8{0} ** 1300,
+    fin_frame_len: usize = 0,
+    fin_pkt_pn: u64 = 0,
+    fin_last_sent_ms: i64 = 0,
+    fin_retransmit_count: usize = 0,
+
+    const MAX_FIN_RETRANSMITS: usize = 15;
+
+    fn close(self: *Http3OutSlot) void {
+        if (self.active) {
+            self.file.close();
+            self.active = false;
+        }
+    }
+};
+
 const pending_1rtt_cap: usize = 8;
 
 /// Decrypted 1-RTT coalesced payload queued until the handshake is confirmed.
@@ -607,6 +636,9 @@ pub const ConnState = struct {
 
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
     http09_slots: [128]Http09OutSlot = [_]Http09OutSlot{.{}} ** 128,
+
+    /// HTTP/3 responses in progress (paced DATA frame sending per connection).
+    http3_slots: [32]Http3OutSlot = [_]Http3OutSlot{.{}} ** 32,
 
     /// 1-RTT frames received while waiting for client Finished (reordering).
     pending_1rtt: [pending_1rtt_cap]Pending1RttPayload = [_]Pending1RttPayload{.{}} ** pending_1rtt_cap,
@@ -727,6 +759,8 @@ pub const Server = struct {
     /// can send 6+ MB/s into a 10 Mbps (1.25 MB/s) simulated link, causing
     /// the network simulator to drop 80%+ of packets and stalling transfers.
     http09_last_flush_ms: i64 = 0,
+    /// Same pacing timestamp for HTTP/3 DATA frame sends.
+    http3_last_flush_ms: i64 = 0,
 
     /// Initialize server: load cert/key and create UDP socket.
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !*Server {
@@ -831,6 +865,14 @@ pub const Server = struct {
                             break;
                         }
                     }
+                    if (poll_timeout_ms != 50) {
+                        for (&conn.http3_slots) |*slot| {
+                            if (slot.active or slot.awaiting_fin_ack) {
+                                poll_timeout_ms = 50;
+                                break;
+                            }
+                        }
+                    }
                 }
                 if (poll_timeout_ms == 50) break;
             }
@@ -839,6 +881,8 @@ pub const Server = struct {
                 std.debug.print("io: poll error: {}\n", .{err});
                 self.flushPendingHttp09Responses();
                 self.http09RetransmitPendingFins();
+                self.flushPendingHttp3Responses();
+                self.http3RetransmitPendingFins();
                 continue;
             };
             if (ready == 0) {
@@ -846,12 +890,10 @@ pub const Server = struct {
                     idle_secs += 2;
                     std.debug.print("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
                 }
-                // Pending HTTP/0.9 bodies must keep draining even when the socket
-                // is not readable (poll timeout); otherwise we stall until the next
-                // inbound datagram and the transfer test starves.
                 self.flushPendingHttp09Responses();
-                // Retransmit any FIN frames the client has not yet acknowledged.
                 self.http09RetransmitPendingFins();
+                self.flushPendingHttp3Responses();
+                self.http3RetransmitPendingFins();
                 continue;
             }
             idle_secs = 0;
@@ -913,6 +955,8 @@ pub const Server = struct {
 
             self.flushPendingHttp09Responses();
             self.http09RetransmitPendingFins();
+            self.flushPendingHttp3Responses();
+            self.http3RetransmitPendingFins();
         }
     }
 
@@ -1944,24 +1988,30 @@ pub const Server = struct {
     }
 
     fn handleHttp3Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
-        // Server control stream (stream_id=3 is server-initiated unidirectional)
-        // Client control stream (stream_id=2), QPACK encoder (stream_id=6)
-        // Request streams: client-initiated bidirectional (stream_id=0, 4, 8, ...)
+        // Stream ID classification (RFC 9000 §2.1):
+        //   %4==0  client-initiated bidirectional  → HTTP/3 request streams
+        //   %4==2  client-initiated unidirectional → control / QPACK encoder / decoder
+        //   %4==3  server-initiated unidirectional → our control stream (id=3)
 
-        // Send server control stream with SETTINGS if not done yet
+        // Send server control stream with SETTINGS once per connection.
         if (!conn.h3_settings_sent) {
             self.sendH3ControlStream(conn, src);
             conn.h3_settings_sent = true;
         }
 
-        // Ignore client-initiated unidirectional streams (control/QPACK)
-        if (sf.stream_id % 4 == 2) return; // unidirectional client-initiated
+        // Ignore client unidirectional streams (control, QPACK encoder/decoder).
+        if (sf.stream_id % 4 == 2) return;
 
-        // Bidirectional request streams (stream_id % 4 == 0)
+        // Only process client-initiated bidirectional request streams.
         if (sf.stream_id % 4 != 0) return;
         if (sf.data.len == 0) return;
 
-        // Parse HTTP/3 frames
+        // Guard: ignore if we already have an active slot for this stream.
+        for (&conn.http3_slots) |*slot| {
+            if ((slot.active or slot.awaiting_fin_ack) and slot.stream_id == sf.stream_id) return;
+        }
+
+        // Parse HTTP/3 HEADERS frame to extract :method and :path.
         var pos: usize = 0;
         var method_buf: [8]u8 = undefined;
         var path_buf: [512]u8 = undefined;
@@ -1971,20 +2021,18 @@ pub const Server = struct {
         while (pos < sf.data.len) {
             const pr = h3_frame.parseFrame(sf.data[pos..]) catch break;
             pos += pr.consumed;
-
             switch (pr.frame) {
                 .headers => |hf| {
-                    // Decode QPACK
                     var decoded = h3_qpack.DecodedHeaders{ .headers = undefined, .count = 0 };
                     h3_qpack.decodeHeaders(hf.data[0..hf.len], &decoded) catch {};
-                    for (decoded.headers[0..decoded.count]) |f| {
-                        if (std.mem.eql(u8, f.name, ":method")) {
-                            const ml = @min(f.value.len, method_buf.len);
-                            @memcpy(method_buf[0..ml], f.value[0..ml]);
+                    for (decoded.headers[0..decoded.count]) |fld| {
+                        if (std.mem.eql(u8, fld.name, ":method")) {
+                            const ml = @min(fld.value.len, method_buf.len);
+                            @memcpy(method_buf[0..ml], fld.value[0..ml]);
                             method = method_buf[0..ml];
-                        } else if (std.mem.eql(u8, f.name, ":path")) {
-                            const pl = @min(f.value.len, path_buf.len);
-                            @memcpy(path_buf[0..pl], f.value[0..pl]);
+                        } else if (std.mem.eql(u8, fld.name, ":path")) {
+                            const pl = @min(fld.value.len, path_buf.len);
+                            @memcpy(path_buf[0..pl], fld.value[0..pl]);
                             path = path_buf[0..pl];
                         }
                     }
@@ -1993,10 +2041,11 @@ pub const Server = struct {
             }
         }
 
-        // Only handle GET for now
+        std.debug.print("io: http3 request stream_id={} method={s} path={s}\n", .{ sf.stream_id, method, path });
+
         if (!std.mem.eql(u8, method, "GET")) return;
 
-        // Serve the file
+        // Resolve and open the requested file.
         var fs_path_buf: [512]u8 = undefined;
         const fs_path = http09_server.resolvePath(self.config.www_dir, path, &fs_path_buf) catch return;
 
@@ -2004,34 +2053,47 @@ pub const Server = struct {
             self.sendH3Response(conn, sf.stream_id, 404, &.{}, src);
             return;
         };
-        defer file.close();
 
-        const file_size = file.getEndPos() catch 0;
+        const file_end = file.getEndPos() catch {
+            file.close();
+            self.sendH3Response(conn, sf.stream_id, 500, &.{}, src);
+            return;
+        };
+
+        // Build and send HEADERS frame immediately (offset=0 on this stream).
         var size_buf: [20]u8 = undefined;
-        const size_str = std.fmt.bufPrint(&size_buf, "{}", .{file_size}) catch "0";
-
-        // Build response headers
+        const size_str = std.fmt.bufPrint(&size_buf, "{}", .{file_end}) catch "0";
         var header_block: [512]u8 = undefined;
         const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
             .{ .name = ":status", .value = "200" },
             .{ .name = "content-length", .value = size_str },
-        }, &header_block) catch return;
-
-        // Send HEADERS frame
+        }, &header_block) catch {
+            file.close();
+            return;
+        };
         var headers_out: [600]u8 = undefined;
-        const headers_len = h3_frame.writeFrame(&headers_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch return;
-        self.sendStreamData(conn, sf.stream_id, headers_out[0..headers_len], false, src);
+        const headers_frame_len = h3_frame.writeFrame(&headers_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch {
+            file.close();
+            return;
+        };
+        self.sendStreamDataH3(conn, sf.stream_id, 0, headers_out[0..headers_frame_len], false, src);
 
-        // Send DATA frames
-        var data_buf: [1024]u8 = undefined;
-        var data_out: [1100]u8 = undefined;
-        while (true) {
-            const n = file.read(&data_buf) catch break;
-            if (n == 0) break;
-            const data_len = h3_frame.writeFrame(&data_out, @intFromEnum(h3_frame.FrameType.data), data_buf[0..n]) catch break;
-            const eof = (file.getEndPos() catch 0) == (file.getPos() catch 1);
-            self.sendStreamData(conn, sf.stream_id, data_out[0..data_len], eof, src);
+        // Register an Http3OutSlot so the event loop sends DATA frames with
+        // pacing.  stream_offset starts after the HEADERS frame bytes.
+        for (&conn.http3_slots) |*slot| {
+            if (slot.active or slot.awaiting_fin_ack) continue;
+            slot.* = .{
+                .active = true,
+                .stream_id = sf.stream_id,
+                .file = file,
+                .stream_offset = headers_frame_len,
+                .file_end = file_end,
+            };
+            std.debug.print("io: http3 slot registered stream_id={} size={} data_offset={}\n", .{ sf.stream_id, file_end, headers_frame_len });
+            return;
         }
+        std.debug.print("io: http3 out slots full\n", .{});
+        file.close();
     }
 
     fn sendH3ControlStream(self: *Server, conn: *ConnState, src: std.net.Address) void {
@@ -2084,6 +2146,141 @@ pub const Server = struct {
         const frame_len = sf.serialize(&frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], src);
     }
+
+    /// Like sendStreamData but with an explicit QUIC stream offset.
+    /// Required for HTTP/3 DATA frames that follow the HEADERS frame on the same stream.
+    fn sendStreamDataH3(self: *Server, conn: *ConnState, stream_id: u64, offset: u64, data: []const u8, fin: bool, src: std.net.Address) void {
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = stream_id,
+            .offset = offset,
+            .data = data,
+            .fin = fin,
+            .has_length = true,
+        };
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..frame_len], src);
+    }
+
+    /// Send the next HTTP/3 DATA-frame chunk for one queued response slot.
+    fn http3SendNextChunk(self: *Server, conn: *ConnState, slot: *Http3OutSlot) void {
+        // Wrap up to 900 bytes of file content in an HTTP/3 DATA frame.
+        // DATA frame overhead is 2 bytes (type=0x00 + 1-byte varint length),
+        // so the total STREAM payload is at most 902 bytes — well within one UDP packet.
+        const CHUNK: usize = 900;
+        var file_buf: [CHUNK]u8 = undefined;
+        const n = slot.file.read(&file_buf) catch |err| {
+            std.debug.print("io: http3 stream_id={} read error: {}\n", .{ slot.stream_id, err });
+            slot.close();
+            return;
+        };
+
+        if (n == 0) {
+            // EOF: send a zero-length STREAM frame with FIN to close the stream.
+            std.debug.print("io: http3 stream_id={} EOF offset={}\n", .{ slot.stream_id, slot.stream_offset });
+            const sf_fin = stream_frame_mod.StreamFrame{
+                .stream_id = slot.stream_id,
+                .offset = slot.stream_offset,
+                .data = &.{},
+                .fin = true,
+                .has_length = true,
+            };
+            var fin_buf: [64]u8 = undefined;
+            const fin_len = sf_fin.serialize(&fin_buf) catch {
+                slot.close();
+                return;
+            };
+            self.send1Rtt(conn, fin_buf[0..fin_len], conn.peer);
+            const fin_pn = conn.app_pn - 1;
+            @memcpy(slot.fin_frame[0..fin_len], fin_buf[0..fin_len]);
+            slot.fin_frame_len = fin_len;
+            slot.fin_pkt_pn = fin_pn;
+            slot.fin_last_sent_ms = std.time.milliTimestamp();
+            slot.fin_retransmit_count = 0;
+            slot.awaiting_fin_ack = true;
+            slot.file.close();
+            slot.active = false;
+            std.debug.print("io: http3 stream_id={} FIN sent (pn={})\n", .{ slot.stream_id, fin_pn });
+            return;
+        }
+
+        // Wrap the chunk in an HTTP/3 DATA frame.
+        var data_out: [CHUNK + 10]u8 = undefined;
+        const data_frame_len = h3_frame.writeFrame(&data_out, @intFromEnum(h3_frame.FrameType.data), file_buf[0..n]) catch {
+            slot.close();
+            return;
+        };
+
+        const at_eof = slot.stream_offset - slot.stream_offset % CHUNK + @as(u64, @intCast(data_frame_len)) >= slot.file_end + 10;
+        _ = at_eof;
+
+        const sf_out = stream_frame_mod.StreamFrame{
+            .stream_id = slot.stream_id,
+            .offset = slot.stream_offset,
+            .data = data_out[0..data_frame_len],
+            .fin = false,
+            .has_length = true,
+        };
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const frame_len = sf_out.serialize(&frame_buf) catch {
+            slot.close();
+            return;
+        };
+        self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
+        slot.stream_offset += @intCast(data_frame_len);
+
+        if (slot.stream_offset % 10000 < CHUNK + 10) {
+            std.debug.print("io: http3 stream_id={} chunk offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
+        }
+    }
+
+    /// Drain queued HTTP/3 DATA frames with the same 50ms/20-packet pacing as HTTP/0.9.
+    fn flushPendingHttp3Responses(self: *Server) void {
+        const now = std.time.milliTimestamp();
+        if (now - self.http3_last_flush_ms < 50) return;
+        self.http3_last_flush_ms = now;
+
+        var budget: usize = 20;
+        while (budget > 0) {
+            var progressed = false;
+            for (&self.conns) |*cslot| {
+                if (cslot.*) |*conn| {
+                    for (&conn.http3_slots) |*slot| {
+                        if (!slot.active) continue;
+                        if (budget == 0) return;
+                        self.http3SendNextChunk(conn, slot);
+                        progressed = true;
+                        budget -= 1;
+                    }
+                }
+            }
+            if (!progressed) break;
+        }
+    }
+
+    /// Retransmit HTTP/3 FIN frames not yet ACKed (same 200ms retry pattern as HTTP/0.9).
+    fn http3RetransmitPendingFins(self: *Server) void {
+        const now = std.time.milliTimestamp();
+        for (&self.conns) |*cslot| {
+            if (cslot.*) |*conn| {
+                for (&conn.http3_slots) |*slot| {
+                    if (!slot.awaiting_fin_ack) continue;
+                    if (now - slot.fin_last_sent_ms < 200) continue;
+
+                    if (slot.fin_retransmit_count >= Http3OutSlot.MAX_FIN_RETRANSMITS) {
+                        std.debug.print("io: http3 stream_id={} FIN retransmit limit reached\n", .{slot.stream_id});
+                        slot.awaiting_fin_ack = false;
+                        continue;
+                    }
+
+                    slot.fin_retransmit_count += 1;
+                    slot.fin_last_sent_ms = now;
+                    std.debug.print("io: http3 retransmit FIN stream_id={} attempt {}/{}\n", .{ slot.stream_id, slot.fin_retransmit_count, Http3OutSlot.MAX_FIN_RETRANSMITS });
+                    self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
+                }
+            }
+        }
+    }
 };
 
 // ── Client config ─────────────────────────────────────────────────────────────
@@ -2112,6 +2309,11 @@ const StreamDownload = struct {
     stream_id: u64,
     file: std.fs.File,
     active: bool,
+    /// HTTP/3 only: have we already seen and skipped the HEADERS frame?
+    h3_headers_received: bool = false,
+    /// Small buffer for incomplete HTTP/3 frame headers that span two STREAM frames.
+    h3_leftover: [256]u8 = [_]u8{0} ** 256,
+    h3_leftover_len: usize = 0,
 };
 
 // ── QUIC Client ───────────────────────────────────────────────────────────────
@@ -2126,6 +2328,8 @@ pub const Client = struct {
     streams_done: usize = 0,
     requested: bool = false,
     ticket_store: session_mod.TicketStore = .{},
+    /// HTTP/3: whether we have sent the client control stream (stream_id=2).
+    h3_client_control_sent: bool = false,
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -2957,37 +3161,125 @@ pub const Client = struct {
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
         std.debug.print("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
 
-        // Debug: dump all registered streams
-        var active_count: usize = 0;
-        for (&self.streams) |*s| {
-            if (s.active) {
-                std.debug.print("  active stream_id={}\n", .{s.stream_id});
-                active_count += 1;
-            }
-        }
-        std.debug.print("  active streams: {}\n", .{active_count});
-
         for (&self.streams) |*s| {
             if (s.active and s.stream_id == sf.stream_id) {
-                std.debug.print("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
-                _ = s.file.write(sf.data) catch {};
-                if (sf.fin) {
-                    s.file.close();
-                    s.active = false;
-                    self.streams_done += 1;
-                    std.debug.print("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.active_urls.len });
+                if (self.config.http3) {
+                    self.handleH3StreamData(s, sf);
+                } else {
+                    std.debug.print("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
+                    _ = s.file.write(sf.data) catch {};
+                    if (sf.fin) {
+                        s.file.close();
+                        s.active = false;
+                        self.streams_done += 1;
+                        std.debug.print("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.active_urls.len });
+                    }
                 }
                 return;
             }
         }
-        std.debug.print("io: client stream {} not found (active={}, received_fin={})\n", .{ sf.stream_id, false, sf.fin });
+        std.debug.print("io: client stream {} not found (fin={})\n", .{ sf.stream_id, sf.fin });
+    }
+
+    /// Parse HTTP/3 frames from incoming STREAM data for one download slot.
+    ///
+    /// The server sends:  HEADERS frame (offset=0)  then  DATA frame(s).
+    /// We skip the HEADERS frame and write DATA payloads straight to the file.
+    fn handleH3StreamData(self: *Client, s: *StreamDownload, sf: *const stream_frame_mod.StreamFrame) void {
+        // Combine any leftover bytes from the previous STREAM frame with the new data.
+        var combined: [256 + MAX_DATAGRAM_SIZE]u8 = undefined;
+        var data: []const u8 = sf.data;
+        if (s.h3_leftover_len > 0) {
+            const total = s.h3_leftover_len + sf.data.len;
+            if (total <= combined.len) {
+                @memcpy(combined[0..s.h3_leftover_len], s.h3_leftover[0..s.h3_leftover_len]);
+                @memcpy(combined[s.h3_leftover_len..total], sf.data);
+                data = combined[0..total];
+            }
+            s.h3_leftover_len = 0;
+        }
+
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const pr = h3_frame.parseFrame(data[pos..]) catch |err| {
+                if (err == error.BufferTooShort) {
+                    // Save remaining bytes for the next STREAM frame arrival.
+                    const remaining = data.len - pos;
+                    const copy_len = @min(remaining, s.h3_leftover.len);
+                    @memcpy(s.h3_leftover[0..copy_len], data[pos..][0..copy_len]);
+                    s.h3_leftover_len = copy_len;
+                }
+                break;
+            };
+            pos += pr.consumed;
+            switch (pr.frame) {
+                .headers => {
+                    s.h3_headers_received = true;
+                    std.debug.print("io: h3 stream_id={} HEADERS frame parsed, skipping\n", .{s.stream_id});
+                },
+                .data => |d| {
+                    _ = s.file.write(d) catch {};
+                    std.debug.print("io: h3 stream_id={} DATA {} bytes written\n", .{ s.stream_id, d.len });
+                },
+                else => {},
+            }
+        }
+
+        if (sf.fin) {
+            s.file.close();
+            s.active = false;
+            self.streams_done += 1;
+            std.debug.print("io: h3 stream {} download complete ({}/{})\n", .{ s.stream_id, self.streams_done, self.active_urls.len });
+        }
+    }
+
+    /// Send the HTTP/3 client control stream (stream_id=2, client-initiated unidirectional).
+    /// Carries a SETTINGS frame with QPACK table size = 0 (static table only).
+    fn sendH3ClientControlStream(self: *Client, server: std.net.Address) void {
+        var buf: [128]u8 = undefined;
+        buf[0] = 0x00; // stream type = control
+        var pos: usize = 1;
+        const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
+            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = 0 },
+            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = 0 },
+        }) catch return;
+        pos += settings_len;
+
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = 2, // first client-initiated unidirectional stream
+            .offset = 0,
+            .data = buf[0..pos],
+            .fin = false,
+            .has_length = true,
+        };
+        var frame_buf: [256]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            frame_buf[0..frame_len],
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+        std.debug.print("io: h3 client control stream sent\n", .{});
     }
 
     fn downloadUrls(self: *Client, server: std.net.Address) !void {
-        std.debug.print("io: sending {} HTTP/0.9 requests\n", .{self.active_urls.len});
+        std.debug.print("io: sending {} {s} requests\n", .{ self.active_urls.len, if (self.config.http3) @as([]const u8, "HTTP/3") else @as([]const u8, "HTTP/0.9") });
 
         // Ensure output directory exists
         std.fs.makeDirAbsolute(self.config.output_dir) catch {};
+
+        // HTTP/3: send client control stream once before any requests.
+        if (self.config.http3 and !self.h3_client_control_sent) {
+            self.sendH3ClientControlStream(server);
+            self.h3_client_control_sent = true;
+        }
 
         for (self.active_urls, 0..) |url, i| {
             // Extract path from url (strip scheme+host if present, keep path)
@@ -3000,10 +3292,6 @@ pub const Client = struct {
                 }
                 break :blk url;
             };
-
-            // Build HTTP/0.9 request
-            var req_buf: [4096]u8 = undefined;
-            const req = http09_client.buildRequest(path, &req_buf) catch continue;
 
             // Allocate stream ID: client-initiated bidirectional = 4*i
             const stream_id: u64 = @as(u64, i) * 4;
@@ -3030,16 +3318,43 @@ pub const Client = struct {
                 continue;
             }
 
-            // Build STREAM frame with request payload
-            const sf = stream_frame_mod.StreamFrame{
-                .stream_id = stream_id,
-                .offset = 0,
-                .data = req,
-                .fin = true,
-                .has_length = true,
-            };
+            // Build the request payload and QUIC STREAM frame.
             var frame_buf: [4200]u8 = undefined;
-            const frame_len = sf.serialize(&frame_buf) catch continue;
+            var frame_len: usize = undefined;
+
+            if (self.config.http3) {
+                // HTTP/3: send a HEADERS frame with :method GET and :path.
+                var header_block: [512]u8 = undefined;
+                const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
+                    .{ .name = ":method", .value = "GET" },
+                    .{ .name = ":path", .value = path },
+                    .{ .name = ":scheme", .value = "https" },
+                    .{ .name = ":authority", .value = self.config.host },
+                }, &header_block) catch continue;
+                var h3_out: [600]u8 = undefined;
+                const h3_len = h3_frame.writeFrame(&h3_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch continue;
+                const sf = stream_frame_mod.StreamFrame{
+                    .stream_id = stream_id,
+                    .offset = 0,
+                    .data = h3_out[0..h3_len],
+                    .fin = true, // request headers are the complete request
+                    .has_length = true,
+                };
+                frame_len = sf.serialize(&frame_buf) catch continue;
+                std.debug.print("io: h3 GET {s} stream_id={}\n", .{ path, stream_id });
+            } else {
+                // HTTP/0.9: send a raw "GET /path\r\n" request.
+                var req_buf: [4096]u8 = undefined;
+                const req = http09_client.buildRequest(path, &req_buf) catch continue;
+                const sf = stream_frame_mod.StreamFrame{
+                    .stream_id = stream_id,
+                    .offset = 0,
+                    .data = req,
+                    .fin = true,
+                    .has_length = true,
+                };
+                frame_len = sf.serialize(&frame_buf) catch continue;
+            }
 
             var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
             const pkt_len = build1RttPacketFull(
