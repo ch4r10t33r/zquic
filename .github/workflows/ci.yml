@@ -185,8 +185,9 @@ jobs:
           docker load < zquic-interop.tar.gz
 
       # Run the test suite against zquic acting as both client and server.
-      # Test cases are ordered from most fundamental to most complex so
-      # partial results are useful even if later cases time out.
+      # Test cases that are known to pass (handshake→keyupdate) run first so
+      # a 60 s timeout from http3/connectionmigration (not yet implemented)
+      # cannot corrupt the NS3 ARP state for the tests we care about.
       - name: Run interop test suite
         run: |
           mkdir -p interop-results
@@ -194,7 +195,7 @@ jobs:
           python3 run.py \
             --client zquic \
             --server zquic \
-            --test handshake,transfer,retry,resumption,zerortt,http3,chacha20,keyupdate,connectionmigration,multiplexing \
+            --test handshake,transfer,retry,chacha20,keyupdate,resumption,zerortt,http3,connectionmigration,multiplexing \
             --log-dir ../interop-results/logs \
             --json ../interop-results/results.json \
             --debug

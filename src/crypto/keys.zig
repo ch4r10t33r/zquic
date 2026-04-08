@@ -105,10 +105,21 @@ pub const KeyMaterial = struct {
     }
 
     /// Derive the next-generation key material for key updates (RFC 9001 §6).
+    ///
+    /// Only the AEAD key and IV are updated; header-protection keys are
+    /// intentionally preserved from the current generation.
+    /// RFC 9001 §6.4: "The sending and receiving header protection keys are
+    /// not updated during a key update."
     pub fn nextGen(self: *const KeyMaterial) KeyMaterial {
         var next: KeyMaterial = undefined;
         hkdfExpandLabel(&next.secret, &self.secret, "quic ku", "");
-        next.expand();
+        // Derive updated AEAD key + IV from the new secret.
+        hkdfExpandLabel(&next.key, &next.secret, "quic key", "");
+        hkdfExpandLabel(&next.key32, &next.secret, "quic key", "");
+        hkdfExpandLabel(&next.iv, &next.secret, "quic iv", "");
+        // HP keys do NOT change — copy them from the current generation.
+        next.hp = self.hp;
+        next.hp32 = self.hp32;
         return next;
     }
 };

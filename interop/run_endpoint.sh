@@ -57,6 +57,14 @@ route del -net "${UNNEEDED_ROUTE}" netmask 255.255.255.0 2>/dev/null || true
 # processing the inbound ARP request it caches the sender's IP→MAC mapping
 # (our new container MAC).  This is more reliable than a gratuitous ARP
 # (-U / -A) which some NS3 builds silently ignore.
+#
+# IMPORTANT: Keep this fast.  The NS3 sim waits only 10 s for server:443
+# to become available; every second spent here is one less second the
+# server has to complete its TLS handshake.  3 probes ≈ 3 s is sufficient
+# for normal inter-test ARP refresh.  Tests that would contaminate the NS3
+# ARP state via a 60 s timeout (http3, connectionmigration) are ordered
+# AFTER the tests we care about in ci.yml — so stale-ARP recovery for the
+# post-timeout case is not needed here.
 arping -c 3 -I eth0 "${GATEWAY}" 2>/dev/null || true
 
 # IPv6 equivalent
