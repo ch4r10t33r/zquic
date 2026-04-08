@@ -2003,6 +2003,10 @@ pub const Server = struct {
             var progressed = false;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
+                    // Only send 1-RTT data once app keys are available.
+                    // 0-RTT requests can be buffered in http09_slots before the
+                    // handshake completes; wait for has_app_keys before flushing.
+                    if (!conn.has_app_keys) continue;
                     for (&conn.http09_slots) |*slot| {
                         if (!slot.active) continue;
                         if (budget == 0) return;
