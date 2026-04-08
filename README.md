@@ -8,11 +8,11 @@ A pure Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) | QUIC: A UDP-Based Multiplexed and Secure Transport | core modules complete |
-| [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) | Using TLS to Secure QUIC | keys, AEAD, header protection, adapter |
+| [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) | QUIC: A UDP-Based Multiplexed and Secure Transport | complete |
+| [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) | Using TLS to Secure QUIC | complete (keys, AEAD, header protection, key update) |
 | [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002) | QUIC Loss Detection and Congestion Control | RTT, PTO, New Reno |
-| [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) | HTTP/3 | framing complete |
-| [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204) | QPACK: Header Compression for HTTP/3 | literal encoding (no dynamic table yet) |
+| [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) | HTTP/3 | framing, QPACK, server + client I/O |
+| [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204) | QPACK: Header Compression for HTTP/3 | static table, literal encoding (no dynamic table) |
 
 ## Requirements
 
@@ -22,7 +22,7 @@ A pure Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002
 
 ```sh
 zig build               # build library + server/client binaries
-zig build test          # run all 97 unit tests
+zig build test          # run all 100 unit tests
 zig build examples      # build the example programs
 ```
 
@@ -131,7 +131,7 @@ src/
     retry.zig             Retry integrity tag (RFC 9001 §5.8)
     version_negotiation.zig  Version Negotiation parse/build
   crypto/
-    keys.zig              HKDF-Expand-Label, Initial secret derivation
+    keys.zig              HKDF-Expand-Label, Initial secret derivation, key update
     aead.zig              AES-128-GCM + ChaCha20-Poly1305, header protection
     initial.zig           Initial packet protect/unprotect helpers
     quic_tls.zig          QUIC-TLS adapter (nonblock ↔ CRYPTO frames)
@@ -144,6 +144,7 @@ src/
     stream.zig            STREAM frame
     transport.zig         RESET_STREAM, MAX_DATA, PATH_CHALLENGE, …
   transport/
+    io.zig                UDP event loop: server + client, HTTP/0.9 + HTTP/3 I/O
     connection.zig        Connection state machine + ACK manager
     endpoint.zig          UDP socket dispatch
     stream_manager.zig    Stream multiplexing + in-order receive buffer
@@ -179,20 +180,6 @@ in `src/crypto/quic_tls.zig` strips/adds the 5-byte TLS record header so
 raw handshake bytes flow through QUIC CRYPTO frames. The vendored
 [ianic/tls.zig](https://github.com/ianic/tls.zig) `nonblock` API is used.
 
-## Pending / In Progress
-
-| Area | What's missing |
-|------|---------------|
-| **UDP I/O loop** | `src/cmd/server.zig` and `client.zig` parse flags correctly but the actual send/recv loop (wiring `Endpoint` to a real UDP socket) is not yet written |
-| **Full TLS handshake** | `quic_tls.Endpoint` drives the `nonblock` API but the integration path from `Connection` → `Endpoint` → OS socket is not wired end-to-end |
-| **SSLKEYLOGFILE** | TLS session key export for Wireshark is not yet implemented |
-| **qlog** | Structured QUIC event logging to `$QLOGDIR` is not yet written |
-| **ALPN negotiation** | `h3` / `hq-interop` ALPN selection is planned but not wired |
-| **QUIC v2** | RFC 9369 (version 0x6b3343cf) — interop runner test case `v2` exits 127 |
-| **ChaCha20 interop** | `chacha20` test case: cipher suite negotiation not yet wired |
-| **QPACK dynamic table** | `decodeHeaders` rejects indexed field lines; dynamic table capacity is 0 |
-| **Connection migration I/O** | `MigrationManager` state machine is complete; OS-level socket rebind is not |
-
 ## QUIC Interop Runner
 
 This implementation targets the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
@@ -200,17 +187,24 @@ full test suite. The Docker image is built on every merge to `master`.
 
 | Test case | Status |
 |-----------|--------|
-| `handshake` | 🔧 framework ready, UDP I/O pending |
-| `transfer` | 🔧 HTTP/0.9 helpers ready, I/O pending |
-| `retry` | 🔧 Retry integrity tag complete, server trigger pending |
-| `resumption` | 🔧 ticket store + PSK ready, handshake wire-up pending |
-| `zerortt` | 🔧 0-RTT keys derivable, early data sending pending |
-| `http3` | 🔧 framing + QPACK ready, I/O pending |
-| `keyupdate` | 🔧 `KeyPhaseState` complete, trigger pending |
-| `connectionmigration` | 🔧 `MigrationManager` complete, socket rebind pending |
-| `multiconnect` | 🔧 connection manager ready, I/O pending |
-| `chacha20` | ⏳ cipher suite negotiation not wired |
-| `v2` | ❌ not supported (exits 127) |
+| `handshake` | ✅ passing |
+| `transfer` | ✅ passing |
+| `retry` | ✅ passing |
+| `chacha20` | ✅ passing |
+| `keyupdate` | ✅ passing |
+| `resumption` | in progress |
+| `zerortt` | in progress |
+| `http3` | in progress (implemented, pending CI validation) |
+| `connectionmigration` | in progress |
+| `multiplexing` | in progress |
+
+## Known Gaps
+
+| Area | What's missing |
+|------|----------------|
+| **QPACK dynamic table** | `decodeHeaders` handles static table and literal fields only; dynamic table capacity is hardcoded to 0 |
+| **qlog** | Structured QUIC event logging to `$QLOGDIR` is not written |
+| **QUIC v2** | RFC 9369 (version 0x6b3343cf) is not supported |
 
 ## License
 
