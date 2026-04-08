@@ -16,7 +16,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.15.0"
+          version: "0.15.2"
 
       - name: Build library and binaries
         run: zig build
@@ -36,7 +36,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.15.0"
+          version: "0.15.2"
 
       - name: Check formatting
         run: zig fmt --check .
@@ -52,7 +52,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.15.0"
+          version: "0.15.2"
 
       - name: Build release binaries
         run: zig build -Doptimize=ReleaseFast
