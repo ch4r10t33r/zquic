@@ -185,9 +185,13 @@ jobs:
           docker load < zquic-interop.tar.gz
 
       # Run the test suite against zquic acting as both client and server.
-      # Test cases that are known to pass (handshake→keyupdate) run first so
-      # a 60 s timeout from http3/connectionmigration (not yet implemented)
-      # cannot corrupt the NS3 ARP state for the tests we care about.
+      # Order rationale: fast-passing tests run first to fail early on
+      # regressions.  Tests that time out at 60 s (zerortt, connectionmigration,
+      # multiplexing) are pushed to the end because a 60 s timeout corrupts the
+      # NS3 ARP cache for subsequent tests.
+      # http3 must run BEFORE zerortt/connectionmigration: zerortt now actually
+      # connects to the server (resolveAddress IPv4 fix) and times out at 60 s,
+      # which would contaminate NS3 ARP state and cause http3 to fail.
       - name: Run interop test suite
         run: |
           mkdir -p interop-results
@@ -195,7 +199,7 @@ jobs:
           python3 run.py \
             --client zquic \
             --server zquic \
-            --test handshake,transfer,retry,chacha20,keyupdate,resumption,zerortt,http3,connectionmigration,multiplexing \
+            --test handshake,transfer,retry,chacha20,keyupdate,resumption,http3,zerortt,connectionmigration,multiplexing \
             --log-dir ../interop-results/logs \
             --json ../interop-results/results.json \
             --debug
