@@ -48,6 +48,7 @@ pub const EXT_KEY_SHARE: u16 = 0x0033;
 pub const EXT_QUIC_TRANSPORT_PARAMS: u16 = 0xffa5;
 pub const EXT_PRE_SHARED_KEY: u16 = 0x0029;
 pub const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
+pub const EXT_EARLY_DATA: u16 = 0x002a;
 
 // TLS cipher suites
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -89,6 +90,11 @@ pub const ClientHelloData = struct {
     quic_transport_params: ?struct { offset: usize, len: usize } = null,
     alpn_h3: bool = false,
     alpn_h09: bool = false,
+    /// True if the client sent the early_data extension (0-RTT request).
+    has_early_data: bool = false,
+    /// First PSK identity from pre_shared_key extension (ticket blob = PSK).
+    psk_identity: [64]u8 = .{0} ** 64,
+    psk_identity_len: usize = 0,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -290,6 +296,20 @@ pub fn parseClientHello(data: []const u8) ParseError!ClientHelloData {
                     }
                 }
             },
+            EXT_EARLY_DATA => {
+                result.has_early_data = true;
+            },
+            EXT_PRE_SHARED_KEY => {
+                // Extract first PSK identity: identities_len(2) + identity_len(2) + identity
+                if (ext_data.len >= 4) {
+                    const id_len = readU16(ext_data[2..]);
+                    const ilen = @min(id_len, 64);
+                    if (4 + ilen <= ext_data.len) {
+                        @memcpy(result.psk_identity[0..ilen], ext_data[4 .. 4 + ilen]);
+                        result.psk_identity_len = ilen;
+                    }
+                }
+            },
             else => {},
         }
         p += ext_len;
@@ -375,10 +395,13 @@ pub fn buildServerHello(
 // ── EncryptedExtensions builder ───────────────────────────────────────────────
 
 /// Build a TLS 1.3 EncryptedExtensions message (raw, no record header).
+/// When `accept_early_data` is true, includes the early_data extension (0x002a)
+/// to signal that the server accepts 0-RTT data.
 pub fn buildEncryptedExtensions(
     out: []u8,
     quic_transport_params: []const u8,
     alpn: ?[]const u8,
+    accept_early_data: bool,
 ) !usize {
     // Extensions content
     var ext_buf: [2048]u8 = undefined;
@@ -406,6 +429,14 @@ pub fn buildEncryptedExtensions(
         ep += 1;
         @memcpy(ext_buf[ep .. ep + a.len], a);
         ep += a.len;
+    }
+
+    // early_data acceptance (signals server accepts 0-RTT)
+    if (accept_early_data) {
+        writeU16(ext_buf[ep..], EXT_EARLY_DATA);
+        ep += 2;
+        writeU16(ext_buf[ep..], 0); // empty body
+        ep += 2;
     }
 
     // Body = u16 ext list len + ext list
@@ -597,6 +628,7 @@ pub fn buildClientHelloWithPsk(
     server_name: ?[]const u8,
     psk_info: PskInfo,
     prefer_chacha20: bool,
+    include_early_data: bool,
 ) !usize {
     var client_random: [32]u8 = undefined;
     crypto.random.bytes(&client_random);
@@ -670,6 +702,14 @@ pub fn buildClientHelloWithPsk(
         ep += 1;
         @memcpy(ext_buf[ep .. ep + a.len], a);
         ep += a.len;
+    }
+
+    // early_data extension (0x002a) — signals 0-RTT support, placed before psk_key_exchange_modes.
+    if (include_early_data) {
+        writeU16(ext_buf[ep..], EXT_EARLY_DATA);
+        ep += 2;
+        writeU16(ext_buf[ep..], 0); // empty body
+        ep += 2;
     }
 
     // psk_key_exchange_modes — MUST appear before pre_shared_key.
@@ -912,6 +952,9 @@ pub const ServerHandshake = struct {
     ch: ClientHelloData,
     /// True once server flight is built and client Finished is verified.
     handshake_done: bool,
+    /// SHA-256(ClientHello) captured before ServerHello is added to transcript.
+    /// Used for client_early_traffic_secret derivation (RFC 8446 §7.1).
+    ch_hash: [32]u8,
 
     pub fn init() ServerHandshake {
         return .{
@@ -921,6 +964,7 @@ pub const ServerHandshake = struct {
             .handshake_secret = [_]u8{0} ** 32,
             .ch = .{},
             .handshake_done = false,
+            .ch_hash = [_]u8{0} ** 32,
         };
     }
 
@@ -936,6 +980,10 @@ pub const ServerHandshake = struct {
 
         // Add ClientHello to transcript
         self.transcript.update(ch_bytes);
+
+        // Capture transcript hash after ClientHello for early traffic secret derivation.
+        // Must be done BEFORE ServerHello is added (RFC 8446 §7.1 "Messages" = up to CH).
+        self.ch_hash = peekHash(self.transcript);
 
         // ServerHello → Initial CRYPTO
         const n = try buildServerHello(
@@ -984,8 +1032,8 @@ pub const ServerHandshake = struct {
     ) !usize {
         var pos: usize = 0;
 
-        // EncryptedExtensions
-        const ee_len = try buildEncryptedExtensions(out[pos..], quic_tp, alpn);
+        // EncryptedExtensions (include early_data acceptance if client requested it)
+        const ee_len = try buildEncryptedExtensions(out[pos..], quic_tp, alpn, self.ch.has_early_data);
         self.transcript.update(out[pos .. pos + ee_len]);
         pos += ee_len;
 
@@ -1105,10 +1153,33 @@ pub const ClientHandshake = struct {
         server_name: ?[]const u8,
         psk_info: PskInfo,
     ) !usize {
-        const n = try buildClientHelloWithPsk(out, &self.kp.public_key, quic_tp, alpn, server_name, psk_info, false);
+        const n = try buildClientHelloWithPsk(out, &self.kp.public_key, quic_tp, alpn, server_name, psk_info, false, false);
         self.transcript.update(out[0..n]);
         if (n >= 6 + 32) @memcpy(&self.client_random, out[6..38]);
         return n;
+    }
+
+    /// Build a ClientHello with PSK + early_data extension for 0-RTT.
+    /// Updates the TLS transcript; returns the message length and the HKDF
+    /// early_secret (= HKDF-Extract(0, PSK)) so the caller can derive the
+    /// client_early_traffic_secret using the ClientHello transcript hash.
+    pub fn buildClientHelloMsgWithPskAndEarlyData(
+        self: *ClientHandshake,
+        out: []u8,
+        quic_tp: []const u8,
+        alpn: ?[]const u8,
+        server_name: ?[]const u8,
+        psk_info: PskInfo,
+    ) !struct { n: usize, early_secret: [32]u8 } {
+        const n = try buildClientHelloWithPsk(out, &self.kp.public_key, quic_tp, alpn, server_name, psk_info, false, true);
+        self.transcript.update(out[0..n]);
+        if (n >= 6 + 32) @memcpy(&self.client_random, out[6..38]);
+        // Derive early_secret = HKDF-Extract(zeros_32, PSK).
+        // The caller combines this with peekHash(transcript) to get the
+        // client_early_traffic_secret.
+        const zeros: [32]u8 = .{0} ** 32;
+        const early_secret = HkdfSha256.extract(&zeros, &psk_info.psk);
+        return .{ .n = n, .early_secret = early_secret };
     }
 
     /// Process ServerHello bytes. Derives handshake secrets.

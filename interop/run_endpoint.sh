@@ -89,10 +89,10 @@ case "${TESTCASE}" in
         EXTRA_FLAGS=(--retry)
         ;;
     resumption)
-        EXTRA_FLAGS=(--resumption)
+        EXTRA_FLAGS=(--resumption --http09)
         ;;
     zerortt)
-        EXTRA_FLAGS=(--early-data)
+        EXTRA_FLAGS=(--early-data --http09)
         ;;
     http3)
         EXTRA_FLAGS=(--http3)

@@ -261,6 +261,37 @@ pub fn buildHandshakePacket(
     return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
 }
 
+/// Build a 0-RTT (Long Header, Type=0-RTT) packet.
+/// First byte = 0xD0: LH=1, Fixed=1, Type=01 (0-RTT), Reserved=00, PN_len=0.
+pub fn build0RttPacket(
+    out: []u8,
+    dcid: ConnectionId,
+    scid: ConnectionId,
+    payload: []const u8,
+    pn: u64,
+    km: *const KeyMaterial,
+) !usize {
+    var hdr_buf: [128]u8 = undefined;
+    var hp: usize = 0;
+    // 1101_0000 = Long Header | Fixed | 0-RTT | PN_len=0
+    hdr_buf[hp] = 0xD0;
+    hp += 1;
+    std.mem.writeInt(u32, hdr_buf[hp..][0..4], QUIC_VERSION_1, .big);
+    hp += 4;
+    hdr_buf[hp] = dcid.len;
+    hp += 1;
+    @memcpy(hdr_buf[hp .. hp + dcid.len], dcid.slice());
+    hp += dcid.len;
+    hdr_buf[hp] = scid.len;
+    hp += 1;
+    @memcpy(hdr_buf[hp .. hp + scid.len], scid.slice());
+    hp += scid.len;
+    const length: u64 = 1 + payload.len + 16;
+    const len_enc = try varint.encode(hdr_buf[hp..], length);
+    hp += len_enc.len;
+    return initial_mod.protectInitialPacket(out, hdr_buf[0..hp], pn, 0, payload, km);
+}
+
 /// Build a 1-RTT (Short Header) packet.
 /// Compare two `std.net.Address` values for equality (address + port).
 fn addressEqual(a: std.net.Address, b: std.net.Address) bool {
@@ -678,6 +709,10 @@ pub const ConnState = struct {
     // Non-null while waiting for a PATH_RESPONSE from the new address.
     path_challenge_data: ?[8]u8 = null,
 
+    // 0-RTT early data keys (derived from PSK + ClientHello transcript hash).
+    early_km: KeyMaterial = undefined,
+    has_early_keys: bool = false,
+
     // Cipher suite in use for 1-RTT packets (true = ChaCha20-Poly1305).
     use_chacha20: bool = false,
 
@@ -731,6 +766,7 @@ pub const ServerConfig = struct {
     keylog_path: ?[]const u8 = null,
     retry_enabled: bool = false,
     resumption_enabled: bool = false,
+    early_data: bool = false,
     http09: bool = false,
     http3: bool = false,
     key_update: bool = false,
@@ -1001,7 +1037,7 @@ pub const Server = struct {
             switch (lh.header.packet_type) {
                 .initial => self.processInitialPacket(buf, src),
                 .handshake => self.processHandshakePacket(buf, src),
-                .zero_rtt => {}, // not supported yet
+                .zero_rtt => self.process0RttPacket(buf, src),
                 .retry => {}, // server never receives Retry
             }
         } else {
@@ -1154,6 +1190,59 @@ pub const Server = struct {
         }
     }
 
+    /// Process a 0-RTT Long Header packet.  Decrypts with the connection's
+    /// early keys (if available) and dispatches STREAM frames to handleStreamData.
+    fn process0RttPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+        const lh = header_mod.parseLong(buf) catch return;
+        const conn = self.findConn(lh.header.dcid) orelse return;
+        if (!conn.has_early_keys) {
+            std.debug.print("io: 0-RTT dropped — no early keys for connection\n", .{});
+            return;
+        }
+
+        // Parse the length + PN fields that follow the QUIC long header.
+        var pos = lh.consumed;
+        if (pos >= buf.len) return;
+        const payload_len_r = varint.decode(buf[pos..]) catch return;
+        pos += payload_len_r.len;
+        const payload_len: usize = @intCast(payload_len_r.value);
+        const pn_start = pos;
+        const payload_end = pos + payload_len;
+        if (payload_end > buf.len) return;
+
+        // Decrypt with early client keys.
+        var plaintext: [4096]u8 = undefined;
+        const pt_len = decryptLongPacket(
+            &plaintext,
+            buf,
+            pn_start,
+            payload_end,
+            &conn.early_km,
+        ) catch |err| {
+            std.debug.print("io: 0-RTT decrypt failed: {}\n", .{err});
+            return;
+        };
+        std.debug.print("io: server 0-RTT decrypted {} bytes\n", .{pt_len});
+
+        // Walk the decrypted payload for STREAM frames.
+        var fpos: usize = 0;
+        while (fpos < pt_len) {
+            const ft = plaintext[fpos];
+            if (ft == 0x00) {
+                fpos += 1;
+                continue;
+            } // PADDING
+            if (ft >= 0x08 and ft <= 0x0f) {
+                const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[fpos..pt_len], ft) catch break;
+                fpos += sf_r.consumed;
+                self.handleStreamData(conn, &sf_r.frame, src);
+                continue;
+            }
+            // Unknown frame — stop.
+            break;
+        }
+    }
+
     /// Build a Retry token that encodes the original DCID so the server can
     /// recover it at verification time without external state.
     ///
@@ -1263,6 +1352,26 @@ pub const Server = struct {
 
         // Build and send server flight
         self.buildAndSendServerFlight(conn, src);
+
+        // Derive 0-RTT early keys if the client requested early data.
+        // The PSK identity sent by the client (ticket blob) IS the PSK, so we
+        // can derive client_early_traffic_secret directly.
+        if (conn.tls.ch.has_early_data and conn.tls.ch.psk_identity_len >= 32) {
+            var psk: [32]u8 = .{0} ** 32;
+            @memcpy(&psk, conn.tls.ch.psk_identity[0..32]);
+            const cets = session_mod.deriveEarlyTrafficSecret(psk, conn.tls.ch_hash);
+            const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
+            conn.early_km = KeyMaterial{
+                .secret = cets,
+                .key = early_keys.key,
+                .key32 = .{0} ** 32,
+                .iv = early_keys.iv,
+                .hp = early_keys.hp,
+                .hp32 = .{0} ** 32,
+            };
+            conn.has_early_keys = true;
+            std.debug.print("io: server derived 0-RTT early keys\n", .{});
+        }
     }
 
     fn buildAndSendServerFlight(self: *Server, conn: *ConnState, src: std.net.Address) void {
@@ -1518,18 +1627,23 @@ pub const Server = struct {
         // HANDSHAKE_DONE frame
         fp += buildHandshakeDoneFrame(frames_buf[fp..]);
 
-        // NewSessionTicket (if resumption is enabled)
-        if (self.config.resumption_enabled) {
+        // NewSessionTicket (for resumption or 0-RTT).
+        // Ticket blob = PSK = HKDF-Expand-Label(resumption_secret, "resumption", nonce, 32)
+        // The PSK is self-contained in the ticket so the server can re-derive it from
+        // the identity without persistent server-side state.
+        if (self.config.resumption_enabled or self.config.early_data) {
             const nonce = [_]u8{0x01} ** 8;
-            // Ticket = resumption secret (32 bytes)
             const res_secret = conn.tls.resumptionSecret();
+            // Derive the actual PSK per RFC 8446 §4.6.1.
+            var psk: [32]u8 = undefined;
+            keys_mod.hkdfExpandLabel(&psk, &res_secret, "resumption", &nonce);
             // Build NST into a separate buffer to avoid overlapping memcpy.
             var nst_buf: [192]u8 = undefined;
             const nst_len = tls_hs.buildNewSessionTicket(
                 &nst_buf,
                 3600,
                 &nonce,
-                &res_secret,
+                &psk, // ticket blob IS the PSK
                 16384, // max_early_data
             ) catch 0;
             if (nst_len > 0) {
@@ -2332,6 +2446,10 @@ pub const Client = struct {
     h3_client_control_sent: bool = false,
     /// Connection migration: true once the socket has been rebound to a new port.
     migrate_done: bool = false,
+    /// 0-RTT early data keys (null until a PSK+early_data ClientHello is built).
+    early_km: ?KeyMaterial = null,
+    /// Packet number space for 0-RTT packets (separate from 1-RTT PN space).
+    zerortt_pn: u64 = 0,
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -2399,11 +2517,11 @@ pub const Client = struct {
         self.conn.peer = server_addr;
         std.debug.print("io: client resolved {s} to {any}\n", .{ self.config.host, server_addr });
 
-        if (self.config.resumption and self.config.urls.len > 0) {
+        if ((self.config.resumption or self.config.early_data) and self.config.urls.len > 0) {
             // ── Connection 1: download the first URL, get a session ticket ──
             const split = @min(1, self.config.urls.len);
             self.active_urls = self.config.urls[0..split];
-            std.debug.print("io: resumption conn-1: downloading {} URL(s)\n", .{split});
+            std.debug.print("io: conn-1: downloading {} URL(s)\n", .{split});
             try self.runEventLoop(server_addr);
 
             // Wait a short while for the server to send NewSessionTicket.
@@ -2423,13 +2541,16 @@ pub const Client = struct {
                     }
                 }
             }
-            std.debug.print("io: resumption ticket_store empty={}\n", .{self.ticket_store.isEmpty()});
+            std.debug.print("io: ticket_store empty={}\n", .{self.ticket_store.isEmpty()});
 
-            // ── Connection 2: reconnect using PSK ──
+            // ── Connection 2: reconnect using PSK (+ 0-RTT if early_data) ──
             const rest_urls = self.config.urls[split..];
             try self.resetForReconnect(server_addr);
             self.active_urls = if (rest_urls.len > 0) rest_urls else self.config.urls;
-            std.debug.print("io: resumption conn-2: downloading {} URL(s) with PSK\n", .{self.active_urls.len});
+            std.debug.print("io: conn-2: downloading {} URL(s) with PSK{s}\n", .{
+                self.active_urls.len,
+                if (self.config.early_data) " + 0-RTT" else "",
+            });
             try self.runEventLoop(server_addr);
         } else {
             self.active_urls = self.config.urls;
@@ -2483,6 +2604,9 @@ pub const Client = struct {
         self.initial_pkt_len = 0;
         self.client_hello_bytes = [_]u8{0} ** 2048;
         self.client_hello_len = 0;
+        // Clear 0-RTT state so the new connection starts fresh.
+        self.early_km = null;
+        self.zerortt_pn = 0;
     }
 
     /// Inner event loop: send ClientHello, wait for handshake, download URLs.
@@ -2656,12 +2780,53 @@ pub const Client = struct {
             var quic_tp_buf: [128]u8 = undefined;
             const quic_tp = buildClientTransportParams(&quic_tp_buf);
 
-            // If resumption is enabled and we have a valid session ticket, use PSK.
+            // Choose ClientHello variant based on flags.
             const now_ms: u64 = @intCast(std.time.milliTimestamp());
-            const len = if (self.config.resumption) psk_blk: {
+            const len = if (self.config.early_data) ed_blk: {
+                // 0-RTT: PSK + early_data extension
                 if (self.ticket_store.get(now_ms)) |ticket| {
-                    var psk_bytes: [32]u8 = undefined;
-                    @memcpy(&psk_bytes, ticket.resumption_secret[0..32]);
+                    var psk_bytes: [32]u8 = .{0} ** 32;
+                    @memcpy(&psk_bytes, ticket.resumption_secret[0..@min(ticket.resumption_secret_len, 32)]);
+                    const psk_info = tls_hs.PskInfo{
+                        .ticket = ticket.ticket[0..ticket.ticket_len],
+                        .obfuscated_age = ticket.ageMs(now_ms),
+                        .psk = psk_bytes,
+                    };
+                    std.debug.print("io: client building ClientHello with PSK + early_data (ticket_len={})\n", .{ticket.ticket_len});
+                    const result = try self.tls.buildClientHelloMsgWithPskAndEarlyData(
+                        &self.client_hello_bytes,
+                        quic_tp,
+                        alpn,
+                        self.config.host,
+                        psk_info,
+                    );
+                    // Derive early keys using the ClientHello transcript hash.
+                    const ch_hash = tls_hs.peekHash(self.tls.transcript);
+                    var cets: [32]u8 = undefined;
+                    keys_mod.hkdfExpandLabel(&cets, &result.early_secret, "c e traffic", &ch_hash);
+                    const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
+                    self.early_km = KeyMaterial{
+                        .secret = cets,
+                        .key = early_keys.key,
+                        .key32 = .{0} ** 32,
+                        .iv = early_keys.iv,
+                        .hp = early_keys.hp,
+                        .hp32 = .{0} ** 32,
+                    };
+                    std.debug.print("io: client derived 0-RTT early keys\n", .{});
+                    break :ed_blk result.n;
+                } else {
+                    std.debug.print("io: early_data enabled but no valid ticket — full handshake\n", .{});
+                    break :ed_blk if (self.config.chacha20)
+                        try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
+                    else
+                        try self.tls.buildClientHelloMsg(&self.client_hello_bytes, quic_tp, alpn, self.config.host);
+                }
+            } else if (self.config.resumption) psk_blk: {
+                // 1-RTT resumption: PSK only, no early_data extension
+                if (self.ticket_store.get(now_ms)) |ticket| {
+                    var psk_bytes: [32]u8 = .{0} ** 32;
+                    @memcpy(&psk_bytes, ticket.resumption_secret[0..@min(ticket.resumption_secret_len, 32)]);
                     const psk_info = tls_hs.PskInfo{
                         .ticket = ticket.ticket[0..ticket.ticket_len],
                         .obfuscated_age = ticket.ageMs(now_ms),
@@ -2715,6 +2880,88 @@ pub const Client = struct {
         self.initial_pkt_len = pkt_len;
 
         _ = try std.posix.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
+
+        // If early keys were derived, immediately send 0-RTT request packets.
+        // This must happen only on the first send (early_km is cleared on reconnect).
+        if (self.early_km != null and !self.requested) {
+            self.send0RttRequests(server) catch |err| {
+                std.debug.print("io: 0-RTT send failed: {}\n", .{err});
+            };
+            self.requested = true;
+        }
+    }
+
+    /// Send HTTP/0.9 GET requests as 0-RTT STREAM frames.
+    /// Called immediately after the first ClientHello when early keys are available.
+    fn send0RttRequests(self: *Client, server: std.net.Address) !void {
+        const km = self.early_km orelse return;
+        std.debug.print("io: client sending {} 0-RTT request(s)\n", .{self.active_urls.len});
+
+        std.fs.makeDirAbsolute(self.config.output_dir) catch {};
+
+        for (self.active_urls, 0..) |url, i| {
+            // Extract path from URL.
+            const path = blk: {
+                if (std.mem.indexOf(u8, url, "://")) |sep| {
+                    const after_scheme = url[sep + 3 ..];
+                    if (std.mem.indexOf(u8, after_scheme, "/")) |slash| {
+                        break :blk after_scheme[slash..];
+                    }
+                }
+                break :blk url;
+            };
+
+            const stream_id: u64 = @as(u64, i) * 4;
+
+            // Open output file.
+            var dl_path_buf: [512]u8 = undefined;
+            const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
+            const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
+                std.debug.print("io: 0-RTT cannot create {s}\n", .{dl_path});
+                continue;
+            };
+
+            // Register stream for download.
+            var registered = false;
+            for (&self.streams) |*s| {
+                if (!s.active) {
+                    s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                    registered = true;
+                    break;
+                }
+            }
+            if (!registered) {
+                out_file.close();
+                continue;
+            }
+
+            // Build HTTP/0.9 GET request STREAM frame.
+            var req_buf: [4096]u8 = undefined;
+            const req = http09_client.buildRequest(path, &req_buf) catch continue;
+            const sf = stream_frame_mod.StreamFrame{
+                .stream_id = stream_id,
+                .offset = 0,
+                .data = req,
+                .fin = true,
+                .has_length = true,
+            };
+            var frame_buf: [4200]u8 = undefined;
+            const frame_len = sf.serialize(&frame_buf) catch continue;
+
+            // Build and send 0-RTT packet.
+            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const pkt_len = build0RttPacket(
+                &send_buf,
+                self.conn.remote_cid,
+                self.conn.local_cid,
+                frame_buf[0..frame_len],
+                self.zerortt_pn,
+                &km,
+            ) catch continue;
+            self.zerortt_pn += 1;
+            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+            std.debug.print("io: 0-RTT GET {s} stream_id={}\n", .{ path, stream_id });
+        }
     }
 
     fn processPacket(self: *Client, buf: []const u8) void {
@@ -3098,14 +3345,16 @@ pub const Client = struct {
         if (p + ticket_len > body.len) return;
         const ticket_blob = body[p .. p + ticket_len];
 
-        // Use the TLS application_traffic_secret as resumption secret
-        const res_secret = self.tls.secrets.client_app;
+        // The ticket blob IS the PSK (server sends PSK = HKDF-Expand-Label(resumption_secret,
+        // "resumption", nonce, 32)).  Store it as both the ticket identity and the PSK.
         var ticket_arr: [session_mod.max_ticket_len]u8 = .{0} ** session_mod.max_ticket_len;
         const tl = @min(ticket_blob.len, session_mod.max_ticket_len);
         @memcpy(ticket_arr[0..tl], ticket_blob[0..tl]);
 
+        // resumption_secret = PSK = ticket blob (used in psk_info.psk on reconnect).
         var rs_arr: [48]u8 = .{0} ** 48;
-        @memcpy(rs_arr[0..32], &res_secret);
+        const rs_len = @min(tl, 32);
+        @memcpy(rs_arr[0..rs_len], ticket_arr[0..rs_len]);
 
         const ticket = session_mod.SessionTicket{
             .lifetime_s = lifetime_s,
@@ -3114,7 +3363,7 @@ pub const Client = struct {
             .ticket = ticket_arr,
             .ticket_len = tl,
             .resumption_secret = rs_arr,
-            .resumption_secret_len = 32,
+            .resumption_secret_len = @intCast(rs_len),
             .max_early_data_size = 16384,
             .received_at_ms = @intCast(std.time.milliTimestamp()),
         };

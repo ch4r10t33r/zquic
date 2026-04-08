@@ -131,6 +131,7 @@ pub fn main() !void {
         .keylog_path = cfg.keylog,
         .retry_enabled = cfg.retry,
         .resumption_enabled = cfg.resumption,
+        .early_data = cfg.early_data,
         .http09 = cfg.http09,
         .http3 = cfg.http3,
         .key_update = cfg.key_update,
