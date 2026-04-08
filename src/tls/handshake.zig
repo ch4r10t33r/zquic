@@ -46,6 +46,8 @@ pub const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 pub const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 pub const EXT_KEY_SHARE: u16 = 0x0033;
 pub const EXT_QUIC_TRANSPORT_PARAMS: u16 = 0xffa5;
+pub const EXT_PRE_SHARED_KEY: u16 = 0x0029;
+pub const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 
 // TLS cipher suites
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -539,6 +541,224 @@ pub fn buildClientHello(
     return buildClientHelloInner(out, client_x25519_pub, quic_transport_params, alpn, server_name, false);
 }
 
+// ── PSK / session resumption ──────────────────────────────────────────────────
+
+/// PSK information for TLS 1.3 session resumption ClientHello.
+pub const PskInfo = struct {
+    /// Opaque ticket blob from the server's NewSessionTicket message.
+    ticket: []const u8,
+    /// Obfuscated ticket age (actual_age_ms + ticket_age_add) mod 2^32.
+    /// Use 0 when ticket_age_add is not tracked (RFC 8446 §4.2.11.1).
+    obfuscated_age: u32,
+    /// PSK (resumption_secret from the previous session).
+    psk: [32]u8,
+};
+
+/// Compute the PSK binder for TLS 1.3 session resumption (RFC 8446 §4.2.11.2).
+///
+/// `partial_ch` = all ClientHello bytes up to and including the PSK
+/// identities section (NOT including the binders_len/binders fields).
+fn computeResumptionBinder(psk: [32]u8, partial_ch: []const u8) [32]u8 {
+    // SHA-256("") — empty transcript hash constant.
+    const empty_hash = [32]u8{
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    };
+    // early_secret = HKDF-Extract(salt=zeros_32, IKM=PSK)
+    const zeros: [32]u8 = .{0} ** 32;
+    const early_secret = HkdfSha256.extract(&zeros, &psk);
+    // binder_key = HKDF-Expand-Label(early_secret, "res binder", SHA-256(""), 32)
+    var binder_key: [32]u8 = undefined;
+    keys_mod.hkdfExpandLabel(&binder_key, &early_secret, "res binder", &empty_hash);
+    // finished_key = HKDF-Expand-Label(binder_key, "finished", "", 32)
+    var finished_key: [32]u8 = undefined;
+    keys_mod.hkdfExpandLabel(&finished_key, &binder_key, "finished", "");
+    // binder = HMAC-SHA256(finished_key, SHA-256(partial_ch))
+    var partial_hash: [32]u8 = undefined;
+    Sha256.hash(partial_ch, &partial_hash, .{});
+    var binder: [32]u8 = undefined;
+    HmacSha256.create(&binder, &partial_hash, &finished_key);
+    return binder;
+}
+
+/// Build a TLS 1.3 ClientHello with a pre_shared_key extension for session
+/// resumption (RFC 8446 §4.2.11).  The pre_shared_key extension is always the
+/// last extension, and a psk_key_exchange_modes extension (psk_dhe_ke) is
+/// inserted immediately before it.
+///
+/// The PSK binder is computed and written into the message before returning.
+pub fn buildClientHelloWithPsk(
+    out: []u8,
+    client_x25519_pub: *const [32]u8,
+    quic_transport_params: []const u8,
+    alpn: ?[]const u8,
+    server_name: ?[]const u8,
+    psk_info: PskInfo,
+    prefer_chacha20: bool,
+) !usize {
+    var client_random: [32]u8 = undefined;
+    crypto.random.bytes(&client_random);
+
+    // Build all extensions except pre_shared_key into ext_buf.
+    var ext_buf: [2048]u8 = undefined;
+    var ep: usize = 0;
+
+    if (server_name) |sn| {
+        writeU16(ext_buf[ep..], EXT_SERVER_NAME);
+        ep += 2;
+        const sni_data_len: u16 = @intCast(2 + 1 + 2 + sn.len);
+        writeU16(ext_buf[ep..], sni_data_len);
+        ep += 2;
+        writeU16(ext_buf[ep..], @intCast(1 + 2 + sn.len));
+        ep += 2;
+        ext_buf[ep] = 0; // host_name type
+        ep += 1;
+        writeU16(ext_buf[ep..], @intCast(sn.len));
+        ep += 2;
+        @memcpy(ext_buf[ep .. ep + sn.len], sn);
+        ep += sn.len;
+    }
+    writeU16(ext_buf[ep..], EXT_SUPPORTED_VERSIONS);
+    ep += 2;
+    writeU16(ext_buf[ep..], 3);
+    ep += 2;
+    ext_buf[ep] = 2;
+    ep += 1;
+    writeU16(ext_buf[ep..], TLS_VERSION_13);
+    ep += 2;
+
+    writeU16(ext_buf[ep..], EXT_SUPPORTED_GROUPS);
+    ep += 2;
+    writeU16(ext_buf[ep..], 4);
+    ep += 2;
+    writeU16(ext_buf[ep..], 2);
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+
+    writeU16(ext_buf[ep..], EXT_KEY_SHARE);
+    ep += 2;
+    writeU16(ext_buf[ep..], 38);
+    ep += 2;
+    writeU16(ext_buf[ep..], 36);
+    ep += 2;
+    writeU16(ext_buf[ep..], GROUP_X25519);
+    ep += 2;
+    writeU16(ext_buf[ep..], 32);
+    ep += 2;
+    @memcpy(ext_buf[ep .. ep + 32], client_x25519_pub);
+    ep += 32;
+
+    writeU16(ext_buf[ep..], EXT_QUIC_TRANSPORT_PARAMS);
+    ep += 2;
+    writeU16(ext_buf[ep..], @intCast(quic_transport_params.len));
+    ep += 2;
+    @memcpy(ext_buf[ep .. ep + quic_transport_params.len], quic_transport_params);
+    ep += quic_transport_params.len;
+
+    if (alpn) |a| {
+        writeU16(ext_buf[ep..], EXT_ALPN);
+        ep += 2;
+        const adata_len: u16 = @intCast(2 + 1 + a.len);
+        writeU16(ext_buf[ep..], adata_len);
+        ep += 2;
+        writeU16(ext_buf[ep..], @intCast(1 + a.len));
+        ep += 2;
+        ext_buf[ep] = @intCast(a.len);
+        ep += 1;
+        @memcpy(ext_buf[ep .. ep + a.len], a);
+        ep += a.len;
+    }
+
+    // psk_key_exchange_modes — MUST appear before pre_shared_key.
+    writeU16(ext_buf[ep..], EXT_PSK_KEY_EXCHANGE_MODES);
+    ep += 2;
+    writeU16(ext_buf[ep..], 2); // ext_data_len = modes_len(1) + mode(1)
+    ep += 2;
+    ext_buf[ep] = 1; // ke_modes list length
+    ep += 1;
+    ext_buf[ep] = 1; // psk_dhe_ke = 1
+    ep += 1;
+
+    // PSK extension layout (appended after ext_buf, last in CH):
+    //   type(2) + ext_data_len(2)
+    //   + identities_len(2) + identity_len(2) + ticket(N) + age(4)
+    //   + binders_len(2) + binder_entry_len(1) + binder(32)
+    const ticket = psk_info.ticket;
+    const id_list_len: usize = 2 + ticket.len + 4;
+    const binder_list_len: usize = 1 + 32;
+    const psk_ext_data_len: usize = 2 + id_list_len + 2 + binder_list_len;
+    const psk_ext_total: usize = 4 + psk_ext_data_len;
+    const total_ext_len: usize = ep + psk_ext_total;
+
+    const cs_data_len: usize = if (prefer_chacha20) 4 else 2;
+    // body = version(2) + random(32) + sid_len(1) + cs_len(2) + cs + comp_len(1) + comp(1) + exts_len(2) + exts
+    const body_len = 2 + 32 + 1 + (2 + cs_data_len) + 2 + 2 + total_ext_len;
+    if (out.len < 4 + body_len) return error.BufferTooSmall;
+
+    var pos: usize = writeHsMsgHeader(out, 0, MSG_CLIENT_HELLO, body_len);
+    writeU16(out[pos..], TLS_LEGACY_VERSION);
+    pos += 2;
+    @memcpy(out[pos .. pos + 32], &client_random);
+    pos += 32;
+    out[pos] = 0; // session_id = empty
+    pos += 1;
+    writeU16(out[pos..], @intCast(cs_data_len));
+    pos += 2;
+    if (prefer_chacha20) {
+        writeU16(out[pos..], TLS_CHACHA20_POLY1305_SHA256);
+        pos += 2;
+        writeU16(out[pos..], TLS_AES_128_GCM_SHA256);
+        pos += 2;
+    } else {
+        writeU16(out[pos..], TLS_AES_128_GCM_SHA256);
+        pos += 2;
+    }
+    out[pos] = 1; // compression methods count
+    pos += 1;
+    out[pos] = 0; // no compression
+    pos += 1;
+    writeU16(out[pos..], @intCast(total_ext_len));
+    pos += 2;
+    // Regular extensions
+    @memcpy(out[pos .. pos + ep], ext_buf[0..ep]);
+    pos += ep;
+
+    // PSK extension — MUST be last.
+    writeU16(out[pos..], EXT_PRE_SHARED_KEY);
+    pos += 2;
+    writeU16(out[pos..], @intCast(psk_ext_data_len));
+    pos += 2;
+    // identities
+    writeU16(out[pos..], @intCast(id_list_len));
+    pos += 2;
+    writeU16(out[pos..], @intCast(ticket.len));
+    pos += 2;
+    @memcpy(out[pos .. pos + ticket.len], ticket);
+    pos += ticket.len;
+    std.mem.writeInt(u32, out[pos..][0..4], psk_info.obfuscated_age, .big);
+    pos += 4;
+    // ← partial_ch boundary (everything above is hashed for binder computation)
+    const partial_ch_end = pos;
+
+    // binders
+    writeU16(out[pos..], @intCast(binder_list_len));
+    pos += 2;
+    out[pos] = 32; // binder entry byte length
+    pos += 1;
+    const binder_pos = pos;
+    @memset(out[pos .. pos + 32], 0); // placeholder — filled in below
+    pos += 32;
+
+    // Compute and fill in the binder.
+    const binder = computeResumptionBinder(psk_info.psk, out[0..partial_ch_end]);
+    @memcpy(out[binder_pos .. binder_pos + 32], &binder);
+
+    return pos;
+}
+
 /// Build a ClientHello that advertises ChaCha20-Poly1305 as the preferred
 /// cipher suite, followed by AES-128-GCM as fallback.
 pub fn buildClientHelloChaCha20(
@@ -870,6 +1090,22 @@ pub const ClientHandshake = struct {
         server_name: ?[]const u8,
     ) !usize {
         const n = try buildClientHelloChaCha20(out, &self.kp.public_key, quic_tp, alpn, server_name);
+        self.transcript.update(out[0..n]);
+        if (n >= 6 + 32) @memcpy(&self.client_random, out[6..38]);
+        return n;
+    }
+
+    /// Build a ClientHello with a PSK extension for session resumption.
+    /// Updates the TLS transcript with the full ClientHello (including binder).
+    pub fn buildClientHelloMsgWithPsk(
+        self: *ClientHandshake,
+        out: []u8,
+        quic_tp: []const u8,
+        alpn: ?[]const u8,
+        server_name: ?[]const u8,
+        psk_info: PskInfo,
+    ) !usize {
+        const n = try buildClientHelloWithPsk(out, &self.kp.public_key, quic_tp, alpn, server_name, psk_info, false);
         self.transcript.update(out[0..n]);
         if (n >= 6 + 32) @memcpy(&self.client_random, out[6..38]);
         return n;

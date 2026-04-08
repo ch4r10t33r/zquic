@@ -44,6 +44,15 @@ const QUIC_VERSION_1: u32 = 0x00000001;
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
 
+/// MSG_DONTWAIT flag for non-blocking recvfrom().
+/// std.posix.MSG is void on some platforms (macOS/Zig 0.14), so use raw values.
+const MSG_DONTWAIT: u32 = if (@hasDecl(std.posix, "MSG") and @typeInfo(@TypeOf(std.posix.MSG)) == .@"struct")
+    MSG_DONTWAIT
+else switch (@import("builtin").target.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos => 0x80,
+    else => 0x40, // Linux
+};
+
 // ── QUIC packet building helpers ─────────────────────────────────────────────
 
 /// Build a CRYPTO frame: type(varint) + offset(varint) + len(varint) + data.
@@ -878,7 +887,7 @@ pub const Server = struct {
                 while (true) {
                     var src_addr: std.posix.sockaddr.storage = undefined;
                     var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-                    const flags: u32 = if (drained == 0) 0 else std.posix.MSG.DONTWAIT;
+                    const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
                     const n = std.posix.recvfrom(
                         self.sock,
                         &recv_buf,
@@ -1466,8 +1475,10 @@ pub const Server = struct {
             const nonce = [_]u8{0x01} ** 8;
             // Ticket = resumption secret (32 bytes)
             const res_secret = conn.tls.resumptionSecret();
+            // Build NST into a separate buffer to avoid overlapping memcpy.
+            var nst_buf: [192]u8 = undefined;
             const nst_len = tls_hs.buildNewSessionTicket(
-                frames_buf[fp + 4 + 8 ..], // leave room for CRYPTO frame header
+                &nst_buf,
                 3600,
                 &nonce,
                 &res_secret,
@@ -1477,7 +1488,7 @@ pub const Server = struct {
                 const crypto_len = buildCryptoFrame(
                     frames_buf[fp..],
                     conn.app_crypto_offset,
-                    frames_buf[fp + 4 + 8 .. fp + 4 + 8 + nst_len],
+                    nst_buf[0..nst_len],
                 ) catch 0;
                 conn.app_crypto_offset += nst_len;
                 fp += crypto_len;
@@ -2106,6 +2117,10 @@ pub const Client = struct {
     requested: bool = false,
     ticket_store: session_mod.TicketStore = .{},
 
+    /// Active URL slice for the current connection.  Normally == config.urls;
+    /// for the resumption second connection it is the remaining URLs.
+    active_urls: []const []const u8 = &.{},
+
     // Stored Initial packet for retransmission.
     // On the first sendClientHello call, the packet is built and stored here.
     // Subsequent retransmit calls resend this exact buffer to avoid adding the
@@ -2147,6 +2162,7 @@ pub const Client = struct {
             .sock = sock,
             .tls = tls_client,
             .conn = conn,
+            .active_urls = config.urls,
         };
     }
 
@@ -2155,6 +2171,11 @@ pub const Client = struct {
     }
 
     /// Connect to the server and download all configured URLs.
+    ///
+    /// When `config.resumption` is true the client makes two separate QUIC
+    /// connections: the first downloads the initial URL(s) and stores the
+    /// session ticket; the second reconnects using TLS 1.3 PSK (pre_shared_key
+    /// extension) and downloads the remaining URLs.
     pub fn run(self: *Client) !void {
         // Resolve server address (try IPv4 first, then DNS)
         const server_addr = std.net.Address.parseIp4(self.config.host, self.config.port) catch
@@ -2162,6 +2183,94 @@ pub const Client = struct {
         self.conn.peer = server_addr;
         std.debug.print("io: client resolved {s} to {any}\n", .{ self.config.host, server_addr });
 
+        if (self.config.resumption and self.config.urls.len > 0) {
+            // ── Connection 1: download the first URL, get a session ticket ──
+            const split = @min(1, self.config.urls.len);
+            self.active_urls = self.config.urls[0..split];
+            std.debug.print("io: resumption conn-1: downloading {} URL(s)\n", .{split});
+            try self.runEventLoop(server_addr);
+
+            // Wait a short while for the server to send NewSessionTicket.
+            // RFC 8446 §4.6.1: the server sends the ticket after the handshake.
+            if (self.ticket_store.isEmpty()) {
+                std.debug.print("io: waiting up to 2s for session ticket...\n", .{});
+                const ticket_deadline = std.time.milliTimestamp() + 2_000;
+                var recv_buf2: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                while (std.time.milliTimestamp() < ticket_deadline and self.ticket_store.isEmpty()) {
+                    var fds2 = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
+                    const rdy = std.posix.poll(&fds2, 200) catch 0;
+                    if (rdy > 0 and fds2[0].revents & std.posix.POLL.IN != 0) {
+                        var sa: std.posix.sockaddr.storage = undefined;
+                        var sl: std.posix.socklen_t = @sizeOf(@TypeOf(sa));
+                        const nb = std.posix.recvfrom(self.sock, &recv_buf2, 0, @ptrCast(&sa), &sl) catch continue;
+                        self.processPacket(recv_buf2[0..nb]);
+                    }
+                }
+            }
+            std.debug.print("io: resumption ticket_store empty={}\n", .{self.ticket_store.isEmpty()});
+
+            // ── Connection 2: reconnect using PSK ──
+            const rest_urls = self.config.urls[split..];
+            try self.resetForReconnect(server_addr);
+            self.active_urls = if (rest_urls.len > 0) rest_urls else self.config.urls;
+            std.debug.print("io: resumption conn-2: downloading {} URL(s) with PSK\n", .{self.active_urls.len});
+            try self.runEventLoop(server_addr);
+        } else {
+            self.active_urls = self.config.urls;
+            try self.runEventLoop(server_addr);
+        }
+    }
+
+    /// Reset connection state for a new QUIC connection to the same server.
+    /// Preserves the ticket_store so the second connection can use PSK.
+    fn resetForReconnect(self: *Client, server_addr: std.net.Address) !void {
+        // Close old socket and open a fresh one (new local port = new connection
+        // identity from the network's perspective).
+        std.posix.close(self.sock);
+        const new_sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
+        errdefer std.posix.close(new_sock);
+        self.sock = new_sock;
+
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+
+        // New random connection IDs.
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+        const dcid = ConnectionId.random(prng.random(), 8);
+        const scid = ConnectionId.random(prng.random(), 8);
+
+        // Reset connection state (new CIDs, new Initial secrets).
+        self.conn = ConnState{
+            .local_cid = scid,
+            .remote_cid = dcid,
+            .peer = server_addr,
+        };
+        self.conn.init_keys = InitialSecrets.derive(dcid.slice());
+
+        // Fresh TLS handshake state.
+        self.tls = ClientHandshake.init();
+
+        // Close any open stream files.
+        for (&self.streams) |*s| {
+            if (s.active) {
+                s.file.close();
+                s.active = false;
+            }
+        }
+        self.streams_done = 0;
+        self.requested = false;
+
+        // Clear packet buffers (ticket_store is preserved intentionally).
+        self.initial_pkt = [_]u8{0} ** MAX_DATAGRAM_SIZE;
+        self.initial_pkt_len = 0;
+        self.client_hello_bytes = [_]u8{0} ** 2048;
+        self.client_hello_len = 0;
+    }
+
+    /// Inner event loop: send ClientHello, wait for handshake, download URLs.
+    fn runEventLoop(self: *Client, server_addr: std.net.Address) !void {
         // Send ClientHello Initial packet
         try self.sendClientHello(server_addr);
         var last_initial_ms = std.time.milliTimestamp();
@@ -2265,16 +2374,16 @@ pub const Client = struct {
             }
             self.processPacket(recv_buf[0..n]);
 
-            // On first connection, send requests
+            // On connection established, send requests
             if (self.conn.phase == .connected and !self.requested) {
-                if (self.config.urls.len > 0) {
+                if (self.active_urls.len > 0) {
                     try self.downloadUrls(server_addr);
                 }
                 self.requested = true;
             }
 
             // Wait until all streams complete
-            if (self.conn.phase == .connected and self.streams_done >= self.config.urls.len) {
+            if (self.conn.phase == .connected and self.streams_done >= self.active_urls.len) {
                 std.debug.print("io: client all streams done\n", .{});
                 break;
             }
@@ -2287,7 +2396,7 @@ pub const Client = struct {
             return error.HandshakeTimeout;
         }
 
-        std.debug.print("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.config.urls.len });
+        std.debug.print("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.active_urls.len });
     }
 
     fn sendClientHello(self: *Client, server: std.net.Address) !void {
@@ -2310,7 +2419,7 @@ pub const Client = struct {
         // new keys, retry token), but buildClientHelloMsg must NOT be called
         // again — it would append a second ClientHello to the TLS transcript,
         // causing a Finished MAC mismatch with the server.
-        var frame_buf: [2200]u8 = undefined;
+        var frame_buf: [2400]u8 = undefined;
         const ch_len: usize = if (self.client_hello_len > 0) blk: {
             // Post-Retry: reuse the already-built TLS ClientHello bytes.
             break :blk self.client_hello_len;
@@ -2319,10 +2428,38 @@ pub const Client = struct {
             const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
             var quic_tp_buf: [128]u8 = undefined;
             const quic_tp = buildClientTransportParams(&quic_tp_buf);
-            const len = if (self.config.chacha20)
+
+            // If resumption is enabled and we have a valid session ticket, use PSK.
+            const now_ms: u64 = @intCast(std.time.milliTimestamp());
+            const len = if (self.config.resumption) psk_blk: {
+                if (self.ticket_store.get(now_ms)) |ticket| {
+                    var psk_bytes: [32]u8 = undefined;
+                    @memcpy(&psk_bytes, ticket.resumption_secret[0..32]);
+                    const psk_info = tls_hs.PskInfo{
+                        .ticket = ticket.ticket[0..ticket.ticket_len],
+                        .obfuscated_age = ticket.ageMs(now_ms),
+                        .psk = psk_bytes,
+                    };
+                    std.debug.print("io: client building ClientHello with PSK (ticket_len={})\n", .{ticket.ticket_len});
+                    break :psk_blk try self.tls.buildClientHelloMsgWithPsk(
+                        &self.client_hello_bytes,
+                        quic_tp,
+                        alpn,
+                        self.config.host,
+                        psk_info,
+                    );
+                } else {
+                    std.debug.print("io: resumption enabled but no valid ticket — full handshake\n", .{});
+                    break :psk_blk if (self.config.chacha20)
+                        try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
+                    else
+                        try self.tls.buildClientHelloMsg(&self.client_hello_bytes, quic_tp, alpn, self.config.host);
+                }
+            } else if (self.config.chacha20)
                 try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
             else
                 try self.tls.buildClientHelloMsg(&self.client_hello_bytes, quic_tp, alpn, self.config.host);
+
             self.client_hello_len = len;
             break :blk len;
         };
@@ -2784,7 +2921,7 @@ pub const Client = struct {
                     s.file.close();
                     s.active = false;
                     self.streams_done += 1;
-                    std.debug.print("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.config.urls.len });
+                    std.debug.print("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.active_urls.len });
                 }
                 return;
             }
@@ -2793,12 +2930,12 @@ pub const Client = struct {
     }
 
     fn downloadUrls(self: *Client, server: std.net.Address) !void {
-        std.debug.print("io: sending {} HTTP/0.9 requests\n", .{self.config.urls.len});
+        std.debug.print("io: sending {} HTTP/0.9 requests\n", .{self.active_urls.len});
 
         // Ensure output directory exists
         std.fs.makeDirAbsolute(self.config.output_dir) catch {};
 
-        for (self.config.urls, 0..) |url, i| {
+        for (self.active_urls, 0..) |url, i| {
             // Extract path from url (strip scheme+host if present, keep path)
             const path = blk: {
                 if (std.mem.indexOf(u8, url, "://")) |sep| {
@@ -2883,7 +3020,7 @@ pub const Client = struct {
             if (dl_iter % 100 == 0) {
                 std.debug.print("io: downloadUrls iteration {} streams_done={} remaining={}ms\n", .{ dl_iter, self.streams_done, remaining });
             }
-            if (self.streams_done >= self.config.urls.len) {
+            if (self.streams_done >= self.active_urls.len) {
                 std.debug.print("io: downloadUrls all streams done\n", .{});
                 break;
             }
@@ -2899,7 +3036,7 @@ pub const Client = struct {
             while (true) {
                 var src_addr: std.posix.sockaddr.storage = undefined;
                 var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-                const flags: u32 = if (drained == 0) 0 else std.posix.MSG.DONTWAIT;
+                const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
                 const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
                     if (drained > 0 and err == error.WouldBlock) break;
                     std.debug.print("io: downloadUrls recvfrom error: {}\n", .{err});
@@ -2910,7 +3047,7 @@ pub const Client = struct {
                 self.processPacket(recv_buf[0..n]);
             }
         }
-        std.debug.print("io: downloadUrls done iter={} streams_done={}/{}\n", .{ dl_iter, self.streams_done, self.config.urls.len });
+        std.debug.print("io: downloadUrls done iter={} streams_done={}/{}\n", .{ dl_iter, self.streams_done, self.active_urls.len });
 
         // Close all stream files
         for (&self.streams) |*s| {
