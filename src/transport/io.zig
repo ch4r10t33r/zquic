@@ -404,7 +404,11 @@ fn unprotect1RttPacketWithPnTracking(
     const plaintext_len = ciphertext.len - 16;
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
-    try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+    if (chacha20) {
+        try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
+    } else {
+        try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+    }
     return .{ .pt_len = plaintext_len, .pn = pn };
 }
 
@@ -666,8 +670,8 @@ pub const ConnState = struct {
         const hs_client_qkm = tls_hs.deriveQuicKeys(secrets.client_handshake);
         const hs_server_qkm = tls_hs.deriveQuicKeys(secrets.server_handshake);
 
-        self.hs_client_km = .{ .key = hs_client_qkm.key, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .secret = secrets.client_handshake };
-        self.hs_server_km = .{ .key = hs_server_qkm.key, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .secret = secrets.server_handshake };
+        self.hs_client_km = .{ .key = hs_client_qkm.key, .key32 = hs_client_qkm.key32, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .hp32 = hs_client_qkm.hp32, .secret = secrets.client_handshake };
+        self.hs_server_km = .{ .key = hs_server_qkm.key, .key32 = hs_server_qkm.key32, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .hp32 = hs_server_qkm.hp32, .secret = secrets.server_handshake };
 
         self.has_hs_keys = true;
     }
@@ -678,8 +682,8 @@ pub const ConnState = struct {
         const app_client_qkm = tls_hs.deriveQuicKeys(secrets.client_app);
         const app_server_qkm = tls_hs.deriveQuicKeys(secrets.server_app);
 
-        self.app_client_km = .{ .key = app_client_qkm.key, .iv = app_client_qkm.iv, .hp = app_client_qkm.hp, .secret = secrets.client_app };
-        self.app_server_km = .{ .key = app_server_qkm.key, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .secret = secrets.server_app };
+        self.app_client_km = .{ .key = app_client_qkm.key, .key32 = app_client_qkm.key32, .iv = app_client_qkm.iv, .hp = app_client_qkm.hp, .hp32 = app_client_qkm.hp32, .secret = secrets.client_app };
+        self.app_server_km = .{ .key = app_server_qkm.key, .key32 = app_server_qkm.key32, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .hp32 = app_server_qkm.hp32, .secret = secrets.server_app };
 
         self.has_app_keys = true;
     }
@@ -1542,6 +1546,11 @@ pub const Server = struct {
                             conn.use_chacha20,
                         )) |n| {
                             conn.app_client_km = nk;
+                            // Peer initiated a key update — also rotate our send keys so
+                            // the server's outgoing packets carry the new key phase bit
+                            // (RFC 9001 §6.1: both endpoints must send with the new phase).
+                            conn.app_server_km = conn.app_server_km.nextGen();
+                            conn.key_phase_bit = !conn.key_phase_bit;
                             break :decrypt n;
                         } else |_| {}
                     }
@@ -2091,6 +2100,7 @@ pub const ClientConfig = struct {
     http09: bool = false,
     http3: bool = false,
     chacha20: bool = false,
+    migrate: bool = false,
 };
 
 // ── Stream download tracker ───────────────────────────────────────────────────
@@ -2731,12 +2741,20 @@ pub const Client = struct {
         if (buf.len == 834) {
             std.debug.print("io: client 834-byte packet key phase: incoming={} current_peer={}\n", .{ incoming_phase, self.conn.peer_key_phase });
         }
-        if (incoming_phase != self.conn.peer_key_phase and !self.conn.key_update_pending) {
-            // Server has rotated its send keys; rotate our receive keys to match.
+        if (incoming_phase != self.conn.peer_key_phase) {
+            // Server's key phase changed — rotate our receive keys to match.
+            // This covers two cases:
+            //   1. Server-initiated key update (key_update_pending=false): rotate.
+            //   2. Server confirming our client-initiated key update
+            //      (key_update_pending=true): also rotate and clear the flag.
             if (buf.len == 834) {
                 std.debug.print("io: client 834-byte packet rotating to next key generation\n", .{});
             }
             self.conn.app_server_km = self.conn.app_server_km.nextGen();
+            if (self.conn.key_update_pending) {
+                // Server has confirmed our key update.
+                self.conn.key_update_pending = false;
+            }
         }
         const decrypt_result = unprotect1RttPacketWithPnTracking(
             &plaintext,
@@ -2783,6 +2801,11 @@ pub const Client = struct {
                 self.conn.phase = .connected;
                 if (self.config.keylog_path) |kpath| {
                     writeKeylog(kpath, self.tls.client_random, &self.tls.secrets);
+                }
+                // Initiate a key update immediately after the handshake if
+                // the "keyupdate" test case flag is set (RFC 9001 §6).
+                if (self.config.key_update) {
+                    self.initiateClientKeyUpdate();
                 }
                 continue;
             }
@@ -2883,6 +2906,37 @@ pub const Client = struct {
     }
 
     /// Respond to a server-sent PATH_CHALLENGE with a matching PATH_RESPONSE.
+    /// Initiate a key update from the client side (RFC 9001 §6).
+    ///
+    /// Rotates the client's send keys to the next generation, flips the key
+    /// phase bit, and sends a PING in the new epoch.  The server will detect
+    /// the key phase change, rotate its receive keys, and start sending with
+    /// the new phase too — satisfying the quic-interop-runner "keyupdate"
+    /// test case requirement that both sides emit key-phase-1 packets.
+    fn initiateClientKeyUpdate(self: *Client) void {
+        self.conn.app_client_km = self.conn.app_client_km.nextGen();
+        self.conn.key_phase_bit = !self.conn.key_phase_bit;
+        self.conn.key_update_pending = true;
+
+        // Send a PING so the server can verify the new key phase.
+        const ping_frame = [_]u8{0x01};
+        var padded: [3]u8 = .{ 0x01, 0x00, 0x00 };
+        _ = ping_frame;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            &padded,
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+        std.debug.print("io: client initiated key update → key_phase={}\n", .{self.conn.key_phase_bit});
+    }
+
     fn sendClientPathResponse(self: *Client, data: [8]u8) void {
         var frame_buf: [64]u8 = undefined;
         const frame_len = transport_frames.PathResponse.serialize(.{ .data = data }, &frame_buf) catch return;

@@ -42,6 +42,31 @@ echo "Endpoint IPv4: ${IP}, gateway: ${GATEWAY}"
 route add -net 193.167.0.0 netmask 255.255.0.0 gw "${GATEWAY}" 2>/dev/null || true
 route del -net "${UNNEEDED_ROUTE}" netmask 255.255.255.0 2>/dev/null || true
 
+# Flush any stale ARP cache entries in the NS3 network simulator.
+#
+# The NS3 sim container is kept alive across test cases, but the client and
+# server containers are recreated for every test (new MAC addresses, same
+# IPs).  Without a forced ARP exchange the sim's cached <IP → old-MAC>
+# entry causes every packet from test N+1 onward to be delivered to the
+# now-dead container from test N, so the server never receives the
+# client's Initial packets.
+#
+# We send a real ARP REQUEST for the gateway's MAC address (not a
+# gratuitous/self-addressed ARP).  Because the gateway is an NS3 router
+# node, NS3 *must* process the request and send a reply — and as part of
+# processing the inbound ARP request it caches the sender's IP→MAC mapping
+# (our new container MAC).  This is more reliable than a gratuitous ARP
+# (-U / -A) which some NS3 builds silently ignore.
+#
+# IMPORTANT: Keep this fast.  The NS3 sim waits only 10 s for server:443
+# to become available; every second spent here is one less second the
+# server has to complete its TLS handshake.  3 probes ≈ 3 s is sufficient
+# for normal inter-test ARP refresh.  Tests that would contaminate the NS3
+# ARP state via a 60 s timeout (http3, connectionmigration) are ordered
+# AFTER the tests we care about in ci.yml — so stale-ARP recovery for the
+# post-timeout case is not needed here.
+arping -c 3 -I eth0 "${GATEWAY}" 2>/dev/null || true
+
 # IPv6 equivalent
 IPV6=$(hostname -I | cut -f2 -d" " 2>/dev/null || true)
 if [[ -n "${IPV6}" && "${IPV6}" =~ ":" ]]; then
