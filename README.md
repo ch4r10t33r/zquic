@@ -194,8 +194,8 @@ full test suite. The Docker image is built on every merge to `master`.
 | `keyupdate` | ✅ passing |
 | `resumption` | in progress |
 | `zerortt` | in progress |
-| `http3` | in progress (implemented, pending CI validation) |
-| `connectionmigration` | in progress |
+| `http3` | implemented, pending CI validation |
+| `connectionmigration` | implemented, pending CI validation |
 | `multiplexing` | in progress |
 
 ## Known Gaps
