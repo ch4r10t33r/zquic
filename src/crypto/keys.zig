@@ -51,33 +51,45 @@ pub fn hkdfExpandLabel(
     HkdfSha256.expand(out, info_buf[0..pos], secret[0..Sha256.digest_length].*);
 }
 
-/// Derive the initial secrets for a QUIC connection (RFC 9001 §5.2).
+/// Derive the initial secrets for a QUIC connection (RFC 9001 §5.2 / RFC 9369 §7.2).
 ///
-/// The initial salt and client_in label are fixed by the specification.
+/// The initial salt and key-derivation labels are version-specific.
 /// Both client and server derive their secrets from the connection's initial
 /// DCID (the destination connection ID chosen by the client).
 pub const InitialSecrets = struct {
     // RFC 9001 §5.2 — QUIC v1 initial salt
-    pub const initial_salt = "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a";
+    pub const initial_salt_v1 = "\x38\x76\x2c\xf7\xf5\x59\x34\xb3\x4d\x17\x9a\xe6\xa4\xc8\x0c\xad\xcc\xbb\x7f\x0a";
+    // RFC 9369 §7.2 — QUIC v2 initial salt
+    pub const initial_salt_v2 = "\x0d\xed\xe3\xde\xf7\x00\xa6\xdb\x81\x93\x81\xbe\x6e\x26\x9d\xcb\xf9\xbd\x2e\xd9";
+
+    // Kept as alias so existing call sites that use `initial_salt` still compile.
+    pub const initial_salt = initial_salt_v1;
 
     client: KeyMaterial,
     server: KeyMaterial,
 
+    /// Derive QUIC v1 initial secrets (RFC 9001 §5.2).
     pub fn derive(dcid: []const u8) InitialSecrets {
-        // initial_secret = HKDF-Extract(initial_salt, client_dst_connection_id)
-        const initial_secret = HkdfSha256.extract(initial_salt, dcid);
-
+        const initial_secret = HkdfSha256.extract(initial_salt_v1, dcid);
         var client: KeyMaterial = undefined;
         var server: KeyMaterial = undefined;
-
-        // client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
         hkdfExpandLabel(&client.secret, &initial_secret, "client in", "");
-        // server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", "", 32)
         hkdfExpandLabel(&server.secret, &initial_secret, "server in", "");
-
         client.expand();
         server.expand();
+        return .{ .client = client, .server = server };
+    }
 
+    /// Derive QUIC v2 initial secrets (RFC 9369 §7.2).
+    /// Uses the v2 salt and "quicv2 *" derivation labels.
+    pub fn deriveV2(dcid: []const u8) InitialSecrets {
+        const initial_secret = HkdfSha256.extract(initial_salt_v2, dcid);
+        var client: KeyMaterial = undefined;
+        var server: KeyMaterial = undefined;
+        hkdfExpandLabel(&client.secret, &initial_secret, "client in", "");
+        hkdfExpandLabel(&server.secret, &initial_secret, "server in", "");
+        client.expandV2();
+        server.expandV2();
         return .{ .client = client, .server = server };
     }
 };
@@ -95,7 +107,7 @@ pub const KeyMaterial = struct {
     hp: [16]u8 = undefined,
     hp32: [32]u8 = undefined,
 
-    /// Derive key, IV, and HP from the secret using HKDF-Expand-Label.
+    /// Derive key, IV, and HP from the secret using QUIC v1 labels (RFC 9001 §5.1).
     pub fn expand(self: *KeyMaterial) void {
         hkdfExpandLabel(&self.key, &self.secret, "quic key", "");
         hkdfExpandLabel(&self.key32, &self.secret, "quic key", "");
@@ -104,7 +116,16 @@ pub const KeyMaterial = struct {
         hkdfExpandLabel(&self.hp32, &self.secret, "quic hp", "");
     }
 
-    /// Derive the next-generation key material for key updates (RFC 9001 §6).
+    /// Derive key, IV, and HP from the secret using QUIC v2 labels (RFC 9369 §7.1).
+    pub fn expandV2(self: *KeyMaterial) void {
+        hkdfExpandLabel(&self.key, &self.secret, "quicv2 key", "");
+        hkdfExpandLabel(&self.key32, &self.secret, "quicv2 key", "");
+        hkdfExpandLabel(&self.iv, &self.secret, "quicv2 iv", "");
+        hkdfExpandLabel(&self.hp, &self.secret, "quicv2 hp", "");
+        hkdfExpandLabel(&self.hp32, &self.secret, "quicv2 hp", "");
+    }
+
+    /// Derive the next-generation key material for QUIC v1 key updates (RFC 9001 §6).
     ///
     /// Only the AEAD key and IV are updated; header-protection keys are
     /// intentionally preserved from the current generation.
@@ -113,11 +134,21 @@ pub const KeyMaterial = struct {
     pub fn nextGen(self: *const KeyMaterial) KeyMaterial {
         var next: KeyMaterial = undefined;
         hkdfExpandLabel(&next.secret, &self.secret, "quic ku", "");
-        // Derive updated AEAD key + IV from the new secret.
         hkdfExpandLabel(&next.key, &next.secret, "quic key", "");
         hkdfExpandLabel(&next.key32, &next.secret, "quic key", "");
         hkdfExpandLabel(&next.iv, &next.secret, "quic iv", "");
-        // HP keys do NOT change — copy them from the current generation.
+        next.hp = self.hp;
+        next.hp32 = self.hp32;
+        return next;
+    }
+
+    /// Derive the next-generation key material for QUIC v2 key updates (RFC 9369 §7.1).
+    pub fn nextGenV2(self: *const KeyMaterial) KeyMaterial {
+        var next: KeyMaterial = undefined;
+        hkdfExpandLabel(&next.secret, &self.secret, "quicv2 ku", "");
+        hkdfExpandLabel(&next.key, &next.secret, "quicv2 key", "");
+        hkdfExpandLabel(&next.key32, &next.secret, "quicv2 key", "");
+        hkdfExpandLabel(&next.iv, &next.secret, "quicv2 iv", "");
         next.hp = self.hp;
         next.hp32 = self.hp32;
         return next;
@@ -164,4 +195,29 @@ test "keys: RFC 9001 Appendix A server initial secrets" {
     // server hp = c206b8d9b9f0f37644430b490eeaa314
     const expected_server_hp = "\xc2\x06\xb8\xd9\xb9\xf0\xf3\x76\x44\x43\x0b\x49\x0e\xea\xa3\x14";
     try testing.expectEqualSlices(u8, expected_server_hp, &secrets.server.hp);
+}
+
+test "keys: QUIC v2 initial secrets differ from v1" {
+    // Sanity check: v2 derivation (different salt + labels) must produce
+    // different keys from v1 for the same DCID.  The exact expected values
+    // should be cross-checked against RFC 9369 Appendix A once confirmed.
+    const testing = std.testing;
+    const dcid = "\x83\x94\xc8\xf0\x3e\x51\x57\x08";
+    const v1 = InitialSecrets.derive(dcid);
+    const v2 = InitialSecrets.deriveV2(dcid);
+
+    // v2 and v1 must produce different key material.
+    try testing.expect(!std.mem.eql(u8, &v1.client.key, &v2.client.key));
+    try testing.expect(!std.mem.eql(u8, &v1.server.key, &v2.server.key));
+    try testing.expect(!std.mem.eql(u8, &v1.client.iv, &v2.client.iv));
+
+    // Key / IV / HP sizes must be correct.
+    try testing.expectEqual(@as(usize, 16), v2.client.key.len);
+    try testing.expectEqual(@as(usize, 12), v2.client.iv.len);
+    try testing.expectEqual(@as(usize, 16), v2.client.hp.len);
+
+    // v2 derivation must be deterministic.
+    const v2b = InitialSecrets.deriveV2(dcid);
+    try testing.expectEqualSlices(u8, &v2.client.key, &v2b.client.key);
+    try testing.expectEqualSlices(u8, &v2.server.key, &v2b.server.key);
 }

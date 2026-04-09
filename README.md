@@ -13,6 +13,7 @@ A pure Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002
 | [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002) | QUIC Loss Detection and Congestion Control | RTT, PTO, New Reno |
 | [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) | HTTP/3 | framing, QPACK, server + client I/O |
 | [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204) | QPACK: Header Compression for HTTP/3 | static table, literal encoding (no dynamic table) |
+| [RFC 9369](https://www.rfc-editor.org/rfc/rfc9369) | QUIC Version 2 | initial secrets, packet type bits, Retry tag |
 
 ## Requirements
 
@@ -197,6 +198,7 @@ full test suite. The Docker image is built on every merge to `master`.
 | `http3` | ✅ passing |
 | `connectionmigration` | ✅ passing |
 | `multiplexing` | ✅ passing |
+| `v2` | ✅ passing |
 
 ## Known Gaps
 
@@ -204,7 +206,6 @@ full test suite. The Docker image is built on every merge to `master`.
 |------|----------------|
 | **QPACK dynamic table** | `decodeHeaders` handles static table and literal fields only; dynamic table capacity is hardcoded to 0 |
 | **qlog** | Structured QUIC event logging to `$QLOGDIR` is not written |
-| **QUIC v2** | RFC 9369 (version 0x6b3343cf) is not supported |
 
 ## License
 

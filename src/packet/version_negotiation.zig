@@ -17,6 +17,9 @@ const std = @import("std");
 /// QUIC version 1 (RFC 9000).
 pub const QUIC_V1: u32 = 0x00000001;
 
+/// QUIC version 2 (RFC 9369).
+pub const QUIC_V2: u32 = 0x6b3343cf;
+
 /// Parse error types for Version Negotiation packets.
 pub const ParseError = error{
     BufferTooShort,
