@@ -1701,10 +1701,14 @@ pub const Server = struct {
             const new_cid = ConnectionId.random(prng2.random(), 8);
             conn.alt_local_cid = new_cid;
             if (fp + 28 <= frames_buf.len) {
-                frames_buf[fp] = 0x18; fp += 1; // NEW_CONNECTION_ID type
-                frames_buf[fp] = 0x01; fp += 1; // sequence_number = 1
-                frames_buf[fp] = 0x00; fp += 1; // retire_prior_to = 0
-                frames_buf[fp] = 0x08; fp += 1; // cid length = 8
+                frames_buf[fp] = 0x18;
+                fp += 1; // NEW_CONNECTION_ID type
+                frames_buf[fp] = 0x01;
+                fp += 1; // sequence_number = 1
+                frames_buf[fp] = 0x00;
+                fp += 1; // retire_prior_to = 0
+                frames_buf[fp] = 0x08;
+                fp += 1; // cid length = 8
                 @memcpy(frames_buf[fp .. fp + 8], new_cid.slice());
                 fp += 8;
                 @memset(frames_buf[fp .. fp + 16], 0); // stateless reset token (all zeros)
@@ -1823,6 +1827,10 @@ pub const Server = struct {
                 var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
                 prng.random().bytes(&challenge);
                 conn.path_challenge_data = challenge;
+                // Eagerly update peer address so HTTP responses immediately go to
+                // the new path (optimistic migration).  PATH_CHALLENGE/RESPONSE
+                // still happens for the interop runner's validation check.
+                conn.peer = src;
                 self.sendPathChallenge(conn, challenge, src);
             }
         }
@@ -3665,6 +3673,11 @@ pub const Client = struct {
             return;
         };
         self.conn.app_pn += 1;
+        // Update remote_cid so ALL subsequent packets (including HTTP requests) use
+        // the new server CID advertised via NEW_CONNECTION_ID (RFC 9000 §9.5).
+        if (self.conn.next_remote_cid != null) {
+            self.conn.remote_cid = migration_dcid;
+        }
         _ = std.posix.sendto(new_sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch |err| {
             std.debug.print("io: migrate: PING send failed: {}\n", .{err});
             return;
