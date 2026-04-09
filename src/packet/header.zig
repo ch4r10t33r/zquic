@@ -34,13 +34,43 @@ pub const ParseError = error{
 /// The two possible header forms.
 pub const HeaderForm = enum { long, short };
 
-/// Long packet types (encoded in bits 4–5 of the first byte for QUIC v1).
+/// Long packet types (encoded in bits 4–5 of the first byte).
+///
+/// The enum values match the QUIC v1 wire encoding (RFC 9000 §17.2).
+/// QUIC v2 uses a different bit mapping (RFC 9369 §3.1); use
+/// `longTypeBits` / `longTypeFromBits` for version-aware conversions.
 pub const LongType = enum(u2) {
-    initial = 0,
-    zero_rtt = 1,
-    handshake = 2,
-    retry = 3,
+    initial = 0, // v1: 0b00  v2: 0b01
+    zero_rtt = 1, // v1: 0b01  v2: 0b10
+    handshake = 2, // v1: 0b10  v2: 0b11
+    retry = 3, // v1: 0b11  v2: 0b00
 };
+
+/// Return the 2-bit wire encoding for `pkt_type` given `version`.
+pub fn longTypeBits(pkt_type: LongType, version: u32) u2 {
+    if (version == 0x6b3343cf) { // QUIC v2
+        return switch (pkt_type) {
+            .initial => 1,
+            .zero_rtt => 2,
+            .handshake => 3,
+            .retry => 0,
+        };
+    }
+    return @intFromEnum(pkt_type); // v1: enum value == wire bits
+}
+
+/// Return the `LongType` for the given 2-bit wire encoding and `version`.
+pub fn longTypeFromBits(bits: u2, version: u32) LongType {
+    if (version == 0x6b3343cf) { // QUIC v2
+        return switch (bits) {
+            0 => .retry,
+            1 => .initial,
+            2 => .zero_rtt,
+            3 => .handshake,
+        };
+    }
+    return @enumFromInt(bits); // v1: direct mapping
+}
 
 /// Parsed long header common fields (before type-specific fields).
 pub const LongHeader = struct {
@@ -73,8 +103,11 @@ pub fn parseLong(buf: []const u8) ParseError!struct { header: LongHeader, consum
     if (first & 0x80 == 0) return error.InvalidFixedBit; // should be long
     if (first & 0x40 == 0) return error.InvalidFixedBit; // fixed bit
 
-    const pkt_type: LongType = @enumFromInt((first >> 4) & 0x03);
+    // Read version before interpreting packet-type bits — the mapping differs
+    // between QUIC v1 (RFC 9000) and QUIC v2 (RFC 9369 §3.1).
     const version = std.mem.readInt(u32, buf[1..5], .big);
+    const raw_bits: u2 = @intCast((first >> 4) & 0x03);
+    const pkt_type: LongType = longTypeFromBits(raw_bits, version);
 
     var pos: usize = 5;
 
@@ -151,8 +184,8 @@ pub fn writeLong(
     if (buf.len < needed) return error.BufferTooShort;
 
     var pos: usize = 0;
-    // Header Form=1, Fixed Bit=1, Type (2 bits), flags (4 bits)
-    buf[pos] = 0xc0 | (@as(u8, @intFromEnum(pkt_type)) << 4) | flags;
+    // Header Form=1, Fixed Bit=1, Type (2 bits, version-aware), flags (4 bits)
+    buf[pos] = 0xc0 | (@as(u8, longTypeBits(pkt_type, version)) << 4) | flags;
     pos += 1;
     std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
     pos += 4;

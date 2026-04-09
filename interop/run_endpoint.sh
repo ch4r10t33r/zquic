@@ -110,8 +110,7 @@ case "${TESTCASE}" in
         EXTRA_FLAGS=(--chacha20)
         ;;
     v2)
-        echo "TESTCASE v2 not supported" >&2
-        exit 127
+        EXTRA_FLAGS=(--v2)
         ;;
     *)
         echo "Unknown TESTCASE: ${TESTCASE}" >&2

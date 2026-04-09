@@ -41,6 +41,14 @@ const ServerHandshake = tls_hs.ServerHandshake;
 const ClientHandshake = tls_hs.ClientHandshake;
 
 const QUIC_VERSION_1: u32 = 0x00000001;
+const QUIC_VERSION_2: u32 = 0x6b3343cf;
+
+/// Return the first byte for a QUIC long-header packet.
+/// The two packet-type bits (bits 5–4) are encoded differently in v1 vs v2
+/// (RFC 9369 §3.1); everything else (Form=1, Fixed=1, low nibble=0) is common.
+inline fn quicLongFirstByte(pkt_type: header_mod.LongType, version: u32) u8 {
+    return 0xc0 | (@as(u8, header_mod.longTypeBits(pkt_type, version)) << 4);
+}
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
 
@@ -174,6 +182,7 @@ fn skipAckBody(data: []const u8, is_ecn: bool) usize {
 }
 
 /// Build an Initial packet with the given payload.
+/// `version` selects QUIC v1 (0x00000001) or v2 (0x6b3343cf).
 /// Returns bytes written.
 pub fn buildInitialPacket(
     out: []u8,
@@ -183,17 +192,14 @@ pub fn buildInitialPacket(
     payload: []const u8,
     pn: u64,
     km: *const KeyMaterial,
+    version: u32,
 ) !usize {
-    // Build header (without PN, to match buildInitialHeader from packet.zig logic)
-    // First byte: Header Form=1, Fixed Bit=1, Type=initial(00), PN_len=0 (1 byte PN)
     var hdr_buf: [128]u8 = undefined;
     var hp: usize = 0;
 
-    // First byte: 0xc0 | (initial << 4) | (pn_len_wire = 0) = 0xc0
-    hdr_buf[hp] = 0xc0; // will be header-protected
+    hdr_buf[hp] = quicLongFirstByte(.initial, version);
     hp += 1;
-    // Version
-    std.mem.writeInt(u32, hdr_buf[hp..][0..4], QUIC_VERSION_1, .big);
+    std.mem.writeInt(u32, hdr_buf[hp..][0..4], version, .big);
     hp += 4;
     // DCID
     hdr_buf[hp] = dcid.len;
@@ -229,6 +235,7 @@ pub fn buildInitialPacket(
 }
 
 /// Build a Handshake packet with the given payload.
+/// `version` selects QUIC v1 or v2.
 pub fn buildHandshakePacket(
     out: []u8,
     dcid: ConnectionId,
@@ -236,14 +243,14 @@ pub fn buildHandshakePacket(
     payload: []const u8,
     pn: u64,
     km: *const KeyMaterial,
+    version: u32,
 ) !usize {
     var hdr_buf: [128]u8 = undefined;
     var hp: usize = 0;
 
-    // First byte: Header Form=1, Fixed Bit=1, Type=handshake(10), PN_len=0
-    hdr_buf[hp] = 0xe0; // 1110_0000: long, fixed, handshake, pn_len=0
+    hdr_buf[hp] = quicLongFirstByte(.handshake, version);
     hp += 1;
-    std.mem.writeInt(u32, hdr_buf[hp..][0..4], QUIC_VERSION_1, .big);
+    std.mem.writeInt(u32, hdr_buf[hp..][0..4], version, .big);
     hp += 4;
     hdr_buf[hp] = dcid.len;
     hp += 1;
@@ -262,7 +269,7 @@ pub fn buildHandshakePacket(
 }
 
 /// Build a 0-RTT (Long Header, Type=0-RTT) packet.
-/// First byte = 0xD0: LH=1, Fixed=1, Type=01 (0-RTT), Reserved=00, PN_len=0.
+/// `version` selects QUIC v1 or v2.
 pub fn build0RttPacket(
     out: []u8,
     dcid: ConnectionId,
@@ -270,13 +277,13 @@ pub fn build0RttPacket(
     payload: []const u8,
     pn: u64,
     km: *const KeyMaterial,
+    version: u32,
 ) !usize {
     var hdr_buf: [128]u8 = undefined;
     var hp: usize = 0;
-    // 1101_0000 = Long Header | Fixed | 0-RTT | PN_len=0
-    hdr_buf[hp] = 0xD0;
+    hdr_buf[hp] = quicLongFirstByte(.zero_rtt, version);
     hp += 1;
-    std.mem.writeInt(u32, hdr_buf[hp..][0..4], QUIC_VERSION_1, .big);
+    std.mem.writeInt(u32, hdr_buf[hp..][0..4], version, .big);
     hp += 4;
     hdr_buf[hp] = dcid.len;
     hp += 1;
@@ -725,6 +732,16 @@ pub const ConnState = struct {
     // Cipher suite in use for 1-RTT packets (true = ChaCha20-Poly1305).
     use_chacha20: bool = false,
 
+    // QUIC version in use for this connection (true = QUIC v2 / RFC 9369).
+    // Controls initial-secret derivation, long-header type bits, and Retry tag.
+    use_v2: bool = false,
+
+    // Pre-derived QUIC v2 initial secrets for compatible version negotiation.
+    // Set on the client when config.v2 = true so we can decrypt a v2 Initial
+    // from the server even though we sent the first packet as v1.
+    // Cleared once we successfully upgrade to v2 (or connection is dropped).
+    v2_upgrade_keys: ?InitialSecrets = null,
+
     // TLS handshake state machine (server side)
     tls: ServerHandshake = undefined,
     tls_inited: bool = false,
@@ -736,8 +753,16 @@ pub const ConnState = struct {
     flight_bytes: [8192]u8 = undefined, // EncryptedExtensions+Cert+CV+Finished
     flight_len: usize = 0,
 
+    /// Return the QUIC version constant for this connection.
+    pub fn quicVersion(self: *const ConnState) u32 {
+        return if (self.use_v2) QUIC_VERSION_2 else QUIC_VERSION_1;
+    }
+
     pub fn deriveInitialKeys(self: *ConnState, dcid: ConnectionId) void {
-        self.init_keys = InitialSecrets.derive(dcid.slice());
+        self.init_keys = if (self.use_v2)
+            InitialSecrets.deriveV2(dcid.slice())
+        else
+            InitialSecrets.derive(dcid.slice());
     }
 
     /// Derive Handshake QUIC keys from TLS handshake traffic secrets.
@@ -781,6 +806,10 @@ pub const ServerConfig = struct {
     key_update: bool = false,
     migrate: bool = false,
     chacha20: bool = false,
+    /// Accept (and respond using) QUIC v2 when the client sends a v2 Initial.
+    /// Also suppresses Version Negotiation for QUIC_V2 packets regardless of
+    /// this flag, so the server auto-negotiates down to v1 if needed.
+    v2: bool = false,
 };
 
 // ── QUIC Server ───────────────────────────────────────────────────────────────
@@ -1033,11 +1062,12 @@ pub const Server = struct {
                 std.debug.print("io: server parseLong failed: {}\n", .{err});
                 return;
             };
-            // RFC 9000 §6.1: respond with Version Negotiation for any
-            // unsupported version so that readiness probes (wait-for-it-quic
-            // sends version 0x57415449 "WAIT") get a proper reply and do not
-            // consume connection slots.
-            if (lh.header.version != version_neg_mod.QUIC_V1) {
+            // RFC 9000 §6.1: respond with Version Negotiation for unsupported
+            // versions (e.g. "WAIT" probes from the interop network simulator).
+            // Accept both QUIC v1 and QUIC v2.
+            if (lh.header.version != version_neg_mod.QUIC_V1 and
+                lh.header.version != version_neg_mod.QUIC_V2)
+            {
                 std.debug.print("io: server sendVersionNegotiation to {}.{}.{}.{}\n", .{
                     src_ip[0], src_ip[1], src_ip[2], src_ip[3],
                 });
@@ -1100,7 +1130,7 @@ pub const Server = struct {
     }
 
     /// Create a new server-side connection.
-    fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: std.net.Address) ?*ConnState {
+    fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: std.net.Address, is_v2: bool) ?*ConnState {
         for (&self.conns) |*slot| {
             if (slot.* == null) {
                 var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
@@ -1110,6 +1140,7 @@ pub const Server = struct {
                     .remote_cid = scid,
                     .peer = peer,
                     .init_dcid = dcid,
+                    .use_v2 = is_v2,
                 };
                 const conn = &(slot.*.?);
                 conn.deriveInitialKeys(dcid);
@@ -1126,6 +1157,12 @@ pub const Server = struct {
         src: std.net.Address,
     ) void {
         const ip = packet_mod.parseInitial(buf) catch return;
+        // Detect QUIC version from raw packet (already validated in processPacket).
+        const pkt_version: u32 = if (buf.len >= 5)
+            (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 8) | buf[4]
+        else
+            QUIC_VERSION_1;
+        const is_v2_conn = pkt_version == QUIC_VERSION_2;
 
         // Retry mode: if enabled and no valid token, send Retry and drop.
         // An empty token means this is the first Initial (pre-Retry); a non-empty
@@ -1134,7 +1171,7 @@ pub const Server = struct {
         if (self.config.retry_enabled) {
             verified_odcid = self.verifyRetryToken(ip.token);
             if (verified_odcid == null) {
-                self.sendRetry(ip.dcid.slice(), ip.scid.slice(), src);
+                self.sendRetry(ip.dcid.slice(), ip.scid.slice(), src, pkt_version);
                 return;
             }
         }
@@ -1157,7 +1194,7 @@ pub const Server = struct {
             }
 
             // Truly new connection
-            const c = self.newConn(ip.dcid, ip.scid, src) orelse return;
+            const c = self.newConn(ip.dcid, ip.scid, src, is_v2_conn) orelse return;
             break :blk c;
         };
 
@@ -1182,6 +1219,18 @@ pub const Server = struct {
             payload_end,
             &init_km.client,
         ) catch return; // bad packet
+
+        // Compatible version negotiation (RFC 9368): if the server is configured
+        // for QUIC v2 but the client sent a v1 Initial, upgrade the connection to
+        // v2 now — AFTER successful v1 decryption — so that the server's Initial
+        // response (ServerHello), Handshake flight, and all subsequent packets are
+        // sent as QUIC v2.  The client pre-derives v2 initial keys and will
+        // successfully decrypt our v2 Initial.
+        if (self.config.v2 and !conn.use_v2) {
+            conn.use_v2 = true;
+            conn.init_keys = InitialSecrets.deriveV2(ip.dcid.slice());
+            std.debug.print("io: server upgraded connection to QUIC v2 (compatible version negotiation)\n", .{});
+        }
 
         // Record received PN for ACK
         conn.init_recv_pn = extractPacketNumber(buf, pn_start);
@@ -1324,11 +1373,15 @@ pub const Server = struct {
     /// = client DCID) so the client can match the response.
     fn sendVersionNegotiation(self: *Server, client_scid: []const u8, client_dcid: []const u8, dst: std.net.Address) void {
         var buf: [64]u8 = undefined;
-        const n = version_neg_mod.build(&buf, client_scid, client_dcid, &[_]u32{version_neg_mod.QUIC_V1}) catch return;
+        // Advertise both v1 and v2 so clients can upgrade or fall back.
+        const n = version_neg_mod.build(&buf, client_scid, client_dcid, &[_]u32{
+            version_neg_mod.QUIC_V1,
+            version_neg_mod.QUIC_V2,
+        }) catch return;
         _ = std.posix.sendto(self.sock, buf[0..n], 0, &dst.any, dst.getOsSockLen()) catch {};
     }
 
-    fn sendRetry(self: *Server, odcid: []const u8, scid: []const u8, src: std.net.Address) void {
+    fn sendRetry(self: *Server, odcid: []const u8, scid: []const u8, src: std.net.Address, version: u32) void {
         // New server SCID for the connection after Retry
         var new_scid: [8]u8 = undefined;
         std.crypto.random.bytes(&new_scid);
@@ -1340,7 +1393,7 @@ pub const Server = struct {
         var buf: [256]u8 = undefined;
         const n = retry_mod.buildRetryPacket(
             &buf,
-            QUIC_VERSION_1,
+            version, // use the same version as the client's Initial
             scid, // DCID = client's SCID
             &new_scid, // SCID = new server CID
             token_buf[0..token_len],
@@ -1477,6 +1530,7 @@ pub const Server = struct {
             frames_buf[0..fp],
             conn.init_pn,
             &init_km.server,
+            conn.quicVersion(),
         ) catch return;
         conn.init_pn += 1;
 
@@ -1514,6 +1568,7 @@ pub const Server = struct {
                 frames_buf[0..fp],
                 conn.hs_pn,
                 &conn.hs_server_km,
+                conn.quicVersion(),
             ) catch return;
             conn.hs_pn += 1;
 
@@ -1649,6 +1704,7 @@ pub const Server = struct {
             frames_buf[0..ack_len],
             conn.hs_pn,
             &conn.hs_server_km,
+            conn.quicVersion(),
         ) catch return;
         conn.hs_pn += 1;
 
@@ -1761,7 +1817,7 @@ pub const Server = struct {
                         break :decrypt r.pt_len;
                     } else |_| {}
                     if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
-                        var nk = conn.app_client_km.nextGen();
+                        var nk = if (conn.use_v2) conn.app_client_km.nextGenV2() else conn.app_client_km.nextGen();
                         if (unprotect1RttPacketWithPnTracking(
                             &plaintext,
                             buf,
@@ -1774,7 +1830,7 @@ pub const Server = struct {
                             // Peer initiated a key update — also rotate our send keys so
                             // the server's outgoing packets carry the new key phase bit
                             // (RFC 9001 §6.1: both endpoints must send with the new phase).
-                            conn.app_server_km = conn.app_server_km.nextGen();
+                            conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
                             conn.key_phase_bit = !conn.key_phase_bit;
                             srv_decrypted_pn = r.pn;
                             break :decrypt r.pt_len;
@@ -1817,8 +1873,8 @@ pub const Server = struct {
     /// the new key phase bit set.  Called after handshake when key_update
     /// is enabled (quic-interop-runner "keyupdate" test case).
     fn initiateKeyUpdate(self: *Server, conn: *ConnState, src: std.net.Address) void {
-        // Rotate to next generation keys.
-        conn.app_server_km = conn.app_server_km.nextGen();
+        // Rotate to next generation keys (version-appropriate label).
+        conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
         conn.key_phase_bit = !conn.key_phase_bit;
         conn.key_update_pending = true;
 
@@ -2504,6 +2560,8 @@ pub const ClientConfig = struct {
     http3: bool = false,
     chacha20: bool = false,
     migrate: bool = false,
+    /// Use QUIC v2 (RFC 9369) for this connection.
+    v2: bool = false,
 };
 
 // ── Stream download tracker ───────────────────────────────────────────────────
@@ -2586,8 +2644,17 @@ pub const Client = struct {
             .local_cid = scid,
             .remote_cid = dcid,
             .peer = undefined,
+            // Compatible version negotiation (RFC 9368): the client always starts
+            // with QUIC v1 even when v2 is preferred.  use_v2 is promoted to true
+            // once the server's v2 Initial is successfully decrypted.
+            .use_v2 = false,
         };
         conn.init_keys = InitialSecrets.derive(dcid.slice());
+        if (config.v2) {
+            // Pre-derive v2 keys so processInitialPacket can detect and handle
+            // a server Initial that uses QUIC v2 (compatible version negotiation).
+            conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
+        }
 
         return .{
             .allocator = allocator,
@@ -2974,6 +3041,7 @@ pub const Client = struct {
             frame_buf[0..payload_len],
             self.conn.init_pn,
             &init_km.client,
+            self.conn.quicVersion(),
         );
         self.conn.init_pn += 1;
         self.initial_pkt_len = pkt_len;
@@ -3068,6 +3136,7 @@ pub const Client = struct {
                 frame_buf[0..frame_len],
                 self.zerortt_pn,
                 &km,
+                self.conn.quicVersion(),
             ) catch continue;
             self.zerortt_pn += 1;
             _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
@@ -3133,13 +3202,45 @@ pub const Client = struct {
         const init_km = self.conn.init_keys orelse return;
 
         var plaintext: [4096]u8 = undefined;
-        const pt_len = initial_mod.unprotectInitialPacket(
-            &plaintext,
-            buf,
-            ip.payload_offset,
-            ip.payload_offset + ip.payload_len,
-            &init_km.server,
-        ) catch return; // bad packet
+        // Compatible version negotiation (RFC 9368): try current keys (v1 initially).
+        // If decryption fails and we have pre-derived v2 keys, check whether the
+        // server sent a v2 Initial and attempt a v2 decrypt.  On success, upgrade
+        // the connection to QUIC v2 so all subsequent packets use v2.
+        const pt_len: usize = blk: {
+            if (initial_mod.unprotectInitialPacket(
+                &plaintext,
+                buf,
+                ip.payload_offset,
+                ip.payload_offset + ip.payload_len,
+                &init_km.server,
+            )) |pt| break :blk pt else |_| {}
+
+            // v1 decryption failed — try v2 upgrade if keys are pre-derived.
+            if (self.conn.v2_upgrade_keys) |v2km| {
+                const pkt_version: u32 = if (buf.len >= 5)
+                    (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) |
+                        (@as(u32, buf[3]) << 8) | buf[4]
+                else
+                    QUIC_VERSION_1;
+                if (pkt_version == QUIC_VERSION_2) {
+                    if (initial_mod.unprotectInitialPacket(
+                        &plaintext,
+                        buf,
+                        ip.payload_offset,
+                        ip.payload_offset + ip.payload_len,
+                        &v2km.server,
+                    )) |pt| {
+                        // Successfully decrypted with v2 keys — upgrade.
+                        self.conn.use_v2 = true;
+                        self.conn.init_keys = v2km;
+                        self.conn.v2_upgrade_keys = null;
+                        std.debug.print("io: client upgraded to QUIC v2 (compatible version negotiation)\n", .{});
+                        break :blk pt;
+                    } else |_| {}
+                }
+            }
+            return; // both v1 and v2 decryption failed
+        };
 
         // Extract CRYPTO frames, skipping ACK and PADDING frames.
         var pos: usize = 0;
@@ -3278,6 +3379,7 @@ pub const Client = struct {
             frame_buf[0..crypto_len],
             self.conn.hs_pn,
             &self.conn.hs_client_km,
+            self.conn.quicVersion(),
         ) catch return;
         self.conn.hs_pn += 1;
         self.conn.finished_pkt_len = pkt_len;
@@ -3325,7 +3427,10 @@ pub const Client = struct {
             if (buf.len == 834) {
                 std.debug.print("io: client 834-byte packet rotating to next key generation\n", .{});
             }
-            self.conn.app_server_km = self.conn.app_server_km.nextGen();
+            self.conn.app_server_km = if (self.conn.use_v2)
+                self.conn.app_server_km.nextGenV2()
+            else
+                self.conn.app_server_km.nextGen();
             if (self.conn.key_update_pending) {
                 // Server has confirmed our key update.
                 self.conn.key_update_pending = false;
@@ -3549,7 +3654,10 @@ pub const Client = struct {
     /// the new phase too — satisfying the quic-interop-runner "keyupdate"
     /// test case requirement that both sides emit key-phase-1 packets.
     fn initiateClientKeyUpdate(self: *Client) void {
-        self.conn.app_client_km = self.conn.app_client_km.nextGen();
+        self.conn.app_client_km = if (self.conn.use_v2)
+            self.conn.app_client_km.nextGenV2()
+        else
+            self.conn.app_client_km.nextGen();
         self.conn.key_phase_bit = !self.conn.key_phase_bit;
         self.conn.key_update_pending = true;
 

@@ -15,28 +15,54 @@
 const std = @import("std");
 const aead_mod = @import("../crypto/aead.zig");
 
-/// AES-128-GCM key for Retry integrity tag (RFC 9001 §5.8).
+/// AES-128-GCM key for QUIC v1 Retry integrity tag (RFC 9001 §5.8).
 pub const retry_key: [16]u8 = .{
     0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
     0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
 };
 
-/// AEAD nonce for Retry integrity tag (RFC 9001 §5.8).
+/// AEAD nonce for QUIC v1 Retry integrity tag (RFC 9001 §5.8).
 pub const retry_nonce: [12]u8 = .{
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
     0x23, 0x98, 0x25, 0xbb,
 };
 
-/// Compute the 16-byte Retry Integrity Tag.
+/// AES-128-GCM key for QUIC v2 Retry integrity tag (RFC 9369 §7.3).
+pub const retry_key_v2: [16]u8 = .{
+    0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2,
+    0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92,
+};
+
+/// AEAD nonce for QUIC v2 Retry integrity tag (RFC 9369 §7.3).
+pub const retry_nonce_v2: [12]u8 = .{
+    0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99,
+    0x90, 0xef, 0xfd, 0x52,
+};
+
+/// Compute the 16-byte Retry Integrity Tag for the given QUIC version.
 ///
 /// `odcid` is the Original Destination Connection ID from the Initial packet
 /// that triggered the Retry. `retry_packet` is the full Retry packet bytes
 /// WITHOUT the 16-byte integrity tag at the end.
+/// `version` selects the correct AEAD key/nonce (v1 vs v2).
 pub fn computeIntegrityTag(
     tag: *[16]u8,
     odcid: []const u8,
     retry_packet: []const u8,
 ) aead_mod.AeadError!void {
+    return computeIntegrityTagVersion(tag, odcid, retry_packet, 0x00000001);
+}
+
+/// Version-aware Retry Integrity Tag computation.
+pub fn computeIntegrityTagVersion(
+    tag: *[16]u8,
+    odcid: []const u8,
+    retry_packet: []const u8,
+    version: u32,
+) aead_mod.AeadError!void {
+    const key = if (version == 0x6b3343cf) retry_key_v2 else retry_key;
+    const nonce = if (version == 0x6b3343cf) retry_nonce_v2 else retry_nonce;
+
     // Build the pseudo-packet: ODCID Length (1 byte) + ODCID + Retry packet
     var pseudo: [512]u8 = undefined;
     if (1 + odcid.len + retry_packet.len > pseudo.len) return error.BufferTooSmall;
@@ -47,13 +73,13 @@ pub fn computeIntegrityTag(
 
     // AES-128-GCM encrypt empty plaintext → produces only the tag
     var ciphertext: [16]u8 = undefined;
-    try aead_mod.encryptAes128Gcm(&ciphertext, &.{}, pseudo[0..pseudo_len], retry_key, retry_nonce);
+    try aead_mod.encryptAes128Gcm(&ciphertext, &.{}, pseudo[0..pseudo_len], key, nonce);
     @memcpy(tag, ciphertext[0..16]);
 }
 
 /// Verify the integrity tag of a received Retry packet.
-///
-/// Returns true if the tag is valid.
+/// Detects the QUIC version from the packet's version field and uses the
+/// appropriate key/nonce (v1 or v2).
 pub fn verifyIntegrityTag(
     odcid: []const u8,
     retry_packet_with_tag: []const u8,
@@ -62,12 +88,23 @@ pub fn verifyIntegrityTag(
     const retry_without_tag = retry_packet_with_tag[0 .. retry_packet_with_tag.len - 16];
     const received_tag = retry_packet_with_tag[retry_packet_with_tag.len - 16 ..][0..16];
 
+    // Extract version from the packet (bytes 1–4 of the long header).
+    const version: u32 = if (retry_packet_with_tag.len >= 5)
+        (@as(u32, retry_packet_with_tag[1]) << 24) |
+            (@as(u32, retry_packet_with_tag[2]) << 16) |
+            (@as(u32, retry_packet_with_tag[3]) << 8) |
+            retry_packet_with_tag[4]
+    else
+        0x00000001;
+
     var computed: [16]u8 = undefined;
-    computeIntegrityTag(&computed, odcid, retry_without_tag) catch return false;
+    computeIntegrityTagVersion(&computed, odcid, retry_without_tag, version) catch return false;
     return std.mem.eql(u8, &computed, received_tag);
 }
 
 /// Build a complete Retry packet (including integrity tag) into `buf`.
+/// The first byte's type bits and the integrity tag AEAD key/nonce are both
+/// chosen based on `version` (QUIC v1 vs v2 encode Retry type bits differently).
 /// Returns bytes written.
 pub fn buildRetryPacket(
     buf: []u8,
@@ -80,8 +117,10 @@ pub fn buildRetryPacket(
     if (buf.len < 1 + 4 + 1 + dcid.len + 1 + scid.len + token.len + 16) return error.BufferTooSmall;
 
     var pos: usize = 0;
-    // First byte: Header Form=1, Fixed Bit=1, Type=Retry (0b11), random low nibble
-    buf[pos] = 0xf0;
+    // First byte: Header Form=1, Fixed Bit=1, Type=Retry, low nibble=0.
+    // v1: Retry type bits = 0b11 → 0xF0
+    // v2: Retry type bits = 0b00 → 0xC0  (RFC 9369 §3.1)
+    buf[pos] = if (version == 0x6b3343cf) 0xC0 else 0xF0;
     pos += 1;
     std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
     pos += 4;
@@ -96,9 +135,9 @@ pub fn buildRetryPacket(
     @memcpy(buf[pos .. pos + token.len], token);
     pos += token.len;
 
-    // Compute and append integrity tag
+    // Compute and append integrity tag (version-appropriate key/nonce).
     var tag: [16]u8 = undefined;
-    try computeIntegrityTag(&tag, odcid, buf[0..pos]);
+    try computeIntegrityTagVersion(&tag, odcid, buf[0..pos], version);
     @memcpy(buf[pos .. pos + 16], &tag);
     pos += 16;
 

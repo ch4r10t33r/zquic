@@ -41,6 +41,7 @@ const Config = struct {
     rebind: bool = false,
     key_update: bool = false,
     chacha20: bool = false,
+    v2: bool = false,
 };
 
 fn parseArgs(args: []const []const u8) !Config {
@@ -90,6 +91,8 @@ fn parseArgs(args: []const []const u8) !Config {
             cfg.key_update = true;
         } else if (std.mem.eql(u8, arg, "--chacha20")) {
             cfg.chacha20 = true;
+        } else if (std.mem.eql(u8, arg, "--v2")) {
+            cfg.v2 = true;
         } else {
             std.debug.print("Unknown flag: {s}\n", .{arg});
             return error.UnknownFlag;
@@ -122,6 +125,7 @@ pub fn main() !void {
     if (cfg.key_update) std.debug.print("  key-update: enabled\n", .{});
     if (cfg.migrate) std.debug.print("  migration: enabled\n", .{});
     if (cfg.chacha20) std.debug.print("  chacha20: enabled\n", .{});
+    if (cfg.v2) std.debug.print("  QUIC v2: enabled\n", .{});
 
     const server_config = io_mod.ServerConfig{
         .port = cfg.port,
@@ -137,6 +141,7 @@ pub fn main() !void {
         .key_update = cfg.key_update,
         .migrate = cfg.migrate,
         .chacha20 = cfg.chacha20,
+        .v2 = cfg.v2,
     };
 
     const server = io_mod.Server.init(allocator, server_config) catch |err| {
