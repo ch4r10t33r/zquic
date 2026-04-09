@@ -196,7 +196,7 @@ full test suite. The Docker image is built on every merge to `master`.
 | `zerortt` | ✅ passing |
 | `http3` | implemented, pending CI validation |
 | `connectionmigration` | implemented, pending CI validation |
-| `multiplexing` | in progress |
+| `multiplexing` | implemented, pending CI validation |
 
 ## Known Gaps
 
