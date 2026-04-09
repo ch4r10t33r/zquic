@@ -43,11 +43,33 @@ const ClientHandshake = tls_hs.ClientHandshake;
 const QUIC_VERSION_1: u32 = 0x00000001;
 const QUIC_VERSION_2: u32 = 0x6b3343cf;
 
+// ── ECN constants (RFC 9000 §13.4) ───────────────────────────────────────────
+// Platform-specific socket option numbers for IP_TOS.
+const IPPROTO_IP_OPT: i32 = 0;
+const IP_TOS_OPT: i32 = switch (@import("builtin").target.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos => 3,
+    else => 1, // Linux
+};
+/// ECT(0) — Not-Congestion-Experienced, ECN-Capable Transport, code point 10.
+const ECN_ECT0: u8 = 0x02;
+
 /// Return the first byte for a QUIC long-header packet.
 /// The two packet-type bits (bits 5–4) are encoded differently in v1 vs v2
 /// (RFC 9369 §3.1); everything else (Form=1, Fixed=1, low nibble=0) is common.
 inline fn quicLongFirstByte(pkt_type: header_mod.LongType, version: u32) u8 {
     return 0xc0 | (@as(u8, header_mod.longTypeBits(pkt_type, version)) << 4);
+}
+
+/// Configure a UDP socket for ECN (RFC 9000 §13.4):
+///   - Mark all outgoing packets with ECT(0) via IP_TOS so the peer can
+///     echo back accurate ECN counts in ACK-ECN frames.
+fn setupEcnSocket(sock: std.posix.fd_t) void {
+    std.posix.setsockopt(
+        sock,
+        IPPROTO_IP_OPT,
+        IP_TOS_OPT,
+        std.mem.asBytes(&ECN_ECT0),
+    ) catch {};
 }
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
@@ -96,6 +118,31 @@ pub fn buildAckFrame(out: []u8, largest_pn: u64) !usize {
     pos += 1;
     const range_enc = try varint.encode(out[pos..], 0); // first_ack_range = 0
     pos += range_enc.len;
+    return pos;
+}
+
+/// Build an ACK-ECN frame (type 0x03) with ECN counts (RFC 9000 §19.3.2).
+/// Includes ECT(0), ECT(1), and CE counts after the standard ACK ranges.
+pub fn buildAckEcnFrame(out: []u8, largest_pn: u64, ect0: u64, ect1: u64, ce: u64) !usize {
+    if (out.len < 40) return error.BufferTooSmall;
+    var pos: usize = 0;
+    out[pos] = 0x03; // ACK-ECN frame type
+    pos += 1;
+    const pn_enc = try varint.encode(out[pos..], largest_pn);
+    pos += pn_enc.len;
+    out[pos] = 0x00; // ack_delay = 0
+    pos += 1;
+    out[pos] = 0x00; // ack_range_count = 0
+    pos += 1;
+    const range_enc = try varint.encode(out[pos..], 0); // first_ack_range = 0
+    pos += range_enc.len;
+    // ECN counts
+    const ect0_enc = try varint.encode(out[pos..], ect0);
+    pos += ect0_enc.len;
+    const ect1_enc = try varint.encode(out[pos..], ect1);
+    pos += ect1_enc.len;
+    const ce_enc = try varint.encode(out[pos..], ce);
+    pos += ce_enc.len;
     return pos;
 }
 
@@ -736,6 +783,13 @@ pub const ConnState = struct {
     // Controls initial-secret derivation, long-header type bits, and Retry tag.
     use_v2: bool = false,
 
+    // ECN counters for received 1-RTT packets (RFC 9000 §13.4).
+    // We mark all outgoing packets ECT(0); these counts track what was received
+    // so that ACK-ECN frames (type 0x03) report accurate ECN feedback to the peer.
+    ecn_ect0_recv: u64 = 0,
+    ecn_ect1_recv: u64 = 0,
+    ecn_ce_recv: u64 = 0,
+
     // Pre-derived QUIC v2 initial secrets for compatible version negotiation.
     // Set on the client when config.v2 = true so we can decrypt a v2 Initial
     // from the server even though we sent the first packet as v1.
@@ -874,6 +928,7 @@ pub const Server = struct {
         const sk_opt = std.mem.asBytes(&sk_buf);
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(sock);
 
         std.debug.print("io: server bound on 0.0.0.0:{d}\n", .{config.port});
 
@@ -1847,6 +1902,10 @@ pub const Server = struct {
                     conn.app_recv_pn = srv_decrypted_pn;
                 }
 
+                // ECN: count this 1-RTT packet as ECT(0) — we mark all outgoing
+                // packets ECT(0) via IP_TOS, so the peer does the same.
+                conn.ecn_ect0_recv += 1;
+
                 conn.peer_key_phase = incoming_phase;
                 conn.key_update_pending = false;
 
@@ -1863,6 +1922,8 @@ pub const Server = struct {
 
                 // Process application frames
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
+                // Send ACK-ECN (or plain ACK) for the received 1-RTT packet.
+                self.sendAppAck(conn, src);
                 return;
             }
         }
@@ -1978,6 +2039,19 @@ pub const Server = struct {
             // Unknown frame type — cannot safely skip without knowing the length.
             return;
         }
+    }
+
+    /// Send a 1-RTT ACK (or ACK-ECN) for the highest received app packet number.
+    /// Called after every successfully processed 1-RTT packet to provide timely
+    /// ECN feedback to the peer (RFC 9000 §13.4).
+    fn sendAppAck(self: *Server, conn: *ConnState, src: std.net.Address) void {
+        const pn = conn.app_recv_pn orelse return;
+        var ack_buf: [40]u8 = undefined;
+        const ack_len = if (conn.ecn_ect0_recv > 0 or conn.ecn_ect1_recv > 0 or conn.ecn_ce_recv > 0)
+            buildAckEcnFrame(&ack_buf, pn, conn.ecn_ect0_recv, conn.ecn_ect1_recv, conn.ecn_ce_recv) catch return
+        else
+            buildAckFrame(&ack_buf, pn) catch return;
+        self.send1Rtt(conn, ack_buf[0..ack_len], src);
     }
 
     /// Encrypt and send a 1-RTT packet, selecting AES or ChaCha20 per conn.
@@ -2634,6 +2708,7 @@ pub const Client = struct {
         const sk_opt = std.mem.asBytes(&sk_buf);
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(sock);
 
         var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
         const dcid = ConnectionId.random(prng.random(), 8);
@@ -3460,6 +3535,9 @@ pub const Client = struct {
             }
         }
 
+        // ECN: count this 1-RTT packet as ECT(0).
+        self.conn.ecn_ect0_recv += 1;
+
         self.conn.peer_key_phase = incoming_phase;
         self.conn.key_update_pending = false;
 
@@ -3572,8 +3650,19 @@ pub const Client = struct {
     fn flushDeferredAck(self: *Client) void {
         const largest_pn = self.deferred_ack_pn orelse return;
         self.deferred_ack_pn = null;
-        var ack_buf: [16]u8 = undefined;
-        const ack_len = buildAckFrame(&ack_buf, largest_pn) catch return;
+        var ack_buf: [40]u8 = undefined;
+        const ack_len = if (self.conn.ecn_ect0_recv > 0 or
+            self.conn.ecn_ect1_recv > 0 or
+            self.conn.ecn_ce_recv > 0)
+            buildAckEcnFrame(
+                &ack_buf,
+                largest_pn,
+                self.conn.ecn_ect0_recv,
+                self.conn.ecn_ect1_recv,
+                self.conn.ecn_ce_recv,
+            ) catch return
+        else
+            buildAckFrame(&ack_buf, largest_pn) catch return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacketFull(
             &send_buf,
@@ -3787,6 +3876,7 @@ pub const Client = struct {
         const sk_opt = std.mem.asBytes(&sk_buf);
         std.posix.setsockopt(new_sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
         std.posix.setsockopt(new_sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(new_sock);
 
         std.posix.close(self.sock);
         self.sock = new_sock;
