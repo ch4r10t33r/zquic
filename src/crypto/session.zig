@@ -21,6 +21,8 @@
 const std = @import("std");
 const crypto_keys = @import("keys.zig");
 
+const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -208,45 +210,50 @@ pub const EarlyDataKeys = struct {
     hp: [16]u8,
 };
 
-/// Derive 0-RTT (early data) AEAD keys from a session ticket's resumption
-/// secret.
+/// Derive client_early_traffic_secret from PSK and ClientHello transcript hash.
 ///
-/// Follows RFC 8446 §7.1:
-///   early_secret = HKDF-Extract(0, PSK)
-///   client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", ClientHello)
-///   [key, iv, hp] = HKDF-Expand-Label(client_early_traffic_secret, ...)
-///
-/// For simplicity this implementation derives the PSK directly from the
-/// resumption secret and an empty transcript hash (the full transcript-based
-/// derivation requires a running TLS handshake context).
-pub fn deriveEarlyKeys(ticket: *const SessionTicket) EarlyDataKeys {
-    // PSK = resumption_secret (simplified; real impl. hashes the nonce in)
-    const rs = ticket.resumption_secret[0..ticket.resumption_secret_len];
+/// RFC 8446 §7.1:
+///   early_secret = HKDF-Extract(zeros_32, PSK)
+///   client_early_traffic_secret =
+///       HKDF-Expand-Label(early_secret, "c e traffic", ClientHello_hash, 32)
+pub fn deriveEarlyTrafficSecret(psk: [32]u8, ch_hash: [32]u8) [32]u8 {
+    const zeros: [32]u8 = .{0} ** 32;
+    const early_secret = HkdfSha256.extract(&zeros, &psk);
+    var cets: [32]u8 = undefined;
+    crypto_keys.hkdfExpandLabel(&cets, &early_secret, "c e traffic", &ch_hash);
+    return cets;
+}
 
-    // Derive QUIC "early traffic secret" using HKDF-Expand-Label.
-    // Label: "c e traffic", context: SHA-256("") = 0xe3b0...
-    const empty_hash = [_]u8{
-        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
-        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
-        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
-        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
-    };
-    var early_traffic_secret: [32]u8 = undefined;
-    crypto_keys.hkdfExpandLabel(
-        &early_traffic_secret,
-        rs,
-        "c e traffic",
-        &empty_hash,
-    );
-
+/// Derive QUIC 0-RTT keys from the client_early_traffic_secret.
+pub fn deriveEarlyKeysFromSecret(early_traffic_secret: [32]u8) EarlyDataKeys {
     var key: [16]u8 = undefined;
     var iv: [12]u8 = undefined;
     var hp: [16]u8 = undefined;
     crypto_keys.hkdfExpandLabel(&key, &early_traffic_secret, "quic key", &.{});
     crypto_keys.hkdfExpandLabel(&iv, &early_traffic_secret, "quic iv", &.{});
     crypto_keys.hkdfExpandLabel(&hp, &early_traffic_secret, "quic hp", &.{});
-
     return .{ .key = key, .iv = iv, .hp = hp };
+}
+
+/// Derive 0-RTT (early data) AEAD keys from a session ticket's PSK.
+/// Kept for backward-compatibility; callers that have the ClientHello
+/// transcript hash should use deriveEarlyTrafficSecret + deriveEarlyKeysFromSecret.
+pub fn deriveEarlyKeys(ticket: *const SessionTicket) EarlyDataKeys {
+    // ticket.resumption_secret holds the PSK (= ticket blob sent by server).
+    var psk: [32]u8 = .{0} ** 32;
+    const plen = @min(ticket.resumption_secret_len, 32);
+    @memcpy(psk[0..plen], ticket.resumption_secret[0..plen]);
+
+    // Use an empty transcript hash as a conservative fallback.
+    // Proper derivation requires the real ClientHello hash.
+    const empty_hash = [32]u8{
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    };
+    const cets = deriveEarlyTrafficSecret(psk, empty_hash);
+    return deriveEarlyKeysFromSecret(cets);
 }
 
 // ---------------------------------------------------------------------------
