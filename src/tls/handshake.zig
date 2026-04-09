@@ -328,6 +328,7 @@ pub fn buildServerHello(
     session_id: []const u8,
     cipher_suite: u16,
     server_x25519_pub: *const [32]u8,
+    accept_psk: bool,
 ) !usize {
     // Body: version(2) + random(32) + sid_len(1) + sid + cs(2) + comp(1) + exts
     const server_random = blk: {
@@ -337,8 +338,9 @@ pub fn buildServerHello(
     };
 
     // Build extensions:
-    //   supported_versions: type(2)+len(2)+data(2+2) = total data = 2 bytes of TLS_VERSION_13
-    //   key_share: type(2)+len(2)+group(2)+key_len(2)+key(32) = 4+2+2+32 = 40 bytes total header+data
+    //   supported_versions: type(2)+len(2)+data(2) = 6 bytes
+    //   key_share: type(2)+len(2)+group(2)+key_len(2)+key(32) = 40 bytes
+    //   pre_shared_key (optional): type(2)+len(2)+selected_identity(2) = 6 bytes
     var ext_buf: [128]u8 = undefined;
     var ep: usize = 0;
     // supported_versions
@@ -359,6 +361,15 @@ pub fn buildServerHello(
     ep += 2;
     @memcpy(ext_buf[ep .. ep + 32], server_x25519_pub);
     ep += 32;
+    // pre_shared_key: selected_identity = 0 (RFC 8446 §4.2.11)
+    if (accept_psk) {
+        writeU16(ext_buf[ep..], EXT_PRE_SHARED_KEY);
+        ep += 2;
+        writeU16(ext_buf[ep..], 2); // ext data length = 2
+        ep += 2;
+        writeU16(ext_buf[ep..], 0); // selected_identity = 0
+        ep += 2;
+    }
 
     const body_len = 2 + 32 + 1 + session_id.len + 2 + 1 + 2 + ep;
     if (out.len < 4 + body_len) return error.BufferTooSmall;
@@ -985,12 +996,16 @@ pub const ServerHandshake = struct {
         // Must be done BEFORE ServerHello is added (RFC 8446 §7.1 "Messages" = up to CH).
         self.ch_hash = peekHash(self.transcript);
 
-        // ServerHello → Initial CRYPTO
+        // ServerHello → Initial CRYPTO.
+        // Include pre_shared_key extension if the client sent a PSK identity,
+        // signalling that PSK session resumption was accepted (RFC 8446 §4.2.11).
+        const accept_psk = self.ch.psk_identity_len > 0;
         const n = try buildServerHello(
             out_initial,
             self.ch.session_id[0..self.ch.session_id_len],
             self.ch.cipher_suite,
             &self.kp.public_key,
+            accept_psk,
         );
 
         // Add ServerHello to transcript
@@ -1404,7 +1419,7 @@ test "handshake: build and parse ServerHello" {
     var buf: [512]u8 = undefined;
     const pub_key = [_]u8{0x55} ** 32;
     const session_id = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const n = try buildServerHello(&buf, &session_id, TLS_AES_128_GCM_SHA256, &pub_key);
+    const n = try buildServerHello(&buf, &session_id, TLS_AES_128_GCM_SHA256, &pub_key, false);
     try testing.expect(n > 4);
     try testing.expectEqual(MSG_SERVER_HELLO, buf[0]);
 }
