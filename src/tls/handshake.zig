@@ -966,6 +966,10 @@ pub const ServerHandshake = struct {
     /// SHA-256(ClientHello) captured before ServerHello is added to transcript.
     /// Used for client_early_traffic_secret derivation (RFC 8446 §7.1).
     ch_hash: [32]u8,
+    /// True if the client offered a PSK identity and we echoed pre_shared_key
+    /// in the ServerHello.  When true, buildServerFlight skips Certificate and
+    /// CertificateVerify (RFC 8446 §4.2.11 / §4.4).
+    accept_psk: bool,
 
     pub fn init() ServerHandshake {
         return .{
@@ -976,6 +980,7 @@ pub const ServerHandshake = struct {
             .ch = .{},
             .handshake_done = false,
             .ch_hash = [_]u8{0} ** 32,
+            .accept_psk = false,
         };
     }
 
@@ -999,13 +1004,13 @@ pub const ServerHandshake = struct {
         // ServerHello → Initial CRYPTO.
         // Include pre_shared_key extension if the client sent a PSK identity,
         // signalling that PSK session resumption was accepted (RFC 8446 §4.2.11).
-        const accept_psk = self.ch.psk_identity_len > 0;
+        self.accept_psk = self.ch.psk_identity_len > 0;
         const n = try buildServerHello(
             out_initial,
             self.ch.session_id[0..self.ch.session_id_len],
             self.ch.cipher_suite,
             &self.kp.public_key,
-            accept_psk,
+            self.accept_psk,
         );
 
         // Add ServerHello to transcript
@@ -1052,16 +1057,20 @@ pub const ServerHandshake = struct {
         self.transcript.update(out[pos .. pos + ee_len]);
         pos += ee_len;
 
-        // Certificate
-        const cert_len = try buildCertificate(out[pos..], cert_der);
-        self.transcript.update(out[pos .. pos + cert_len]);
-        pos += cert_len;
+        // RFC 8446 §4.4: when PSK is in use the server authenticates via the
+        // PSK binder, not via a certificate.  Skip Certificate + CertificateVerify.
+        if (!self.accept_psk) {
+            // Certificate
+            const cert_len = try buildCertificate(out[pos..], cert_der);
+            self.transcript.update(out[pos .. pos + cert_len]);
+            pos += cert_len;
 
-        // CertificateVerify (signs transcript through Certificate)
-        const cv_hash = peekHash(self.transcript);
-        const cv_len = try buildCertificateVerify(out[pos..], &cv_hash, private_key);
-        self.transcript.update(out[pos .. pos + cv_len]);
-        pos += cv_len;
+            // CertificateVerify (signs transcript through Certificate)
+            const cv_hash = peekHash(self.transcript);
+            const cv_len = try buildCertificateVerify(out[pos..], &cv_hash, private_key);
+            self.transcript.update(out[pos .. pos + cv_len]);
+            pos += cv_len;
+        }
 
         // Finished
         const fin_hash = peekHash(self.transcript);
