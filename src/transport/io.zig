@@ -1250,20 +1250,22 @@ pub const Server = struct {
         std.debug.print("io: server 0-RTT decrypted {} bytes\n", .{pt_len});
 
         // Walk the decrypted payload for STREAM frames.
+        // NOTE: advance fpos past the type byte before calling StreamFrame.parse,
+        // exactly as processAppFrames does — parse expects a slice that starts
+        // AFTER the type byte, not at it.
         var fpos: usize = 0;
         while (fpos < pt_len) {
             const ft = plaintext[fpos];
-            if (ft == 0x00) {
-                fpos += 1;
-                continue;
-            } // PADDING
+            fpos += 1; // advance past frame type byte
+            if (ft == 0x00) continue; // PADDING
+            if (ft == 0x01) continue; // PING (no body)
             if (ft >= 0x08 and ft <= 0x0f) {
                 const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[fpos..pt_len], ft) catch break;
                 fpos += sf_r.consumed;
                 self.handleStreamData(conn, &sf_r.frame, src);
                 continue;
             }
-            // Unknown frame — stop.
+            // Unknown or non-STREAM frame — stop parsing.
             break;
         }
     }
