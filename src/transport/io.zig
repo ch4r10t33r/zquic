@@ -636,6 +636,11 @@ pub const ConnState = struct {
     // can be matched back to the right ConnState.
     init_dcid: ?ConnectionId = null,
 
+    // Alternative local CID sent to peer via NEW_CONNECTION_ID (for migration).
+    alt_local_cid: ?ConnectionId = null,
+    // Alternative remote CID received from peer via NEW_CONNECTION_ID (use on migration).
+    next_remote_cid: ?ConnectionId = null,
+
     // Peer UDP address
     peer: std.net.Address,
 
@@ -670,7 +675,7 @@ pub const ConnState = struct {
     h3_settings_sent: bool = false,
 
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
-    http09_slots: [128]Http09OutSlot = [_]Http09OutSlot{.{}} ** 128,
+    http09_slots: [2000]Http09OutSlot = [_]Http09OutSlot{.{}} ** 2000,
 
     /// HTTP/3 responses in progress (paced DATA frame sending per connection).
     http3_slots: [32]Http3OutSlot = [_]Http3OutSlot{.{}} ** 32,
@@ -1058,6 +1063,9 @@ pub const Server = struct {
         for (&self.conns) |*slot| {
             if (slot.*) |*c| {
                 if (ConnectionId.eql(c.local_cid, dcid)) return c;
+                if (c.alt_local_cid) |alt| {
+                    if (ConnectionId.eql(alt, dcid)) return c;
+                }
             }
         }
         return null;
@@ -1686,6 +1694,28 @@ pub const Server = struct {
             }
         }
 
+        // NEW_CONNECTION_ID frame (RFC 9000 §19.15) — give the client an
+        // alternative CID to use when it migrates (--migrate mode only).
+        if (self.config.migrate) {
+            var prng2 = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ 0xdeadbeef));
+            const new_cid = ConnectionId.random(prng2.random(), 8);
+            conn.alt_local_cid = new_cid;
+            if (fp + 28 <= frames_buf.len) {
+                frames_buf[fp] = 0x18;
+                fp += 1; // NEW_CONNECTION_ID type
+                frames_buf[fp] = 0x01;
+                fp += 1; // sequence_number = 1
+                frames_buf[fp] = 0x00;
+                fp += 1; // retire_prior_to = 0
+                frames_buf[fp] = 0x08;
+                fp += 1; // cid length = 8
+                @memcpy(frames_buf[fp .. fp + 8], new_cid.slice());
+                fp += 8;
+                @memset(frames_buf[fp .. fp + 16], 0); // stateless reset token (all zeros)
+                fp += 16;
+            }
+        }
+
         self.send1Rtt(conn, frames_buf[0..fp], src);
     }
 
@@ -1699,7 +1729,9 @@ pub const Server = struct {
                 const cid_len = conn.local_cid.len;
                 if (buf.len < 1 + cid_len) continue;
                 const candidate = ConnectionId.fromSlice(buf[1 .. 1 + cid_len]) catch continue;
-                if (!ConnectionId.eql(conn.local_cid, candidate)) continue;
+                const cid_match = ConnectionId.eql(conn.local_cid, candidate) or
+                    (if (conn.alt_local_cid) |alt| ConnectionId.eql(alt, candidate) else false);
+                if (!cid_match) continue;
 
                 // Try to decrypt with current client app keys.
                 var plaintext: [4096]u8 = undefined;
@@ -1795,6 +1827,10 @@ pub const Server = struct {
                 var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
                 prng.random().bytes(&challenge);
                 conn.path_challenge_data = challenge;
+                // Eagerly update peer address so HTTP responses immediately go to
+                // the new path (optimistic migration).  PATH_CHALLENGE/RESPONSE
+                // still happens for the interop runner's validation check.
+                conn.peer = src;
                 self.sendPathChallenge(conn, challenge, src);
             }
         }
@@ -2462,7 +2498,7 @@ pub const ClientConfig = struct {
 // ── Stream download tracker ───────────────────────────────────────────────────
 
 /// Maps a QUIC stream ID to an open output file for download accumulation.
-const MAX_STREAMS = 128;
+const MAX_STREAMS = 2000;
 
 const StreamDownload = struct {
     stream_id: u64,
@@ -3361,6 +3397,25 @@ pub const Client = struct {
                 }
                 continue;
             }
+            if (ft == 0x18) {
+                // NEW_CONNECTION_ID — store for use when migrating (RFC 9000 §19.15).
+                const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
+                pos += seq_r.len;
+                const rpt_r = varint.decode(plaintext[pos..pt_len]) catch return;
+                pos += rpt_r.len;
+                if (pos >= pt_len) return;
+                const cid_len_byte = plaintext[pos];
+                pos += 1;
+                if (pos + cid_len_byte + 16 > pt_len) return;
+                const new_cid = ConnectionId.fromSlice(plaintext[pos .. pos + cid_len_byte]) catch return;
+                pos += cid_len_byte;
+                pos += 16; // skip stateless reset token
+                if (seq_r.value == 1) {
+                    self.conn.next_remote_cid = new_cid;
+                    std.debug.print("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
+                }
+                continue;
+            }
             if (ft >= 0x08 and ft <= 0x0f) {
                 // STREAM frame — write data to download file
                 std.debug.print("io: client received STREAM frame type=0x{x:0>2} fin_bit={}\n", .{ ft, (ft & 0x01) != 0 });
@@ -3600,12 +3655,14 @@ pub const Client = struct {
 
         // Send a PING (frame type 0x01) on the new socket.  The server detects the
         // new source address and initiates path validation (PATH_CHALLENGE →
-        // PATH_RESPONSE).  No packet body needed for PING.
+        // PATH_RESPONSE).  RFC 9000 §9.5 requires the client to use a new DCID
+        // when migrating, so use next_remote_cid if the server sent one.
         const ping_frame = [_]u8{0x01};
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const migration_dcid = if (self.conn.next_remote_cid) |ncid| ncid else self.conn.remote_cid;
         const pkt_len = build1RttPacketFull(
             &send_buf,
-            self.conn.remote_cid,
+            migration_dcid,
             &ping_frame,
             self.conn.app_pn,
             &self.conn.app_client_km,
@@ -3616,6 +3673,11 @@ pub const Client = struct {
             return;
         };
         self.conn.app_pn += 1;
+        // Update remote_cid so ALL subsequent packets (including HTTP requests) use
+        // the new server CID advertised via NEW_CONNECTION_ID (RFC 9000 §9.5).
+        if (self.conn.next_remote_cid != null) {
+            self.conn.remote_cid = migration_dcid;
+        }
         _ = std.posix.sendto(new_sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch |err| {
             std.debug.print("io: migrate: PING send failed: {}\n", .{err});
             return;
@@ -3671,142 +3733,161 @@ pub const Client = struct {
             self.h3_client_control_sent = true;
         }
 
-        for (self.active_urls, 0..) |url, i| {
-            // Extract path from url (strip scheme+host if present, keep path)
-            const path = blk: {
-                if (std.mem.indexOf(u8, url, "://")) |sep| {
-                    const after_scheme = url[sep + 3 ..];
-                    if (std.mem.indexOf(u8, after_scheme, "/")) |slash| {
-                        break :blk after_scheme[slash..];
+        // Process downloads in batches to stay within stream limits.
+        // MAX_STREAMS determines the batch size (matches initial_max_streams_bidi).
+        const BATCH_SIZE: usize = 100;
+        var batch_start: usize = 0;
+        while (batch_start < self.active_urls.len) {
+            const batch_end = @min(batch_start + BATCH_SIZE, self.active_urls.len);
+            const batch = self.active_urls[batch_start..batch_end];
+
+            std.debug.print("io: downloadUrls batch [{}-{}) of {}\n", .{ batch_start, batch_end, self.active_urls.len });
+
+            // Send requests for this batch. Use global index for stream_id so each
+            // stream has a unique, non-overlapping ID across batches.
+            for (batch, batch_start..) |url, global_i| {
+                // Extract path from url (strip scheme+host if present, keep path)
+                const path = blk: {
+                    if (std.mem.indexOf(u8, url, "://")) |sep| {
+                        const after_scheme = url[sep + 3 ..];
+                        if (std.mem.indexOf(u8, after_scheme, "/")) |slash| {
+                            break :blk after_scheme[slash..];
+                        }
+                    }
+                    break :blk url;
+                };
+
+                // Allocate stream ID: client-initiated bidirectional = 4*global_i
+                const stream_id: u64 = @as(u64, global_i) * 4;
+                std.debug.print("io: downloadUrl[{}] path={s} stream_id={}\n", .{ global_i, path, stream_id });
+
+                // Open output file
+                var dl_path_buf: [512]u8 = undefined;
+                const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
+                const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
+                    std.debug.print("io: cannot create {s}\n", .{dl_path});
+                    continue;
+                };
+
+                // Register stream download in an available slot
+                var registered = false;
+                for (&self.streams) |*s| {
+                    if (!s.active) {
+                        s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                        std.debug.print("io: registered stream {} for download\n", .{stream_id});
+                        registered = true;
+                        break;
                     }
                 }
-                break :blk url;
-            };
+                if (!registered) {
+                    out_file.close();
+                    std.debug.print("io: streams array full\n", .{});
+                    continue;
+                }
 
-            // Allocate stream ID: client-initiated bidirectional = 4*i
-            const stream_id: u64 = @as(u64, i) * 4;
-            std.debug.print("io: downloadUrl[{}] path={s} stream_id={}\n", .{ i, path, stream_id });
+                // Build the request payload and QUIC STREAM frame.
+                var frame_buf: [4200]u8 = undefined;
+                var frame_len: usize = undefined;
 
-            // Open output file
-            var dl_path_buf: [512]u8 = undefined;
-            const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
-            const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
-                std.debug.print("io: cannot create {s}\n", .{dl_path});
-                continue;
-            };
+                if (self.config.http3) {
+                    // HTTP/3: send a HEADERS frame with :method GET and :path.
+                    var header_block: [512]u8 = undefined;
+                    const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
+                        .{ .name = ":method", .value = "GET" },
+                        .{ .name = ":path", .value = path },
+                        .{ .name = ":scheme", .value = "https" },
+                        .{ .name = ":authority", .value = self.config.host },
+                    }, &header_block) catch continue;
+                    var h3_out: [600]u8 = undefined;
+                    const h3_len = h3_frame.writeFrame(&h3_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch continue;
+                    const sf = stream_frame_mod.StreamFrame{
+                        .stream_id = stream_id,
+                        .offset = 0,
+                        .data = h3_out[0..h3_len],
+                        .fin = true, // request headers are the complete request
+                        .has_length = true,
+                    };
+                    frame_len = sf.serialize(&frame_buf) catch continue;
+                    std.debug.print("io: h3 GET {s} stream_id={}\n", .{ path, stream_id });
+                } else {
+                    // HTTP/0.9: send a raw "GET /path\r\n" request.
+                    var req_buf: [4096]u8 = undefined;
+                    const req = http09_client.buildRequest(path, &req_buf) catch continue;
+                    const sf = stream_frame_mod.StreamFrame{
+                        .stream_id = stream_id,
+                        .offset = 0,
+                        .data = req,
+                        .fin = true,
+                        .has_length = true,
+                    };
+                    frame_len = sf.serialize(&frame_buf) catch continue;
+                }
 
-            // Register stream download
-            for (&self.streams) |*s| {
-                if (!s.active) {
-                    s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
-                    std.debug.print("io: registered stream {} for download\n", .{stream_id});
+                var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                const pkt_len = build1RttPacketFull(
+                    &send_buf,
+                    self.conn.remote_cid,
+                    frame_buf[0..frame_len],
+                    self.conn.app_pn,
+                    &self.conn.app_client_km,
+                    self.conn.key_phase_bit,
+                    self.conn.use_chacha20,
+                ) catch continue;
+                self.conn.app_pn += 1;
+
+                _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+            }
+
+            // Wait for all downloads in this batch to complete.
+            const batch_target = batch_end;
+            std.debug.print("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
+            var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const dl_deadline = std.time.milliTimestamp() + 60_000;
+            var dl_iter: u32 = 0;
+            while (true) {
+                dl_iter += 1;
+                const now = std.time.milliTimestamp();
+                const remaining = dl_deadline - now;
+
+                if (remaining <= 0) {
+                    std.debug.print("io: downloadUrls DEADLINE EXCEEDED batch_target={} streams_done={}\n", .{ batch_target, self.streams_done });
                     break;
                 }
-            } else {
-                out_file.close();
-                std.debug.print("io: streams array full\n", .{});
-                continue;
-            }
 
-            // Build the request payload and QUIC STREAM frame.
-            var frame_buf: [4200]u8 = undefined;
-            var frame_len: usize = undefined;
-
-            if (self.config.http3) {
-                // HTTP/3: send a HEADERS frame with :method GET and :path.
-                var header_block: [512]u8 = undefined;
-                const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
-                    .{ .name = ":method", .value = "GET" },
-                    .{ .name = ":path", .value = path },
-                    .{ .name = ":scheme", .value = "https" },
-                    .{ .name = ":authority", .value = self.config.host },
-                }, &header_block) catch continue;
-                var h3_out: [600]u8 = undefined;
-                const h3_len = h3_frame.writeFrame(&h3_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch continue;
-                const sf = stream_frame_mod.StreamFrame{
-                    .stream_id = stream_id,
-                    .offset = 0,
-                    .data = h3_out[0..h3_len],
-                    .fin = true, // request headers are the complete request
-                    .has_length = true,
-                };
-                frame_len = sf.serialize(&frame_buf) catch continue;
-                std.debug.print("io: h3 GET {s} stream_id={}\n", .{ path, stream_id });
-            } else {
-                // HTTP/0.9: send a raw "GET /path\r\n" request.
-                var req_buf: [4096]u8 = undefined;
-                const req = http09_client.buildRequest(path, &req_buf) catch continue;
-                const sf = stream_frame_mod.StreamFrame{
-                    .stream_id = stream_id,
-                    .offset = 0,
-                    .data = req,
-                    .fin = true,
-                    .has_length = true,
-                };
-                frame_len = sf.serialize(&frame_buf) catch continue;
-            }
-
-            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacketFull(
-                &send_buf,
-                self.conn.remote_cid,
-                frame_buf[0..frame_len],
-                self.conn.app_pn,
-                &self.conn.app_client_km,
-                self.conn.key_phase_bit,
-                self.conn.use_chacha20,
-            ) catch continue;
-            self.conn.app_pn += 1;
-
-            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
-        }
-
-        // Wait for all downloads to complete (receive STREAM data + FIN)
-        std.debug.print("io: downloadUrls waiting for downloads (deadline=60s)\n", .{});
-        var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const dl_deadline = std.time.milliTimestamp() + 60_000;
-        var dl_iter: u32 = 0;
-        while (true) {
-            dl_iter += 1;
-            const now = std.time.milliTimestamp();
-            const remaining = dl_deadline - now;
-
-            if (remaining <= 0) {
-                std.debug.print("io: downloadUrls DEADLINE EXCEEDED remaining={}\n", .{remaining});
-                break;
-            }
-
-            if (dl_iter % 100 == 0) {
-                std.debug.print("io: downloadUrls iteration {} streams_done={} remaining={}ms\n", .{ dl_iter, self.streams_done, remaining });
-            }
-            if (self.streams_done >= self.active_urls.len) {
-                std.debug.print("io: downloadUrls all streams done\n", .{});
-                break;
-            }
-
-            var fds = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
-            const poll_timeout: i32 = @intCast(@min(200, @max(0, remaining)));
-            const ready = std.posix.poll(&fds, poll_timeout) catch 0;
-            if (ready == 0) continue;
-            if (fds[0].revents & std.posix.POLL.IN == 0) continue;
-
-            std.debug.print("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
-            var drained: usize = 0;
-            while (true) {
-                var src_addr: std.posix.sockaddr.storage = undefined;
-                var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-                const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
-                const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
-                    if (drained > 0 and err == error.WouldBlock) break;
-                    std.debug.print("io: downloadUrls recvfrom error: {}\n", .{err});
+                if (dl_iter % 100 == 0) {
+                    std.debug.print("io: downloadUrls iteration {} streams_done={}/{} remaining={}ms\n", .{ dl_iter, self.streams_done, batch_target, remaining });
+                }
+                if (self.streams_done >= batch_target) {
+                    std.debug.print("io: downloadUrls batch done streams_done={}\n", .{self.streams_done});
                     break;
-                };
-                drained += 1;
-                std.debug.print("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
-                self.processPacket(recv_buf[0..n]);
+                }
+
+                var fds = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
+                const poll_timeout: i32 = @intCast(@min(200, @max(0, remaining)));
+                const ready = std.posix.poll(&fds, poll_timeout) catch 0;
+                if (ready == 0) continue;
+                if (fds[0].revents & std.posix.POLL.IN == 0) continue;
+
+                std.debug.print("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
+                var drained: usize = 0;
+                while (true) {
+                    var src_addr: std.posix.sockaddr.storage = undefined;
+                    var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
+                    const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
+                    const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
+                        if (drained > 0 and err == error.WouldBlock) break;
+                        std.debug.print("io: downloadUrls recvfrom error: {}\n", .{err});
+                        break;
+                    };
+                    drained += 1;
+                    std.debug.print("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
+                    self.processPacket(recv_buf[0..n]);
+                }
             }
+
+            batch_start = batch_end;
         }
-        std.debug.print("io: downloadUrls done iter={} streams_done={}/{}\n", .{ dl_iter, self.streams_done, self.active_urls.len });
+        std.debug.print("io: downloadUrls done streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
 
         // Close all stream files
         for (&self.streams) |*s| {

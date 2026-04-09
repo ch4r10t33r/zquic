@@ -153,6 +153,11 @@ else
         URL_FLAGS+=(--url "${url}")
     done
 
+    # connectionmigration: when server is dual-stack "server46", client must migrate
+    if [[ "${REQUESTS:-}" == *server46* ]]; then
+        EXTRA_FLAGS+=(--migrate)
+    fi
+
     exec zquic-client \
         --host "${HOST}" \
         --port "${PORT}" \
