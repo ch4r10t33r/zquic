@@ -1922,8 +1922,13 @@ pub const Server = struct {
 
                 // Process application frames
                 self.processAppFrames(conn, plaintext[0..pt_len], src);
-                // Send ACK-ECN (or plain ACK) for the received 1-RTT packet.
-                self.sendAppAck(conn, src);
+                // Send ACK-ECN on the 1st and every 8th subsequent 1-RTT packet.
+                // Sending on every packet would flood the NS3 queue (25-packet limit)
+                // in tests with many concurrent streams (zerortt). The ECN test only
+                // requires at least one ACK-ECN frame to appear in the server trace.
+                if (conn.ecn_ect0_recv == 1 or conn.ecn_ect0_recv % 8 == 0) {
+                    self.sendAppAck(conn, src);
+                }
                 return;
             }
         }
