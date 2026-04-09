@@ -1745,32 +1745,39 @@ pub const Server = struct {
                 // Try current recv keys first. Only use next key generation when the
                 // current keys fail and the Key Phase bit indicates an update — avoids
                 // mis-sampled HP flipping keys before the first post-handshake packet.
+                // Use PN-tracking decryption so packet number decompression is correct
+                // even when the client's PN space grows beyond 1-byte truncation range.
+                var srv_decrypted_pn: u64 = 0;
                 const pt_len: usize = decrypt: {
-                    if (unprotect1RttPacket(
+                    if (unprotect1RttPacketWithPnTracking(
                         &plaintext,
                         buf,
                         pn_start,
                         &conn.app_client_km,
                         conn.use_chacha20,
-                    )) |n| {
-                        break :decrypt n;
+                        conn.app_recv_pn,
+                    )) |r| {
+                        srv_decrypted_pn = r.pn;
+                        break :decrypt r.pt_len;
                     } else |_| {}
                     if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
                         var nk = conn.app_client_km.nextGen();
-                        if (unprotect1RttPacket(
+                        if (unprotect1RttPacketWithPnTracking(
                             &plaintext,
                             buf,
                             pn_start,
                             &nk,
                             conn.use_chacha20,
-                        )) |n| {
+                            conn.app_recv_pn,
+                        )) |r| {
                             conn.app_client_km = nk;
                             // Peer initiated a key update — also rotate our send keys so
                             // the server's outgoing packets carry the new key phase bit
                             // (RFC 9001 §6.1: both endpoints must send with the new phase).
                             conn.app_server_km = conn.app_server_km.nextGen();
                             conn.key_phase_bit = !conn.key_phase_bit;
-                            break :decrypt n;
+                            srv_decrypted_pn = r.pn;
+                            break :decrypt r.pt_len;
                         } else |_| {}
                     }
                     std.debug.print(
@@ -1779,6 +1786,10 @@ pub const Server = struct {
                     );
                     continue;
                 };
+                // Update server's received PN so future decompression stays accurate.
+                if (srv_decrypted_pn > (conn.app_recv_pn orelse 0)) {
+                    conn.app_recv_pn = srv_decrypted_pn;
+                }
 
                 conn.peer_key_phase = incoming_phase;
                 conn.key_update_pending = false;
@@ -2531,6 +2542,13 @@ pub const Client = struct {
     early_km: ?KeyMaterial = null,
     /// Packet number space for 0-RTT packets (separate from 1-RTT PN space).
     zerortt_pn: u64 = 0,
+
+    /// Deferred ACK: instead of sending one ACK per received server packet,
+    /// we accumulate the highest received PN here and flush a single cumulative
+    /// ACK after draining all pending packets in the recv loop.  This reduces
+    /// the burst from (N ACKs + N GETs) to (1 ACK + N GETs), keeping the
+    /// combined burst under the NS3 DropTail queue limit of 25 packets.
+    deferred_ack_pn: ?u64 = null,
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -3432,32 +3450,44 @@ pub const Client = struct {
             return;
         }
 
-        // Send an ACK frame for the received packet so the server can clear
-        // awaiting_fin_ack slots.  Without client ACKs, the server retransmits
-        // ALL pending FIN frames every 200ms — a burst that can overflow the
-        // NS3 25-packet queue and permanently lose 0-RTT responses.
-        {
-            var ack_buf: [16]u8 = undefined;
-            const ack_len = buildAckFrame(&ack_buf, decompressed_pn) catch return;
-            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-            const pkt_len = build1RttPacketFull(
-                &send_buf,
-                self.conn.remote_cid,
-                ack_buf[0..ack_len],
-                self.conn.app_pn,
-                &self.conn.app_client_km,
-                self.conn.key_phase_bit,
-                self.conn.use_chacha20,
-            ) catch return;
-            self.conn.app_pn += 1;
-            _ = std.posix.sendto(
-                self.sock,
-                send_buf[0..pkt_len],
-                0,
-                &self.conn.peer.any,
-                self.conn.peer.getOsSockLen(),
-            ) catch {};
+        // Defer ACK: accumulate the highest received PN rather than sending
+        // one ACK per packet.  The actual ACK is flushed once after the recv
+        // drain loop in downloadUrls.  This keeps the combined burst
+        // (deferred ACK + next GET batch) well within the NS3 DropTail queue
+        // limit of 25 packets (1 ACK + 20 GETs = 21 ≤ 25).
+        if (decompressed_pn > (self.deferred_ack_pn orelse 0)) {
+            self.deferred_ack_pn = decompressed_pn;
         }
+    }
+
+    /// Send a single cumulative ACK for the highest PN accumulated since the
+    /// last flush.  Called once per recv-drain cycle from downloadUrls so that
+    /// the server can clear awaiting_fin_ack slots without flooding the NS3
+    /// network simulator queue.
+    fn flushDeferredAck(self: *Client) void {
+        const largest_pn = self.deferred_ack_pn orelse return;
+        self.deferred_ack_pn = null;
+        var ack_buf: [16]u8 = undefined;
+        const ack_len = buildAckFrame(&ack_buf, largest_pn) catch return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            ack_buf[0..ack_len],
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(
+            self.sock,
+            send_buf[0..pkt_len],
+            0,
+            &self.conn.peer.any,
+            self.conn.peer.getOsSockLen(),
+        ) catch {};
+        std.debug.print("io: client flushed deferred ACK largest_pn={}\n", .{largest_pn});
     }
 
     fn handleAppCrypto(self: *Client, data: []const u8) void {
@@ -3733,9 +3763,12 @@ pub const Client = struct {
             self.h3_client_control_sent = true;
         }
 
-        // Process downloads in batches to stay within stream limits.
-        // MAX_STREAMS determines the batch size (matches initial_max_streams_bidi).
-        const BATCH_SIZE: usize = 100;
+        // Process downloads in batches to stay within NS3 network simulator limits.
+        // The NS3 DropTail queue is 25 packets; sending more than ~20 packets at
+        // once causes queue overflow and packet drops.  Using BATCH_SIZE=20 keeps
+        // each GET request burst at or below the queue limit, matching the server's
+        // own 20-packet-per-flush budget (see flushPendingHttp09Responses).
+        const BATCH_SIZE: usize = 20;
         var batch_start: usize = 0;
         while (batch_start < self.active_urls.len) {
             const batch_end = @min(batch_start + BATCH_SIZE, self.active_urls.len);
@@ -3883,6 +3916,10 @@ pub const Client = struct {
                     std.debug.print("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
                     self.processPacket(recv_buf[0..n]);
                 }
+                // Send one cumulative ACK after draining all pending packets.
+                // This replaces N individual ACKs with a single packet, reducing
+                // the combined burst (ACK + next GET batch) to ≤ 21 packets.
+                self.flushDeferredAck();
             }
 
             batch_start = batch_end;
