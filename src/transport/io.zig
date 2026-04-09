@@ -3219,8 +3219,9 @@ pub const Client = struct {
             if (self.conn.v2_upgrade_keys) |v2km| {
                 const pkt_version: u32 = if (buf.len >= 5)
                     (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) |
-                    (@as(u32, buf[3]) << 8) | buf[4]
-                else QUIC_VERSION_1;
+                        (@as(u32, buf[3]) << 8) | buf[4]
+                else
+                    QUIC_VERSION_1;
                 if (pkt_version == QUIC_VERSION_2) {
                     if (initial_mod.unprotectInitialPacket(
                         &plaintext,

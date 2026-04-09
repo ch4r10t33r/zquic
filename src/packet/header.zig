@@ -40,10 +40,10 @@ pub const HeaderForm = enum { long, short };
 /// QUIC v2 uses a different bit mapping (RFC 9369 §3.1); use
 /// `longTypeBits` / `longTypeFromBits` for version-aware conversions.
 pub const LongType = enum(u2) {
-    initial = 0,   // v1: 0b00  v2: 0b01
-    zero_rtt = 1,  // v1: 0b01  v2: 0b10
+    initial = 0, // v1: 0b00  v2: 0b01
+    zero_rtt = 1, // v1: 0b01  v2: 0b10
     handshake = 2, // v1: 0b10  v2: 0b11
-    retry = 3,     // v1: 0b11  v2: 0b00
+    retry = 3, // v1: 0b11  v2: 0b00
 };
 
 /// Return the 2-bit wire encoding for `pkt_type` given `version`.

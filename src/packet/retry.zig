@@ -91,9 +91,9 @@ pub fn verifyIntegrityTag(
     // Extract version from the packet (bytes 1–4 of the long header).
     const version: u32 = if (retry_packet_with_tag.len >= 5)
         (@as(u32, retry_packet_with_tag[1]) << 24) |
-        (@as(u32, retry_packet_with_tag[2]) << 16) |
-        (@as(u32, retry_packet_with_tag[3]) << 8) |
-        retry_packet_with_tag[4]
+            (@as(u32, retry_packet_with_tag[2]) << 16) |
+            (@as(u32, retry_packet_with_tag[3]) << 8) |
+            retry_packet_with_tag[4]
     else
         0x00000001;
 
