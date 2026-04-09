@@ -799,6 +799,8 @@ pub const Server = struct {
     /// can send 6+ MB/s into a 10 Mbps (1.25 MB/s) simulated link, causing
     /// the network simulator to drop 80%+ of packets and stalling transfers.
     http09_last_flush_ms: i64 = 0,
+    /// Pacing timestamp for http09RetransmitPendingFins: at most one burst per 50ms.
+    http09_retransmit_last_ms: i64 = 0,
     /// Same pacing timestamp for HTTP/3 DATA frame sends.
     http3_last_flush_ms: i64 = 0,
 
@@ -2033,9 +2035,17 @@ pub const Server = struct {
     ///   • MAX_FIN_RETRANSMITS re-sends have been attempted.
     fn http09RetransmitPendingFins(self: *Server) void {
         const now = std.time.milliTimestamp();
+        // Rate-limit: at most one retransmit pass every 50ms.
+        if (now - self.http09_retransmit_last_ms < 50) return;
+        self.http09_retransmit_last_ms = now;
+
+        // Budget: send at most 8 retransmit packets per pass to avoid bursting
+        // more than the NS3 25-packet DropTail queue can absorb simultaneously.
+        var budget: usize = 8;
         for (&self.conns) |*cslot| {
             if (cslot.*) |*conn| {
                 for (&conn.http09_slots) |*slot| {
+                    if (budget == 0) return;
                     if (!slot.awaiting_fin_ack) continue;
                     if (now - slot.fin_last_sent_ms < 200) continue;
 
@@ -2047,6 +2057,7 @@ pub const Server = struct {
 
                     slot.fin_retransmit_count += 1;
                     slot.fin_last_sent_ms = now;
+                    budget -= 1;
                     std.debug.print("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, Http09OutSlot.MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
                 }
@@ -2484,8 +2495,6 @@ pub const Client = struct {
     early_km: ?KeyMaterial = null,
     /// Packet number space for 0-RTT packets (separate from 1-RTT PN space).
     zerortt_pn: u64 = 0,
-    /// True once a single 0-RTT probe packet has been sent for this connection.
-    zero_rtt_probe_sent: bool = false,
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -2643,7 +2652,6 @@ pub const Client = struct {
         // Clear 0-RTT state so the new connection starts fresh.
         self.early_km = null;
         self.zerortt_pn = 0;
-        self.zero_rtt_probe_sent = false;
     }
 
     /// Inner event loop: send ClientHello, wait for handshake, download URLs.
@@ -2918,78 +2926,99 @@ pub const Client = struct {
 
         _ = try std.posix.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
 
-        // If early keys were derived, send a single 0-RTT probe packet.
-        // This must happen only on the first send (early_km is cleared on reconnect).
-        // We send exactly ONE 0-RTT packet so the pcap shows early data, but we
-        // do NOT register any streams here: downloadUrls() handles all stream
-        // management reliably after the handshake completes.  Sending all 39
-        // requests as 0-RTT would burst 40 packets simultaneously into the NS3
-        // 25-packet queue, dropping ~15 and causing 0-RTT to fail.
-        if (self.early_km != null and !self.zero_rtt_probe_sent) {
-            self.zero_rtt_probe_sent = true;
-            self.sendZeroRttProbe(server) catch |err| {
-                std.debug.print("io: 0-RTT probe send failed: {}\n", .{err});
+        // If early keys were derived, immediately send ALL requests as 0-RTT
+        // STREAM frames.  The interop pcap check requires ALL GET requests to
+        // appear in 0-RTT packets, not in 1-RTT packets.  Setting requested=true
+        // here prevents downloadUrls() from re-sending the same requests as 1-RTT
+        // after the handshake completes.
+        //
+        // Reliability: two mechanisms prevent the 6/39 response-loss seen in
+        // earlier runs:
+        //   1. Client ACK frames (sent in process1RttPacket) let the server clear
+        //      awaiting_fin_ack slots, reducing retransmit counts to only the
+        //      truly-lost packets.
+        //   2. http09RetransmitPendingFins is budget-capped (8 pkt/pass) so FIN
+        //      retransmit bursts stay well below the NS3 25-pkt queue limit.
+        if (self.early_km != null and !self.requested) {
+            self.requested = true;
+            self.send0RttRequests(server) catch |err| {
+                std.debug.print("io: 0-RTT send failed: {}\n", .{err});
             };
         }
     }
 
-    /// Send a single 0-RTT probe packet carrying the first URL as a GET request.
-    ///
-    /// We intentionally send only ONE 0-RTT packet (not all active_urls) to avoid
-    /// flooding the NS3 25-packet queue.  Sending 40 packets simultaneously (1 Initial
-    /// + 39 0-RTT) exceeds the queue capacity, dropping ~15 packets and causing half
-    /// the 0-RTT requests to never reach the server.
-    ///
-    /// The probe packet serves two purposes:
-    ///   1. It places a 0-RTT packet in the pcap (satisfying the interop tshark check).
-    ///   2. It lets the server pre-load URL[0]'s file before the handshake completes.
-    ///
-    /// All streams are registered and awaited by downloadUrls() after the handshake,
-    /// which sends 1-RTT requests for ALL URLs and reliably handles retransmits.
-    fn sendZeroRttProbe(self: *Client, server: std.net.Address) !void {
+    /// Send HTTP/0.9 GET requests for all active_urls as 0-RTT STREAM frames.
+    /// Called immediately after the first ClientHello when early keys are available.
+    /// Also registers each stream for download so responses are written to files.
+    fn send0RttRequests(self: *Client, server: std.net.Address) !void {
         const km = self.early_km orelse return;
-        if (self.active_urls.len == 0) return;
+        std.debug.print("io: client sending {} 0-RTT request(s)\n", .{self.active_urls.len});
 
-        // Use the first URL for the probe.
-        const url = self.active_urls[0];
-        const path = blk: {
-            if (std.mem.indexOf(u8, url, "://")) |sep| {
-                const after_scheme = url[sep + 3 ..];
-                if (std.mem.indexOf(u8, after_scheme, "/")) |slash| {
-                    break :blk after_scheme[slash..];
+        std.fs.makeDirAbsolute(self.config.output_dir) catch {};
+
+        for (self.active_urls, 0..) |url, i| {
+            // Extract path from URL.
+            const path = blk: {
+                if (std.mem.indexOf(u8, url, "://")) |sep| {
+                    const after_scheme = url[sep + 3 ..];
+                    if (std.mem.indexOf(u8, after_scheme, "/")) |slash| {
+                        break :blk after_scheme[slash..];
+                    }
+                }
+                break :blk url;
+            };
+
+            const stream_id: u64 = @as(u64, i) * 4;
+
+            // Open output file.
+            var dl_path_buf: [512]u8 = undefined;
+            const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
+            const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
+                std.debug.print("io: 0-RTT cannot create {s}\n", .{dl_path});
+                continue;
+            };
+
+            // Register stream for download.
+            var registered = false;
+            for (&self.streams) |*s| {
+                if (!s.active) {
+                    s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
+                    registered = true;
+                    break;
                 }
             }
-            break :blk url;
-        };
+            if (!registered) {
+                out_file.close();
+                continue;
+            }
 
-        const stream_id: u64 = 0; // first client-initiated bidirectional stream
+            // Build HTTP/0.9 GET request STREAM frame.
+            var req_buf: [4096]u8 = undefined;
+            const req = http09_client.buildRequest(path, &req_buf) catch continue;
+            const sf = stream_frame_mod.StreamFrame{
+                .stream_id = stream_id,
+                .offset = 0,
+                .data = req,
+                .fin = true,
+                .has_length = true,
+            };
+            var frame_buf: [4200]u8 = undefined;
+            const frame_len = sf.serialize(&frame_buf) catch continue;
 
-        // Build HTTP/0.9 GET request STREAM frame.
-        var req_buf: [4096]u8 = undefined;
-        const req = http09_client.buildRequest(path, &req_buf) catch return;
-        const sf = stream_frame_mod.StreamFrame{
-            .stream_id = stream_id,
-            .offset = 0,
-            .data = req,
-            .fin = true,
-            .has_length = true,
-        };
-        var frame_buf: [4200]u8 = undefined;
-        const frame_len = sf.serialize(&frame_buf) catch return;
-
-        // Build and send 0-RTT packet.
-        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
-        const pkt_len = build0RttPacket(
-            &send_buf,
-            self.conn.remote_cid,
-            self.conn.local_cid,
-            frame_buf[0..frame_len],
-            self.zerortt_pn,
-            &km,
-        ) catch return;
-        self.zerortt_pn += 1;
-        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
-        std.debug.print("io: 0-RTT probe GET {s} stream_id={}\n", .{ path, stream_id });
+            // Build and send 0-RTT packet.
+            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const pkt_len = build0RttPacket(
+                &send_buf,
+                self.conn.remote_cid,
+                self.conn.local_cid,
+                frame_buf[0..frame_len],
+                self.zerortt_pn,
+                &km,
+            ) catch continue;
+            self.zerortt_pn += 1;
+            _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+            std.debug.print("io: 0-RTT GET {s} stream_id={}\n", .{ path, stream_id });
+        }
     }
 
     fn processPacket(self: *Client, buf: []const u8) void {
@@ -3346,6 +3375,33 @@ pub const Client = struct {
             }
             // Unknown frame type — cannot safely skip without knowing the length.
             return;
+        }
+
+        // Send an ACK frame for the received packet so the server can clear
+        // awaiting_fin_ack slots.  Without client ACKs, the server retransmits
+        // ALL pending FIN frames every 200ms — a burst that can overflow the
+        // NS3 25-packet queue and permanently lose 0-RTT responses.
+        {
+            var ack_buf: [16]u8 = undefined;
+            const ack_len = buildAckFrame(&ack_buf, decompressed_pn) catch return;
+            var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+            const pkt_len = build1RttPacketFull(
+                &send_buf,
+                self.conn.remote_cid,
+                ack_buf[0..ack_len],
+                self.conn.app_pn,
+                &self.conn.app_client_km,
+                self.conn.key_phase_bit,
+                self.conn.use_chacha20,
+            ) catch return;
+            self.conn.app_pn += 1;
+            _ = std.posix.sendto(
+                self.sock,
+                send_buf[0..pkt_len],
+                0,
+                &self.conn.peer.any,
+                self.conn.peer.getOsSockLen(),
+            ) catch {};
         }
     }
 
