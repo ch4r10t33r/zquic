@@ -3733,9 +3733,12 @@ pub const Client = struct {
             self.h3_client_control_sent = true;
         }
 
-        // Process downloads in batches to stay within stream limits.
-        // MAX_STREAMS determines the batch size (matches initial_max_streams_bidi).
-        const BATCH_SIZE: usize = 100;
+        // Process downloads in batches to stay within NS3 network simulator limits.
+        // The NS3 DropTail queue is 25 packets; sending more than ~20 packets at
+        // once causes queue overflow and packet drops.  Using BATCH_SIZE=20 keeps
+        // each GET request burst at or below the queue limit, matching the server's
+        // own 20-packet-per-flush budget (see flushPendingHttp09Responses).
+        const BATCH_SIZE: usize = 20;
         var batch_start: usize = 0;
         while (batch_start < self.active_urls.len) {
             const batch_end = @min(batch_start + BATCH_SIZE, self.active_urls.len);
