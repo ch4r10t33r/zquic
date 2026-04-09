@@ -112,6 +112,9 @@ case "${TESTCASE}" in
     v2)
         EXTRA_FLAGS=(--v2)
         ;;
+    ecn)
+        EXTRA_FLAGS=(--http09)
+        ;;
     *)
         echo "Unknown TESTCASE: ${TESTCASE}" >&2
         exit 127
