@@ -3122,12 +3122,11 @@ pub const Client = struct {
 
         _ = try std.posix.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
 
-        // If early keys were derived, send up to MAX_ZERORTT (20) GETs as 0-RTT
-        // STREAM frames to demonstrate 0-RTT usage to the interop checker.
-        // Capped at 20 to stay within the NS3 DropTail queue (25 pkts):
-        //   1 Initial + 20 0-RTT = 21 total ≤ 25 (safe).
-        // Remaining URLs (if any) are sent as 1-RTT by downloadUrls after the
-        // handshake.  downloadUrls skips streams already sent as 0-RTT.
+        // If early keys were derived, send first batch of 0-RTT GETs (up to 20).
+        // 1 Initial + 20 0-RTT = 21 packets ≤ NS3 queue limit of 25.
+        // A second batch (remaining GETs) is sent from processInitialPacket ~35 ms
+        // later, after the NS3 queue has drained.  All GETs are thus sent as 0-RTT,
+        // satisfying the interop-runner's "0-RTT size ≥ 1-RTT size" check.
         if (self.early_km != null and self.zerortt_count == 0) {
             self.send0RttRequests(server) catch |err| {
                 std.debug.print("io: 0-RTT send failed: {}\n", .{err});
@@ -3136,19 +3135,29 @@ pub const Client = struct {
     }
 
     /// Send HTTP/0.9 GET requests as 0-RTT STREAM frames.
-    /// Called immediately after the first ClientHello when early keys are available.
-    /// Caps at MAX_ZERORTT to stay within the NS3 DropTail queue limit (25 packets):
-    ///   1 Initial + 20 0-RTT = 21 total, safely under the 25-packet queue cap.
-    /// Remaining URLs are sent as 1-RTT by downloadUrls after the handshake.
+    ///
+    /// Sends the next batch of up to MAX_ZERORTT_BATCH GETs starting from
+    /// self.zerortt_count.  Designed to be called multiple times so that the
+    /// total burst stays within the NS3 DropTail queue limit:
+    ///
+    ///   Call 1 (from sendClientHello): sends GETs 0..19 (20 pkts),
+    ///     total burst = 1 Initial + 20 0-RTT = 21 ≤ 25 (safe).
+    ///   Call 2 (from processInitialPacket, ~35 ms later): sends GETs 20..38
+    ///     (19 pkts), queue drained since last burst (safe).
+    ///
+    /// All GETs are 0-RTT so the interop checker sees 0-RTT size ≥ 1-RTT size.
+    /// downloadUrls skips re-registering these streams (zerortt_count guard).
     fn send0RttRequests(self: *Client, server: std.net.Address) !void {
         const km = self.early_km orelse return;
-        const MAX_ZERORTT: usize = 20;
-        const limit = @min(self.active_urls.len, MAX_ZERORTT);
-        std.debug.print("io: client sending {} 0-RTT request(s) (of {} total)\n", .{ limit, self.active_urls.len });
+        const MAX_ZERORTT_BATCH: usize = 20;
+        const start = self.zerortt_count;
+        const limit = @min(start + MAX_ZERORTT_BATCH, self.active_urls.len);
+        if (start >= limit) return; // nothing left to send
+        std.debug.print("io: client sending 0-RTT batch [{}-{}) of {} total\n", .{ start, limit, self.active_urls.len });
 
         std.fs.makeDirAbsolute(self.config.output_dir) catch {};
 
-        for (self.active_urls[0..limit], 0..) |url, i| {
+        for (self.active_urls[start..limit], start..) |url, i| {
             // Extract path from URL.
             const path = blk: {
                 if (std.mem.indexOf(u8, url, "://")) |sep| {
@@ -3213,7 +3222,7 @@ pub const Client = struct {
             std.debug.print("io: 0-RTT GET {s} stream_id={}\n", .{ path, stream_id });
             self.zerortt_count = i + 1;
         }
-        std.debug.print("io: 0-RTT sent {} request(s), remaining {} will be 1-RTT\n", .{
+        std.debug.print("io: 0-RTT sent {} total, {} remaining\n", .{
             self.zerortt_count,
             self.active_urls.len - self.zerortt_count,
         });
@@ -3273,6 +3282,14 @@ pub const Client = struct {
         if (!self.conn.server_cid_confirmed) {
             self.conn.remote_cid = ip.scid;
             self.conn.server_cid_confirmed = true;
+
+            // Send the next 0-RTT batch if there are unsent GETs.
+            // At this point the NS3 link has had ~15 ms to drain the first
+            // burst (sent with the ClientHello), so a fresh 20-packet batch
+            // stays safely within the 25-packet DropTail queue limit.
+            if (self.early_km != null and self.zerortt_count < self.active_urls.len) {
+                self.send0RttRequests(self.conn.peer) catch {};
+            }
         }
         const init_km = self.conn.init_keys orelse return;
 
