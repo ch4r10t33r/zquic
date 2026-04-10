@@ -4152,7 +4152,32 @@ pub const Client = struct {
                 var fds = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
                 const poll_timeout: i32 = @intCast(@min(200, @max(0, remaining)));
                 const ready = std.posix.poll(&fds, poll_timeout) catch 0;
-                if (ready == 0) continue;
+                if (ready == 0) {
+                    // Poll timed out — no incoming data.  Send a PING so the
+                    // server can see our current source port.  This is critical
+                    // for the rebind-port test: after a NAT rebind the server's
+                    // FIN retransmits go to the old (dead) port.  Without this
+                    // PING the server never learns the new port and exhausts all
+                    // retransmits, stalling the download.
+                    if (self.conn.has_app_keys) {
+                        const ping_frame = [_]u8{0x01};
+                        var ping_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                        if (build1RttPacketFull(
+                            &ping_buf,
+                            self.conn.remote_cid,
+                            &ping_frame,
+                            self.conn.app_pn,
+                            &self.conn.app_client_km,
+                            self.conn.key_phase_bit,
+                            self.conn.use_chacha20,
+                        )) |pkt_len| {
+                            self.conn.app_pn += 1;
+                            _ = std.posix.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+                            std.debug.print("io: downloadUrls sent keepalive PING (streams_done={}/{})\n", .{ self.streams_done, self.active_urls.len });
+                        } else |_| {}
+                    }
+                    continue;
+                }
                 if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
                 std.debug.print("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
