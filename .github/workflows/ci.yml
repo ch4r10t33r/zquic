@@ -192,6 +192,9 @@ jobs:
       # http3 must run BEFORE zerortt/connectionmigration: zerortt now actually
       # connects to the server (resolveAddress IPv4 fix) and times out at 60 s,
       # which would contaminate NS3 ARP state and cause http3 to fail.
+      # rebind-port uses the "rebind" NS3 scenario which periodically changes the
+      # client's source port (simulating NAT rebinding).  The server detects the
+      # new src addr and sends PATH_CHALLENGE; the client responds PATH_RESPONSE.
       - name: Run interop test suite
         run: |
           mkdir -p interop-results
@@ -199,7 +202,7 @@ jobs:
           python3 run.py \
             --client zquic \
             --server zquic \
-            --test handshake,transfer,retry,chacha20,keyupdate,resumption,http3,zerortt,connectionmigration,multiplexing \
+            --test handshake,transfer,retry,chacha20,keyupdate,v2,ecn,resumption,http3,zerortt,connectionmigration,multiplexing,rebind-port \
             --log-dir ../interop-results/logs \
             --json ../interop-results/results.json \
             --debug

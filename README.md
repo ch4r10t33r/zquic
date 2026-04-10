@@ -199,6 +199,8 @@ full test suite. The Docker image is built on every merge to `master`.
 | `connectionmigration` | ✅ passing |
 | `multiplexing` | ✅ passing |
 | `v2` | ✅ passing |
+| `ecn` | ✅ passing |
+| `rebind-port` | ✅ passing |
 
 ## Known Gaps
 
