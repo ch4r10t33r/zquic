@@ -1975,6 +1975,25 @@ pub const Server = struct {
             // Eagerly update peer so all subsequent sends reach the new address.
             conn.peer = src;
             self.sendPathChallenge(conn, challenge, src);
+
+            // Rewind active HTTP/0.9 streams to retransmit data that may have
+            // been sent to the old (dead) port before we learned of the rebind.
+            // At 480 KB/s with a 30 ms RTT, up to ~14 KB (12 chunks) can be
+            // in-flight when the path changes.  We rewind by REWIND_BYTES
+            // (conservative 64 × 1200 = 76 800 bytes ≈ 160 ms) to guarantee
+            // coverage even if a flush fires after the rebind event.
+            // The client writes at explicit sf.offset so duplicate retransmits
+            // are idempotent (seekTo + writeAll overwrites the same bytes).
+            const REWIND_BYTES: u64 = 64 * 1200;
+            for (&conn.http09_slots) |*slot| {
+                if (!slot.active) continue;
+                const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
+                if (rewind_to < slot.stream_offset) {
+                    slot.file.seekTo(rewind_to) catch {};
+                    slot.stream_offset = rewind_to;
+                    std.debug.print("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
+                }
+            }
         }
 
         var pos: usize = 0;
@@ -3818,7 +3837,11 @@ pub const Client = struct {
                     self.handleH3StreamData(s, sf);
                 } else {
                     std.debug.print("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
-                    _ = s.file.write(sf.data) catch {};
+                    // Write at the exact stream offset so retransmitted or
+                    // out-of-order STREAM frames (possible after a NAT rebind
+                    // triggers server-side retransmit) land at the right place.
+                    s.file.seekTo(sf.offset) catch {};
+                    s.file.writeAll(sf.data) catch {};
                     if (sf.fin) {
                         s.file.close();
                         s.active = false;
