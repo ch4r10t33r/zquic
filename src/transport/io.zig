@@ -1955,19 +1955,24 @@ pub const Server = struct {
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
         std.debug.print("io: processAppFrames called: {} bytes\n", .{frames.len});
         // Detect address change (connection migration / port rebinding, RFC 9000 §9).
-        // If the source address/port differs from the stored peer address, send a
-        // PATH_CHALLENGE to validate the new path.  This is unconditional — both
-        // active migration (connectionmigration test) and passive NAT rebinding
-        // (rebind-port / rebind-addr tests, where NS3 changes the src port without
-        // the client's knowledge) require the same server-side behaviour.
-        if (conn.path_challenge_data == null and !addressEqual(conn.peer, src)) {
+        // When NS3 rebinds the client's source port (rebind-port test, every 5 s),
+        // the server sees packets from a new src port.  We must:
+        //   1. Eagerly update conn.peer so HTTP responses go to the new path immediately.
+        //   2. Send PATH_CHALLENGE so the interop runner can verify we validated the path.
+        //
+        // We intentionally do NOT guard on path_challenge_data == null.  If a previous
+        // challenge is still in flight (PATH_RESPONSE not yet received) when the next
+        // rebind fires, we overwrite it with a fresh challenge for the new address.
+        // This keeps data flowing: guarding on path_challenge_data == null would leave
+        // conn.peer pointing at the OLD (now-dead) port for the duration of the second
+        // rebind, causing a download stall and eventual 60 s timeout.
+        if (!addressEqual(conn.peer, src)) {
             var challenge: [8]u8 = undefined;
             var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
             prng.random().bytes(&challenge);
+            // Overwrite any pending challenge — a fresh one is needed for the new path.
             conn.path_challenge_data = challenge;
-            // Eagerly update peer address so HTTP responses immediately go to
-            // the new path (optimistic migration).  PATH_CHALLENGE/RESPONSE
-            // still happens for the interop runner's validation check.
+            // Eagerly update peer so all subsequent sends reach the new address.
             conn.peer = src;
             self.sendPathChallenge(conn, challenge, src);
         }
