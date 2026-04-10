@@ -4160,7 +4160,12 @@ pub const Client = struct {
                     // PING the server never learns the new port and exhausts all
                     // retransmits, stalling the download.
                     if (self.conn.has_app_keys) {
-                        const ping_frame = [_]u8{0x01};
+                        // PING (0x01) + PADDING (0x00 × 7) — minimum 4 bytes of
+                        // plaintext required so the HP sample can be drawn starting
+                        // at pn_start+4 (RFC 9001 §5.4.2).  A bare 1-byte PING
+                        // frame would cause protectInitialPacket to return
+                        // error.BufferTooSmall and the packet would never be sent.
+                        const ping_frame = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
                         var ping_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
                         if (build1RttPacketFull(
                             &ping_buf,
@@ -4174,7 +4179,9 @@ pub const Client = struct {
                             self.conn.app_pn += 1;
                             _ = std.posix.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
                             std.debug.print("io: downloadUrls sent keepalive PING (streams_done={}/{})\n", .{ self.streams_done, self.active_urls.len });
-                        } else |_| {}
+                        } else |err| {
+                            std.debug.print("io: downloadUrls PING build failed: {}\n", .{err});
+                        }
                     }
                     continue;
                 }
