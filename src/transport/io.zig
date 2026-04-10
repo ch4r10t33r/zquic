@@ -1978,13 +1978,13 @@ pub const Server = struct {
 
             // Rewind active HTTP/0.9 streams to retransmit data that may have
             // been sent to the old (dead) port before we learned of the rebind.
-            // At 480 KB/s with a 30 ms RTT, up to ~14 KB (12 chunks) can be
-            // in-flight when the path changes.  We rewind by REWIND_BYTES
-            // (conservative 64 × 1200 = 76 800 bytes ≈ 160 ms) to guarantee
-            // coverage even if a flush fires after the rebind event.
+            // Dead-port window: PING interval (200ms) + network RTT/2 (15ms) +
+            // server poll latency (50ms) ≈ 265ms.  At 480 KB/s that is
+            // ~127 200 bytes sent to the dead port.  We use 200 × 1200 = 240 000
+            // bytes (≈500ms buffer) so the rewind always starts before the gap.
             // The client writes at explicit sf.offset so duplicate retransmits
             // are idempotent (seekTo + writeAll overwrites the same bytes).
-            const REWIND_BYTES: u64 = 64 * 1200;
+            const REWIND_BYTES: u64 = 200 * 1200;
             for (&conn.http09_slots) |*slot| {
                 if (!slot.active) continue;
                 const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
