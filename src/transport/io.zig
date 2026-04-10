@@ -2660,6 +2660,9 @@ pub const Client = struct {
     streams: [MAX_STREAMS]StreamDownload = [_]StreamDownload{.{ .stream_id = 0, .file = undefined, .active = false }} ** MAX_STREAMS,
     streams_done: usize = 0,
     requested: bool = false,
+    /// Number of 0-RTT GETs already sent (and registered in self.streams).
+    /// downloadUrls skips these stream indices to avoid re-registering them.
+    zerortt_count: usize = 0,
     ticket_store: session_mod.TicketStore = .{},
     /// HTTP/3: whether we have sent the client control stream (stream_id=2).
     h3_client_control_sent: bool = false,
@@ -2834,6 +2837,7 @@ pub const Client = struct {
         }
         self.streams_done = 0;
         self.requested = false;
+        self.zerortt_count = 0;
 
         // Clear packet buffers (ticket_store is preserved intentionally).
         self.initial_pkt = [_]u8{0} ** MAX_DATAGRAM_SIZE;
@@ -3118,37 +3122,33 @@ pub const Client = struct {
 
         _ = try std.posix.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
 
-        // If early keys were derived, immediately send ALL requests as 0-RTT
-        // STREAM frames.  The interop pcap check requires ALL GET requests to
-        // appear in 0-RTT packets, not in 1-RTT packets.  Setting requested=true
-        // here prevents downloadUrls() from re-sending the same requests as 1-RTT
-        // after the handshake completes.
-        //
-        // Reliability: two mechanisms prevent the 6/39 response-loss seen in
-        // earlier runs:
-        //   1. Client ACK frames (sent in process1RttPacket) let the server clear
-        //      awaiting_fin_ack slots, reducing retransmit counts to only the
-        //      truly-lost packets.
-        //   2. http09RetransmitPendingFins is budget-capped (8 pkt/pass) so FIN
-        //      retransmit bursts stay well below the NS3 25-pkt queue limit.
-        if (self.early_km != null and !self.requested) {
-            self.requested = true;
+        // If early keys were derived, send up to MAX_ZERORTT (20) GETs as 0-RTT
+        // STREAM frames to demonstrate 0-RTT usage to the interop checker.
+        // Capped at 20 to stay within the NS3 DropTail queue (25 pkts):
+        //   1 Initial + 20 0-RTT = 21 total ≤ 25 (safe).
+        // Remaining URLs (if any) are sent as 1-RTT by downloadUrls after the
+        // handshake.  downloadUrls skips streams already sent as 0-RTT.
+        if (self.early_km != null and self.zerortt_count == 0) {
             self.send0RttRequests(server) catch |err| {
                 std.debug.print("io: 0-RTT send failed: {}\n", .{err});
             };
         }
     }
 
-    /// Send HTTP/0.9 GET requests for all active_urls as 0-RTT STREAM frames.
+    /// Send HTTP/0.9 GET requests as 0-RTT STREAM frames.
     /// Called immediately after the first ClientHello when early keys are available.
-    /// Also registers each stream for download so responses are written to files.
+    /// Caps at MAX_ZERORTT to stay within the NS3 DropTail queue limit (25 packets):
+    ///   1 Initial + 20 0-RTT = 21 total, safely under the 25-packet queue cap.
+    /// Remaining URLs are sent as 1-RTT by downloadUrls after the handshake.
     fn send0RttRequests(self: *Client, server: std.net.Address) !void {
         const km = self.early_km orelse return;
-        std.debug.print("io: client sending {} 0-RTT request(s)\n", .{self.active_urls.len});
+        const MAX_ZERORTT: usize = 20;
+        const limit = @min(self.active_urls.len, MAX_ZERORTT);
+        std.debug.print("io: client sending {} 0-RTT request(s) (of {} total)\n", .{ limit, self.active_urls.len });
 
         std.fs.makeDirAbsolute(self.config.output_dir) catch {};
 
-        for (self.active_urls, 0..) |url, i| {
+        for (self.active_urls[0..limit], 0..) |url, i| {
             // Extract path from URL.
             const path = blk: {
                 if (std.mem.indexOf(u8, url, "://")) |sep| {
@@ -3211,7 +3211,12 @@ pub const Client = struct {
             self.zerortt_pn += 1;
             _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
             std.debug.print("io: 0-RTT GET {s} stream_id={}\n", .{ path, stream_id });
+            self.zerortt_count = i + 1;
         }
+        std.debug.print("io: 0-RTT sent {} request(s), remaining {} will be 1-RTT\n", .{
+            self.zerortt_count,
+            self.active_urls.len - self.zerortt_count,
+        });
     }
 
     fn processPacket(self: *Client, buf: []const u8) void {
@@ -3972,6 +3977,9 @@ pub const Client = struct {
             // Send requests for this batch. Use global index for stream_id so each
             // stream has a unique, non-overlapping ID across batches.
             for (batch, batch_start..) |url, global_i| {
+                // Allocate stream ID: client-initiated bidirectional = 4*global_i
+                const stream_id: u64 = @as(u64, global_i) * 4;
+
                 // Extract path from url (strip scheme+host if present, keep path)
                 const path = blk: {
                     if (std.mem.indexOf(u8, url, "://")) |sep| {
@@ -3983,8 +3991,15 @@ pub const Client = struct {
                     break :blk url;
                 };
 
-                // Allocate stream ID: client-initiated bidirectional = 4*global_i
-                const stream_id: u64 = @as(u64, global_i) * 4;
+                // Skip streams already sent as 0-RTT (registered by send0RttRequests).
+                // Those streams are already tracked in self.streams; re-registering them
+                // would create duplicate slots.  The responses will arrive independently
+                // (either during the handshake phase or via server FIN retransmits).
+                if (global_i < self.zerortt_count) {
+                    std.debug.print("io: stream {} ({s}) already sent as 0-RTT, skipping\n", .{ stream_id, path });
+                    continue;
+                }
+
                 std.debug.print("io: downloadUrl[{}] path={s} stream_id={}\n", .{ global_i, path, stream_id });
 
                 // Open output file
