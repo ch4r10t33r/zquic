@@ -2380,7 +2380,7 @@ pub const Server = struct {
             switch (pr.frame) {
                 .headers => |hf| {
                     var decoded = h3_qpack.DecodedHeaders{ .headers = undefined, .count = 0 };
-                    h3_qpack.decodeHeaders(hf.data[0..hf.len], &decoded) catch {};
+                    h3_qpack.decodeHeaders(hf.data[0..hf.len], null, &decoded) catch {};
                     for (decoded.headers[0..decoded.count]) |fld| {
                         if (std.mem.eql(u8, fld.name, ":method")) {
                             const ml = @min(fld.value.len, method_buf.len);
@@ -2423,7 +2423,7 @@ pub const Server = struct {
         const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
             .{ .name = ":status", .value = "200" },
             .{ .name = "content-length", .value = size_str },
-        }, &header_block) catch {
+        }, &header_block, .{}) catch {
             file.close();
             return;
         };
@@ -2484,7 +2484,7 @@ pub const Server = struct {
         var header_block: [256]u8 = undefined;
         const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
             .{ .name = ":status", .value = status_str },
-        }, &header_block) catch return;
+        }, &header_block, .{}) catch return;
         var out: [300]u8 = undefined;
         const out_len = h3_frame.writeFrame(&out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch return;
         self.sendStreamData(conn, stream_id, out[0..out_len], true, src);
@@ -4084,7 +4084,7 @@ pub const Client = struct {
                         .{ .name = ":path", .value = path },
                         .{ .name = ":scheme", .value = "https" },
                         .{ .name = ":authority", .value = self.config.host },
-                    }, &header_block) catch continue;
+                    }, &header_block, .{}) catch continue;
                     var h3_out: [600]u8 = undefined;
                     const h3_len = h3_frame.writeFrame(&h3_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch continue;
                     const sf = stream_frame_mod.StreamFrame{
