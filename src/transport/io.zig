@@ -1954,20 +1954,45 @@ pub const Server = struct {
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
         std.debug.print("io: processAppFrames called: {} bytes\n", .{frames.len});
-        // Detect address change (connection migration, RFC 9000 §9).
-        // If the source address differs from the stored peer address and
-        // migration is enabled, send PATH_CHALLENGE to validate the new path.
-        if (self.config.migrate and conn.path_challenge_data == null) {
-            if (!addressEqual(conn.peer, src)) {
-                var challenge: [8]u8 = undefined;
-                var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-                prng.random().bytes(&challenge);
-                conn.path_challenge_data = challenge;
-                // Eagerly update peer address so HTTP responses immediately go to
-                // the new path (optimistic migration).  PATH_CHALLENGE/RESPONSE
-                // still happens for the interop runner's validation check.
-                conn.peer = src;
-                self.sendPathChallenge(conn, challenge, src);
+        // Detect address change (connection migration / port rebinding, RFC 9000 §9).
+        // When NS3 rebinds the client's source port (rebind-port test, every 5 s),
+        // the server sees packets from a new src port.  We must:
+        //   1. Eagerly update conn.peer so HTTP responses go to the new path immediately.
+        //   2. Send PATH_CHALLENGE so the interop runner can verify we validated the path.
+        //
+        // We intentionally do NOT guard on path_challenge_data == null.  If a previous
+        // challenge is still in flight (PATH_RESPONSE not yet received) when the next
+        // rebind fires, we overwrite it with a fresh challenge for the new address.
+        // This keeps data flowing: guarding on path_challenge_data == null would leave
+        // conn.peer pointing at the OLD (now-dead) port for the duration of the second
+        // rebind, causing a download stall and eventual 60 s timeout.
+        if (!addressEqual(conn.peer, src)) {
+            var challenge: [8]u8 = undefined;
+            var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+            prng.random().bytes(&challenge);
+            // Overwrite any pending challenge — a fresh one is needed for the new path.
+            conn.path_challenge_data = challenge;
+            // Eagerly update peer so all subsequent sends reach the new address.
+            conn.peer = src;
+            self.sendPathChallenge(conn, challenge, src);
+
+            // Rewind active HTTP/0.9 streams to retransmit data that may have
+            // been sent to the old (dead) port before we learned of the rebind.
+            // Dead-port window: PING interval (200ms) + network RTT/2 (15ms) +
+            // server poll latency (50ms) ≈ 265ms.  At 480 KB/s that is
+            // ~127 200 bytes sent to the dead port.  We use 200 × 1200 = 240 000
+            // bytes (≈500ms buffer) so the rewind always starts before the gap.
+            // The client writes at explicit sf.offset so duplicate retransmits
+            // are idempotent (seekTo + writeAll overwrites the same bytes).
+            const REWIND_BYTES: u64 = 200 * 1200;
+            for (&conn.http09_slots) |*slot| {
+                if (!slot.active) continue;
+                const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
+                if (rewind_to < slot.stream_offset) {
+                    slot.file.seekTo(rewind_to) catch {};
+                    slot.stream_offset = rewind_to;
+                    std.debug.print("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
+                }
             }
         }
 
@@ -3812,7 +3837,11 @@ pub const Client = struct {
                     self.handleH3StreamData(s, sf);
                 } else {
                     std.debug.print("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
-                    _ = s.file.write(sf.data) catch {};
+                    // Write at the exact stream offset so retransmitted or
+                    // out-of-order STREAM frames (possible after a NAT rebind
+                    // triggers server-side retransmit) land at the right place.
+                    s.file.seekTo(sf.offset) catch {};
+                    s.file.writeAll(sf.data) catch {};
                     if (sf.fin) {
                         s.file.close();
                         s.active = false;
@@ -4123,7 +4152,39 @@ pub const Client = struct {
                 var fds = [1]std.posix.pollfd{.{ .fd = self.sock, .events = std.posix.POLL.IN, .revents = 0 }};
                 const poll_timeout: i32 = @intCast(@min(200, @max(0, remaining)));
                 const ready = std.posix.poll(&fds, poll_timeout) catch 0;
-                if (ready == 0) continue;
+                if (ready == 0) {
+                    // Poll timed out — no incoming data.  Send a PING so the
+                    // server can see our current source port.  This is critical
+                    // for the rebind-port test: after a NAT rebind the server's
+                    // FIN retransmits go to the old (dead) port.  Without this
+                    // PING the server never learns the new port and exhausts all
+                    // retransmits, stalling the download.
+                    if (self.conn.has_app_keys) {
+                        // PING (0x01) + PADDING (0x00 × 7) — minimum 4 bytes of
+                        // plaintext required so the HP sample can be drawn starting
+                        // at pn_start+4 (RFC 9001 §5.4.2).  A bare 1-byte PING
+                        // frame would cause protectInitialPacket to return
+                        // error.BufferTooSmall and the packet would never be sent.
+                        const ping_frame = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                        var ping_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+                        if (build1RttPacketFull(
+                            &ping_buf,
+                            self.conn.remote_cid,
+                            &ping_frame,
+                            self.conn.app_pn,
+                            &self.conn.app_client_km,
+                            self.conn.key_phase_bit,
+                            self.conn.use_chacha20,
+                        )) |pkt_len| {
+                            self.conn.app_pn += 1;
+                            _ = std.posix.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+                            std.debug.print("io: downloadUrls sent keepalive PING (streams_done={}/{})\n", .{ self.streams_done, self.active_urls.len });
+                        } else |err| {
+                            std.debug.print("io: downloadUrls PING build failed: {}\n", .{err});
+                        }
+                    }
+                    continue;
+                }
                 if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
                 std.debug.print("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
