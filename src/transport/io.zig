@@ -80,11 +80,13 @@ inline fn quicLongFirstByte(pkt_type: header_mod.LongType, version: u32) u8 {
 /// even though ECN is a best-effort optimisation.  Calling the raw
 /// system.setsockopt lets us silently discard any failure.
 fn setupEcnSocket(sock: std.posix.fd_t) void {
+    // Cast to [*]const u8: Linux's syscall wrapper requires a many-pointer;
+    // macOS accepts a single-pointer, but @ptrCast works on both.
     _ = std.posix.system.setsockopt(
         sock,
         IPPROTO_IP_OPT,
         @as(u32, @intCast(IP_TOS_OPT)),
-        &ECN_ECT0,
+        @as([*]const u8, @ptrCast(&ECN_ECT0)),
         @sizeOf(u8),
     );
 }
