@@ -18,6 +18,15 @@
 //! - `EarlyDataKeys`: 0-RTT key material derived from a PSK.
 //! - `deriveEarlyKeys`: HKDF derivation for 0-RTT from a stored ticket.
 
+// ── 0-RTT Anti-Replay (RFC 9001 §8.1 / RFC 8446 §8) ─────────────────────────
+// zquic accepts 0-RTT early data without a server-side replay cache.
+// This is compliant for read-only workloads (file serving) where replayed
+// requests produce idempotent responses.  Implementations that handle
+// non-idempotent operations MUST implement a per-ticket nonce cache or
+// reject all 0-RTT data.
+//
+// TODO(#75): implement a 64-entry nonce cache keyed by (ticket_age, client_random[0..4]).
+
 const std = @import("std");
 const crypto_keys = @import("keys.zig");
 

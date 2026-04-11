@@ -721,6 +721,8 @@ pub const ConnState = struct {
 
     // Alternative local CID sent to peer via NEW_CONNECTION_ID (for migration).
     alt_local_cid: ?ConnectionId = null,
+    // Sequence number of alt_local_cid (used to validate RETIRE_CONNECTION_ID).
+    alt_local_cid_seq: u64 = 1,
     // Alternative remote CID received from peer via NEW_CONNECTION_ID (use on migration).
     next_remote_cid: ?ConnectionId = null,
 
@@ -827,6 +829,8 @@ pub const ConnState = struct {
     key_phase_bit: bool = false,
     // Whether a key update is currently pending confirmation.
     key_update_pending: bool = false,
+    // Packet number at which the server last initiated a key update (0 = never).
+    server_key_update_pn: u64 = 0,
     // Tracks the key phase bit seen in the last successfully decrypted
     // 1-RTT packet; used to detect peer-initiated key updates.
     peer_key_phase: bool = false,
@@ -851,6 +855,9 @@ pub const ConnState = struct {
     // outgoing packets are suppressed and incoming are silently discarded.
     draining: bool = false,
     conn_close_sent: bool = false,
+    draining_deadline_ms: i64 = 0,
+    // Wall-clock time of the last successfully decrypted packet (ms). Used for idle timeout.
+    last_recv_ms: i64 = 0,
     goaway_sent: bool = false,
 
     // ── Stateless Reset (RFC 9000 §10.3) ─────────────────────────────────────
@@ -1078,6 +1085,29 @@ pub const Server = struct {
         self.allocator.destroy(self);
     }
 
+    /// Free connection slots that have completed their draining period (RFC 9000 §10.2.2).
+    fn reapDrainedConnections(self: *Server) void {
+        const now = std.time.milliTimestamp();
+        const idle_timeout_ms: i64 = 30_000; // RFC 9000 §10.1: 30-second idle timeout
+        for (&self.conns) |*slot| {
+            if (slot.*) |*conn| {
+                // Draining period expired.
+                if (conn.draining and conn.draining_deadline_ms > 0 and now >= conn.draining_deadline_ms) {
+                    std.debug.print("io: reaping drained connection (deadline passed)\n", .{});
+                    slot.* = null;
+                    continue;
+                }
+                // Idle timeout: no packet received for idle_timeout_ms.
+                if (conn.phase == .connected and conn.last_recv_ms > 0 and
+                    now - conn.last_recv_ms > idle_timeout_ms)
+                {
+                    std.debug.print("io: idle timeout — closing connection\n", .{});
+                    slot.* = null;
+                }
+            }
+        }
+    }
+
     /// Run the server event loop (blocking).
     pub fn run(self: *Server) !void {
         var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -1133,6 +1163,7 @@ pub const Server = struct {
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
                 self.http3RetransmitPendingFins();
+                self.reapDrainedConnections();
                 continue;
             }
             idle_secs = 0;
@@ -1196,6 +1227,7 @@ pub const Server = struct {
             self.http09RetransmitPendingFins();
             self.flushPendingHttp3Responses();
             self.http3RetransmitPendingFins();
+            self.reapDrainedConnections();
         }
     }
 
@@ -1855,7 +1887,7 @@ pub const Server = struct {
         // Initiate a key update immediately after the handshake if enabled.
         // This satisfies the quic-interop-runner "keyupdate" test case.
         if (self.config.key_update) {
-            self.initiateKeyUpdate(conn, src);
+            self.initiateServerKeyUpdate(conn, src);
         }
     }
 
@@ -2088,6 +2120,9 @@ pub const Server = struct {
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
         std.debug.print("io: processAppFrames called: {} bytes\n", .{frames.len});
         conn.qlog.packetReceived(.one_rtt, conn.app_recv_pn orelse 0, frames.len);
+        // RFC 9000 §10.2.2: silently discard all frames while draining.
+        if (conn.draining) return;
+        conn.last_recv_ms = std.time.milliTimestamp();
         // Detect address change (connection migration / port rebinding, RFC 9000 §9).
         // When NS3 rebinds the client's source port (rebind-port test, every 5 s),
         // the server sees packets from a new src port.  We must:
@@ -2250,12 +2285,21 @@ pub const Server = struct {
                 self.sendResetStream(conn, r.frame.stream_id, r.frame.application_protocol_error_code, src);
                 continue;
             }
+            if (ft == 0x16 or ft == 0x17) {
+                // STREAMS_BLOCKED — peer hit stream-count limit; grant more (RFC 9000 §4.6).
+                const v = varint.decode(frames[pos..]) catch return;
+                pos += v.len;
+                self.sendMaxStreams(conn, ft == 0x16, src);
+                continue;
+            }
             if (ft == 0x1c or ft == 0x1d) {
                 // CONNECTION_CLOSE — peer is closing the connection.
                 const r = transport_frames.ConnectionClose.parse(frames[pos..], ft == 0x1d) catch return;
                 pos += r.consumed;
                 std.debug.print("io: CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
                 conn.draining = true;
+                const pto2 = conn.rtt.pto_ms(25, 0);
+                conn.draining_deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(3 * pto2));
                 continue;
             }
             if (ft == 0x1a) {
@@ -2276,6 +2320,18 @@ pub const Server = struct {
                         conn.path_challenge_data = null;
                         std.debug.print("io: connection migrated to new address\n", .{});
                     }
+                }
+                continue;
+            }
+            if (ft == 0x19) {
+                // RETIRE_CONNECTION_ID — peer retires one of our CIDs (RFC 9000 §19.16).
+                const seq_r = varint.decode(frames[pos..]) catch return;
+                pos += seq_r.len;
+                std.debug.print("io: RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
+                if (seq_r.value == conn.alt_local_cid_seq) {
+                    conn.alt_local_cid = null;
+                    // Issue a replacement CID.
+                    self.sendNewConnectionId(conn, seq_r.value + 1, src);
                 }
                 continue;
             }
@@ -2320,6 +2376,9 @@ pub const Server = struct {
 
     /// Encrypt and send a 1-RTT packet, selecting AES or ChaCha20 per conn.
     fn send1Rtt(self: *Server, conn: *ConnState, payload: []const u8, dst: std.net.Address) void {
+        // RFC 9000 §10.2.3: do not send any frames while draining (only
+        // CONNECTION_CLOSE copies are allowed, handled via sendConnectionClose).
+        if (conn.draining) return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         // Header protection sampling (RFC 9001 §5.4.2) requires at least 3 bytes
         // of plaintext (PN(1) + plaintext(n) + tag(16) >= pn_offset+4+16=pn_offset+20).
@@ -2545,7 +2604,6 @@ pub const Server = struct {
     fn sendConnectionClose(self: *Server, conn: *ConnState, error_code: u64, reason: []const u8, dst: std.net.Address) void {
         if (conn.conn_close_sent) return;
         conn.conn_close_sent = true;
-        conn.draining = true;
         const frame = transport_frames.ConnectionClose{
             .is_application = false,
             .error_code = error_code,
@@ -2554,8 +2612,13 @@ pub const Server = struct {
         };
         var buf: [256]u8 = undefined;
         const len = frame.serialize(&buf) catch return;
+        // Send before setting draining so send1Rtt does not suppress the frame.
         self.send1Rtt(conn, buf[0..len], dst);
         std.debug.print("io: sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
+        conn.draining = true;
+        // RFC 9000 §10.2.2: stay in draining state for at least 3×PTO.
+        const pto = conn.rtt.pto_ms(25, 0);
+        conn.draining_deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(3 * pto));
     }
 
     /// Send a MAX_DATA frame to extend the peer's connection-level send window.
@@ -2582,6 +2645,61 @@ pub const Server = struct {
         pos += max_enc.len;
         self.send1Rtt(conn, buf[0..pos], dst);
         std.debug.print("io: sent MAX_STREAM_DATA stream_id={} new_max={}\n", .{ stream_id, new_max });
+    }
+
+    /// Send a NEW_CONNECTION_ID frame offering a fresh alternative CID to the peer.
+    fn sendNewConnectionId(self: *Server, conn: *ConnState, seq: u64, dst: std.net.Address) void {
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ @as(i64, @bitCast(seq))));
+        const new_cid = ConnectionId.random(prng.random(), 8);
+        conn.alt_local_cid = new_cid;
+        conn.alt_local_cid_seq = seq;
+        var buf: [32]u8 = undefined;
+        var pos: usize = 0;
+        buf[pos] = 0x18;
+        pos += 1; // NEW_CONNECTION_ID type
+        const seq_enc = varint.encode(buf[pos..], seq) catch return;
+        pos += seq_enc.len;
+        const rpt_enc = varint.encode(buf[pos..], 0) catch return;
+        pos += rpt_enc.len;
+        buf[pos] = 0x08;
+        pos += 1; // CID length = 8
+        @memcpy(buf[pos .. pos + 8], new_cid.slice());
+        pos += 8;
+        if (!conn.stateless_reset_token_set) {
+            var prng2 = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+            prng2.random().bytes(&conn.stateless_reset_token);
+            conn.stateless_reset_token_set = true;
+        }
+        @memcpy(buf[pos .. pos + 16], &conn.stateless_reset_token);
+        pos += 16;
+        self.send1Rtt(conn, buf[0..pos], dst);
+        std.debug.print("io: sent NEW_CONNECTION_ID seq={}\n", .{seq});
+    }
+
+    /// Send a MAX_STREAMS frame granting the peer additional stream budget.
+    fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: std.net.Address) void {
+        var buf: [16]u8 = undefined;
+        buf[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13); // MAX_STREAMS bidi/uni
+        const enc = varint.encode(buf[1..], 200) catch return; // grant 200 streams
+        self.send1Rtt(conn, buf[0 .. 1 + enc.len], dst);
+        std.debug.print("io: sent MAX_STREAMS bidi={} limit=200\n", .{bidi});
+    }
+
+    /// Initiate a server-side key update (RFC 9001 §6).
+    /// Rotates app_server_km and flips key_phase_bit, then sends a PING
+    /// so the client sees the new Key Phase bit and can rotate its keys.
+    fn initiateServerKeyUpdate(self: *Server, conn: *ConnState, dst: std.net.Address) void {
+        conn.app_server_km = if (conn.use_v2)
+            conn.app_server_km.nextGenV2()
+        else
+            conn.app_server_km.nextGen();
+        conn.key_phase_bit = !conn.key_phase_bit;
+        conn.key_update_pending = true;
+        conn.server_key_update_pn = conn.app_pn;
+        // Send a PING to deliver the first packet with the new Key Phase bit.
+        const padded = [_]u8{ 0x01, 0x00, 0x00 }; // PING + PADDING
+        self.send1Rtt(conn, &padded, dst);
+        std.debug.print("io: server initiated key update → key_phase={}\n", .{conn.key_phase_bit});
     }
 
     /// Send a GOAWAY frame on the HTTP/3 control stream (stream 3).
@@ -4262,6 +4380,7 @@ pub const Client = struct {
 
         // ECN: count this 1-RTT packet as ECT(0).
         self.conn.ecn_ect0_recv += 1;
+        self.conn.last_recv_ms = std.time.milliTimestamp();
 
         self.conn.peer_key_phase = incoming_phase;
         self.conn.key_update_pending = false;
@@ -4406,6 +4525,19 @@ pub const Client = struct {
                     self.conn.next_remote_cid = new_cid;
                     std.debug.print("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
                 }
+                continue;
+            }
+            if (ft == 0x19) {
+                // RETIRE_CONNECTION_ID — server retires one of our CIDs.
+                const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
+                pos += seq_r.len;
+                std.debug.print("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
+                continue;
+            }
+            if (ft == 0x16 or ft == 0x17) {
+                // STREAMS_BLOCKED — server hit stream limit; skip.
+                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                pos += v.len;
                 continue;
             }
             if (ft >= 0x08 and ft <= 0x0f) {
