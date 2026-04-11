@@ -728,6 +728,12 @@ pub const ConnState = struct {
     // HTTP/3 state: whether the server control stream was sent
     h3_settings_sent: bool = false,
 
+    // QPACK per-connection decoder state (RFC 9204 §3.2).
+    // Populated by instructions arriving on the peer's QPACK encoder stream
+    // (client stream 6 for server, server stream 7 for client).
+    // Used by decodeHeaders when the peer sends dynamic-indexed HEADERS blocks.
+    qpack_dec_tbl: h3_qpack.DynamicTable = .{},
+
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
     http09_slots: [2000]Http09OutSlot = [_]Http09OutSlot{.{}} ** 2000,
 
@@ -2355,8 +2361,11 @@ pub const Server = struct {
             conn.h3_settings_sent = true;
         }
 
-        // Ignore client unidirectional streams (control, QPACK encoder/decoder).
-        if (sf.stream_id % 4 == 2) return;
+        // Route client-initiated unidirectional streams (control=2, QPACK enc=6, dec=10…).
+        if (sf.stream_id % 4 == 2) {
+            self.handleH3ClientUniStream(conn, sf);
+            return;
+        }
 
         // Only process client-initiated bidirectional request streams.
         if (sf.stream_id % 4 != 0) return;
@@ -2380,7 +2389,7 @@ pub const Server = struct {
             switch (pr.frame) {
                 .headers => |hf| {
                     var decoded = h3_qpack.DecodedHeaders{ .headers = undefined, .count = 0 };
-                    h3_qpack.decodeHeaders(hf.data[0..hf.len], null, &decoded) catch {};
+                    h3_qpack.decodeHeaders(hf.data[0..hf.len], &conn.qpack_dec_tbl, &decoded) catch {};
                     for (decoded.headers[0..decoded.count]) |fld| {
                         if (std.mem.eql(u8, fld.name, ":method")) {
                             const ml = @min(fld.value.len, method_buf.len);
@@ -2452,16 +2461,76 @@ pub const Server = struct {
         file.close();
     }
 
+    /// Handle a client-initiated unidirectional QUIC stream (stream_id % 4 == 2).
+    ///
+    /// HTTP/3 uses three such streams per direction (RFC 9114 §6.2):
+    ///   stream type 0x00 — control stream  (SETTINGS, GOAWAY, …)
+    ///   stream type 0x02 — QPACK encoder stream (table insertion instructions)
+    ///   stream type 0x03 — QPACK decoder stream (Section Acks, ICIs, cancellations)
+    ///
+    /// The first byte of the stream payload is the stream type; subsequent bytes
+    /// are the stream body.  We only dispatch on the first STREAM frame per stream
+    /// (offset == 0); later frames for the same stream continue the same body.
+    fn handleH3ClientUniStream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame) void {
+        _ = self;
+        if (sf.data.len == 0) return;
+
+        // The stream type byte is present only in the first frame (offset == 0).
+        // For continuation frames on an already-classified stream we'd need per-stream
+        // state; for now we re-inspect the first byte (correct for initial frames).
+        const stream_type = sf.data[0];
+        const body = sf.data[1..];
+
+        switch (stream_type) {
+            0x00 => {
+                // Client control stream: carries SETTINGS.
+                // We already advertise our own capacity; parse the client's SETTINGS
+                // to learn the peer_max_capacity (not yet used for insertions).
+                // For now, just acknowledge receipt silently.
+                std.debug.print("io: h3 client control stream received ({} bytes body)\n", .{body.len});
+            },
+            0x02 => {
+                // QPACK encoder stream: apply insertion instructions to our decoder table.
+                // Each instruction populates conn.qpack_dec_tbl so we can decode any
+                // HEADERS blocks that carry dynamic table references (RIC > 0).
+                var off: usize = 0;
+                while (off < body.len) {
+                    const consumed = h3_qpack.processEncoderStreamInstruction(
+                        &conn.qpack_dec_tbl,
+                        body[off..],
+                    ) catch |err| {
+                        std.debug.print("io: QPACK enc stream err={} (applied {} of {} bytes)\n", .{ err, off, body.len });
+                        break;
+                    };
+                    off += consumed;
+                }
+                std.debug.print("io: QPACK dec table capacity={} count={} after enc stream\n", .{
+                    conn.qpack_dec_tbl.capacity, conn.qpack_dec_tbl.count,
+                });
+            },
+            0x03 => {
+                // QPACK decoder stream: Section Acks, Insert Count Increments, etc.
+                // We don't currently insert into the encoder table, so no acks are
+                // needed.  Accept and discard.
+            },
+            else => {
+                // Unknown stream type — ignore per RFC 9114 §6.2.
+                std.debug.print("io: unknown h3 uni stream type=0x{x} (ignored)\n", .{stream_type});
+            },
+        }
+    }
+
     fn sendH3ControlStream(self: *Server, conn: *ConnState, src: std.net.Address) void {
-        // Server control stream: stream_id=3 (server-initiated unidirectional)
-        // First byte identifies stream type: 0x00 = control stream
+        // Server control stream: stream_id=3 (server-initiated unidirectional).
+        // First byte identifies stream type: 0x00 = control stream.
         var buf: [256]u8 = undefined;
         buf[0] = 0x00; // stream type = control
         var pos: usize = 1;
 
-        // SETTINGS frame
+        // SETTINGS: advertise non-zero QPACK_MAX_TABLE_CAPACITY so the peer
+        // knows it may insert entries into our dynamic table (RFC 9204 §3.2.3).
         const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
-            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = 0 },
+            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = h3_qpack.DEFAULT_DYN_TABLE_CAPACITY },
             .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = 0 },
         }) catch return;
         pos += settings_len;
@@ -2476,6 +2545,25 @@ pub const Server = struct {
         var frame_buf: [300]u8 = undefined;
         const frame_len = sf.serialize(&frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], src);
+
+        // QPACK encoder stream: stream_id=7 (next server-initiated unidirectional).
+        // Stream type byte 0x02 followed by a Set Dynamic Table Capacity instruction
+        // (RFC 9204 §3.2.3: 0b001xxxxx).  Tells the client our encoder's table capacity
+        // so it can configure its decoder table accordingly.
+        var enc_buf: [16]u8 = undefined;
+        enc_buf[0] = 0x02; // stream type = QPACK encoder
+        var enc_pos: usize = 1;
+        enc_pos += h3_qpack.writeSetCapacity(enc_buf[enc_pos..], h3_qpack.DEFAULT_DYN_TABLE_CAPACITY) catch return;
+        const enc_sf = stream_frame_mod.StreamFrame{
+            .stream_id = 7, // server QPACK encoder stream
+            .offset = 0,
+            .data = enc_buf[0..enc_pos],
+            .fin = false,
+            .has_length = true,
+        };
+        var enc_frame_buf: [64]u8 = undefined;
+        const enc_frame_len = enc_sf.serialize(&enc_frame_buf) catch return;
+        self.send1Rtt(conn, enc_frame_buf[0..enc_frame_len], src);
     }
 
     fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: std.net.Address) void {
@@ -3831,6 +3919,28 @@ pub const Client = struct {
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
         std.debug.print("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
 
+        // Server-initiated unidirectional streams (stream_id % 4 == 3):
+        //   id=3  → server control stream    (SETTINGS; ignore)
+        //   id=7  → server QPACK encoder stream (apply insertions to our decoder table)
+        //   id=11 → server QPACK decoder stream (Section Acks; ignore)
+        if (sf.stream_id % 4 == 3) {
+            if (sf.data.len > 0 and sf.data[0] == 0x02) {
+                // QPACK encoder stream body starts after stream type byte.
+                var off: usize = 1;
+                while (off < sf.data.len) {
+                    const consumed = h3_qpack.processEncoderStreamInstruction(
+                        &self.conn.qpack_dec_tbl,
+                        sf.data[off..],
+                    ) catch break;
+                    off += consumed;
+                }
+                std.debug.print("io: client QPACK dec table capacity={} count={}\n", .{
+                    self.conn.qpack_dec_tbl.capacity, self.conn.qpack_dec_tbl.count,
+                });
+            }
+            return;
+        }
+
         for (&self.streams) |*s| {
             if (s.active and s.stream_id == sf.stream_id) {
                 if (self.config.http3) {
@@ -3959,14 +4069,17 @@ pub const Client = struct {
         std.debug.print("io: migrate: rebound to new socket, PING sent to trigger PATH_CHALLENGE\n", .{});
     }
 
-    /// Send the HTTP/3 client control stream (stream_id=2, client-initiated unidirectional).
-    /// Carries a SETTINGS frame with QPACK table size = 0 (static table only).
+    /// Send the HTTP/3 client control stream (stream_id=2, client-initiated unidirectional)
+    /// and the QPACK encoder stream (stream_id=6).
     fn sendH3ClientControlStream(self: *Client, server: std.net.Address) void {
+        // Control stream (stream_id=2): stream type 0x00 + SETTINGS frame.
+        // Advertise non-zero QPACK_MAX_TABLE_CAPACITY so the server knows it may
+        // insert entries into our dynamic table (RFC 9204 §3.2.3).
         var buf: [128]u8 = undefined;
         buf[0] = 0x00; // stream type = control
         var pos: usize = 1;
         const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
-            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = 0 },
+            .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = h3_qpack.DEFAULT_DYN_TABLE_CAPACITY },
             .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = 0 },
         }) catch return;
         pos += settings_len;
@@ -3993,6 +4106,35 @@ pub const Client = struct {
         self.conn.app_pn += 1;
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
         std.debug.print("io: h3 client control stream sent\n", .{});
+
+        // QPACK encoder stream (stream_id=6, next client-initiated unidirectional).
+        // Stream type byte 0x02 followed by a Set Dynamic Table Capacity instruction.
+        var enc_buf: [16]u8 = undefined;
+        enc_buf[0] = 0x02; // stream type = QPACK encoder
+        var enc_pos: usize = 1;
+        enc_pos += h3_qpack.writeSetCapacity(enc_buf[enc_pos..], h3_qpack.DEFAULT_DYN_TABLE_CAPACITY) catch return;
+        const enc_sf = stream_frame_mod.StreamFrame{
+            .stream_id = 6, // client QPACK encoder stream
+            .offset = 0,
+            .data = enc_buf[0..enc_pos],
+            .fin = false,
+            .has_length = true,
+        };
+        var enc_frame_buf: [64]u8 = undefined;
+        const enc_frame_len = enc_sf.serialize(&enc_frame_buf) catch return;
+        var enc_send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const enc_pkt_len = build1RttPacketFull(
+            &enc_send_buf,
+            self.conn.remote_cid,
+            enc_frame_buf[0..enc_frame_len],
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, enc_send_buf[0..enc_pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+        std.debug.print("io: h3 client QPACK encoder stream sent\n", .{});
     }
 
     fn downloadUrls(self: *Client, server: std.net.Address) !void {

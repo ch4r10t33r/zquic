@@ -206,7 +206,7 @@ full test suite. The Docker image is built on every merge to `master`.
 
 | Area | What's missing |
 |------|----------------|
-| **QPACK Phase 3b** | `DynamicTable` data structure is complete; io.zig integration pending: advertise non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY`, wire encoder/decoder unidirectional streams, send Section Acknowledgements |
+| **QPACK dynamic insertions** | Both sides advertise capacity 4096 and exchange Set Capacity instructions; actual dynamic table insertions in outgoing HEADERS and Section Acknowledgements are not yet implemented |
 | **qlog** | Structured QUIC event logging to `$QLOGDIR` is not written |
 
 ## License
