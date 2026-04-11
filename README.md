@@ -1,6 +1,6 @@
 # zquic
 
-A pure Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002).
+A pure-Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002) with full HTTP/3 and QPACK support.
 
 [![CI](https://github.com/ch4r10t33r/zquic/actions/workflows/ci.yml/badge.svg)](https://github.com/ch4r10t33r/zquic/actions/workflows/ci.yml)
 
@@ -8,12 +8,55 @@ A pure Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002
 
 | RFC | Title | Status |
 |-----|-------|--------|
-| [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) | QUIC: A UDP-Based Multiplexed and Secure Transport | complete |
-| [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) | Using TLS to Secure QUIC | complete (keys, AEAD, header protection, key update) |
-| [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002) | QUIC Loss Detection and Congestion Control | RTT, PTO, New Reno |
-| [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) | HTTP/3 | framing, QPACK, server + client I/O |
-| [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204) | QPACK: Header Compression for HTTP/3 | static table, dynamic table (insertions, encoder/decoder streams, Section Acks, blocked streams) |
-| [RFC 9369](https://www.rfc-editor.org/rfc/rfc9369) | QUIC Version 2 | initial secrets, packet type bits, Retry tag |
+| [RFC 9000](https://www.rfc-editor.org/rfc/rfc9000) | QUIC: A UDP-Based Multiplexed and Secure Transport | ✅ Complete |
+| [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) | Using TLS to Secure QUIC | ✅ Complete |
+| [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002) | QUIC Loss Detection and Congestion Control | ✅ Complete |
+| [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) | HTTP/3 | ✅ Complete |
+| [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204) | QPACK: Header Compression for HTTP/3 | ✅ Complete |
+| [RFC 9369](https://www.rfc-editor.org/rfc/rfc9369) | QUIC Version 2 | ✅ Complete |
+
+### Frame support
+
+| Frame | Type | Status |
+|-------|------|--------|
+| PADDING / PING | 0x00–0x01 | ✅ |
+| ACK / ACK-ECN | 0x02–0x03 | ✅ |
+| RESET_STREAM | 0x04 | ✅ |
+| STOP_SENDING | 0x05 | ✅ |
+| CRYPTO | 0x06 | ✅ |
+| NEW_TOKEN | 0x07 | ✅ |
+| STREAM | 0x08–0x0f | ✅ |
+| MAX_DATA | 0x10 | ✅ |
+| MAX_STREAM_DATA | 0x11 | ✅ |
+| MAX_STREAMS (bidi/uni) | 0x12–0x13 | ✅ |
+| DATA_BLOCKED | 0x14 | ✅ |
+| STREAM_DATA_BLOCKED | 0x15 | ✅ |
+| STREAMS_BLOCKED | 0x16–0x17 | ✅ |
+| NEW_CONNECTION_ID | 0x18 | ✅ |
+| RETIRE_CONNECTION_ID | 0x19 | ✅ |
+| PATH_CHALLENGE / PATH_RESPONSE | 0x1a–0x1b | ✅ |
+| CONNECTION_CLOSE (transport/app) | 0x1c–0x1d | ✅ |
+| HANDSHAKE_DONE | 0x1e | ✅ |
+
+## Interop Results
+
+All 13/13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) test cases pass:
+
+| Test | Status |
+|------|--------|
+| `handshake` | ✅ |
+| `transfer` | ✅ |
+| `retry` | ✅ |
+| `chacha20` | ✅ |
+| `keyupdate` | ✅ |
+| `resumption` | ✅ |
+| `zerortt` | ✅ |
+| `http3` | ✅ |
+| `connectionmigration` | ✅ |
+| `multiplexing` | ✅ |
+| `v2` | ✅ |
+| `ecn` | ✅ |
+| `rebind-port` | ✅ |
 
 ## Requirements
 
@@ -23,13 +66,11 @@ A pure Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002
 
 ```sh
 zig build               # build library + server/client binaries
-zig build test          # run all 100 unit tests
+zig build test          # run all 141 unit tests
 zig build examples      # build the example programs
 ```
 
 ## Examples
-
-Three self-contained examples live in `examples/`. Build and run them with:
 
 ```sh
 zig build examples
@@ -94,11 +135,9 @@ try aead_mod.decryptAes128Gcm(&recovered, &ciphertext, aad, key, nonce);
 ```zig
 const session = zquic.crypto.session;
 
-// Store a ticket received from the server.
 var store = session.TicketStore{};
 store.store(ticket);
 
-// On the next connection, retrieve and derive 0-RTT keys.
 if (store.get(now_ms)) |t| {
     const keys = session.deriveEarlyKeys(t);
     // keys.key / keys.iv / keys.hp  — ready for 0-RTT AEAD
@@ -110,11 +149,9 @@ if (store.get(now_ms)) |t| {
 ```zig
 const h3 = zquic.http3.frame;
 
-// Write a HEADERS frame.
 var buf: [256]u8 = undefined;
 const written = try h3.writeFrame(&buf, @intFromEnum(h3.FrameType.headers), encoded_header_block);
 
-// Parse any frame.
 const result = try h3.parseFrame(buf[0..written]);
 // result.frame.headers.data / result.frame.data / result.frame.settings …
 ```
@@ -143,7 +180,7 @@ src/
     ack.zig               ACK frame with ECN
     crypto_frame.zig      CRYPTO frame
     stream.zig            STREAM frame
-    transport.zig         RESET_STREAM, MAX_DATA, PATH_CHALLENGE, …
+    transport.zig         RESET_STREAM, STOP_SENDING, MAX_DATA, PATH_CHALLENGE, …
   transport/
     io.zig                UDP event loop: server + client, HTTP/0.9 + HTTP/3 I/O
     connection.zig        Connection state machine + ACK manager
@@ -152,20 +189,20 @@ src/
     flow_control.zig      Connection + stream flow control
     migration.zig         Path validation, connection migration (RFC 9000 §9)
   loss/
-    recovery.zig          RTT estimation, PTO, loss detection (RFC 9002)
-    congestion.zig        New Reno congestion control
+    recovery.zig          RTT estimation (SRTT/RTTVAR), PTO, packet-threshold loss detection
+    congestion.zig        New Reno congestion control (cwnd, ssthresh, slow start / CA / recovery)
   http09/
     server.zig            HTTP/0.9 request parser + path resolver
     client.zig            HTTP/0.9 request builder + download path helper
   http3/
     frame.zig             HTTP/3 frame codec (RFC 9114 §7)
-    qpack.zig             QPACK: static table, static-indexed encoding, dynamic table (RFC 9204)
+    qpack.zig             QPACK: static table, dynamic table (RFC 9204)
   cmd/
-    server.zig            QUIC server binary (interop runner entry point)
-    client.zig            QUIC client binary (interop runner entry point)
+    server.zig            QUIC server binary
+    client.zig            QUIC client binary
 vendor/tls/               ianic/tls.zig @ 34248f38c189 (Zig 0.15 compatible)
 interop/
-  Dockerfile              Self-contained local build (downloads Zig at build time)
+  Dockerfile              Self-contained local build
   Dockerfile.prebuilt     CI-optimised image from pre-built binaries
   run_endpoint.sh         quic-interop-runner entry point
 examples/
@@ -176,35 +213,15 @@ examples/
 
 ## TLS Integration
 
-QUIC uses TLS 1.3 without the TLS record layer (RFC 9001). A thin adapter
-in `src/crypto/quic_tls.zig` strips/adds the 5-byte TLS record header so
-raw handshake bytes flow through QUIC CRYPTO frames. The vendored
+QUIC uses TLS 1.3 without the TLS record layer (RFC 9001). A thin adapter in
+`src/crypto/quic_tls.zig` strips/adds the 5-byte TLS record header so raw
+handshake bytes flow through QUIC CRYPTO frames. The vendored
 [ianic/tls.zig](https://github.com/ianic/tls.zig) `nonblock` API is used.
 
-## QUIC Interop Runner
+## Releases
 
-This implementation targets the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
-full test suite. The Docker image is built on every merge to `master`.
-
-| Test case | Status |
-|-----------|--------|
-| `handshake` | ✅ passing |
-| `transfer` | ✅ passing |
-| `retry` | ✅ passing |
-| `chacha20` | ✅ passing |
-| `keyupdate` | ✅ passing |
-| `resumption` | ✅ passing |
-| `zerortt` | ✅ passing |
-| `http3` | ✅ passing |
-| `connectionmigration` | ✅ passing |
-| `multiplexing` | ✅ passing |
-| `v2` | ✅ passing |
-| `ecn` | ✅ passing |
-| `rebind-port` | ✅ passing |
-
-## Known Gaps
-
-None at this time.
+See [CHANGELOG.md](CHANGELOG.md) for version history. Releases are published
+automatically on `v*` tags via `.github/workflows/release.yml`.
 
 ## License
 

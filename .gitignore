@@ -1,5 +1,10 @@
 .zig-cache/
 zig-out/
-interop-results/
+interop-results*/
+local-interop-results/
+zquic-interop-image/
+quic-interop-runner/
 *.pem
 *.key
+*.a
+.venv/
