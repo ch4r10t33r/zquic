@@ -857,6 +857,13 @@ pub const ConnState = struct {
     draining_deadline_ms: i64 = 0,
     // Wall-clock time of the last successfully decrypted packet (ms). Used for idle timeout.
     last_recv_ms: i64 = 0,
+    // PTO (Probe Timeout) state (RFC 9002 §6.2).
+    // last_ack_ms: wall-clock time of the most recent ACK frame we processed.
+    // pto_count:   exponential-backoff multiplier (doubles each consecutive probe).
+    // last_pto_ms: wall-clock time we last sent a PTO probe packet.
+    last_ack_ms: i64 = 0,
+    pto_count: u32 = 0,
+    last_pto_ms: i64 = 0,
     goaway_sent: bool = false,
 
     // ── Stateless Reset (RFC 9000 §10.3) ─────────────────────────────────────
@@ -1156,6 +1163,9 @@ pub const Server = struct {
                     idle_secs += 2;
                     dbg("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
                 }
+                // PTO: probe before flushing so that if a probe is sent the
+                // subsequent flushPendingHttp09Responses call can resume sends.
+                self.checkPto();
                 self.flushPendingHttp09Responses();
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
@@ -2246,6 +2256,10 @@ pub const Server = struct {
                 while (li < ld_result.lost_count) : (li += 1) {
                     conn.cc.onLoss(lost_buf[li]);
                 }
+                // ACK received — reset PTO backoff counter and record timestamp
+                // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
+                conn.last_ack_ms = std.time.milliTimestamp();
+                conn.pto_count = 0;
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
             }
@@ -2569,6 +2583,10 @@ pub const Server = struct {
                     for (&conn.http09_slots) |*slot| {
                         if (!slot.active) continue;
                         if (budget == 0) return;
+                        // Pre-check CC: if the window is exhausted, skip all
+                        // remaining slots for this connection — there is nothing
+                        // to send and we must not burn the budget on null sends.
+                        if (!conn.cc.canSend(congestion.mss)) break;
                         self.http09SendNextChunk(conn, slot);
                         progressed = true;
                         budget -= 1;
@@ -2576,6 +2594,47 @@ pub const Server = struct {
                 }
             }
             if (!progressed) break;
+        }
+    }
+
+    /// Probe Timeout (PTO) handler (RFC 9002 §6.2).
+    ///
+    /// When the sender has packets in flight but receives no acknowledgement for
+    /// longer than the PTO interval, it sends 1–2 PING probe packets.  The probe
+    /// is *not* gated by the congestion window — its purpose is to elicit an ACK
+    /// from the peer so that:
+    ///
+    ///   1. "Tail" packets that cannot be declared lost via k_packet_threshold
+    ///      (because no higher-numbered packet has been sent or acknowledged) get
+    ///      detected once the probe ACK carries a new largest_acknowledged.
+    ///   2. bytes_in_flight is corrected, unblocking subsequent data sends.
+    ///
+    /// The pto_count field provides exponential back-off (PTO doubles each probe).
+    fn checkPto(self: *Server) void {
+        const now_ms = std.time.milliTimestamp();
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (!conn.has_app_keys) continue;
+            if (conn.draining) continue;
+            // Only probe when there are packets in flight (otherwise there is
+            // nothing to recover and no need to elicit an ACK).
+            if (conn.cc.bytes_in_flight == 0) continue;
+            // Require at least one ACK to have been received so we have a
+            // meaningful RTT estimate; before that, last_ack_ms == 0.
+            if (conn.last_ack_ms == 0) continue;
+            const pto_delay: i64 = @intCast(conn.rtt.pto_ms(25, conn.pto_count));
+            const elapsed_since_ack: i64 = now_ms - conn.last_ack_ms;
+            const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms;
+            if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
+                // Send a PING probe bypassing the congestion window.
+                const ping_frame = [_]u8{0x01};
+                self.send1Rtt(conn, &ping_frame, conn.peer);
+                conn.last_pto_ms = now_ms;
+                conn.pto_count +|= 1;
+                dbg("io: PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
+                    conn.app_pn - 1, conn.pto_count, pto_delay, conn.cc.bytes_in_flight,
+                });
+            }
         }
     }
 
