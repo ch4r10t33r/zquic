@@ -35,6 +35,13 @@ const transport_frames = @import("../frames/transport.zig");
 const version_neg_mod = @import("../packet/version_negotiation.zig");
 const congestion = @import("../loss/congestion.zig");
 const recovery = @import("../loss/recovery.zig");
+const build_options = @import("build_options");
+
+/// Compile-time-eliminated debug logger. With `-Dverbose=true` prints to stderr;
+/// in production builds all calls are removed by the optimizer with zero overhead.
+inline fn dbg(comptime fmt: []const u8, args: anytype) void {
+    if (build_options.verbose) std.debug.print(fmt, args);
+}
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -421,77 +428,45 @@ fn unprotect1RttPacketWithPnTracking(
     chacha20: bool,
     expected_recv_pn: ?u64,
 ) !struct { pt_len: usize, pn: u64 } {
-    if (buf.len < pn_start + initial_mod.hp_sample_offset + initial_mod.hp_sample_len) return error.BufferTooShort;
+    // Compute HP mask once — reused for both first-byte and PN field unmasking.
+    const mask = computeHpMask(buf, pn_start, km, chacha20) orelse return error.BufferTooShort;
+    const first_byte_mask: u8 = 0x1f; // short header: protect low 5 bits
 
-    // Sample for header protection removal
-    const sample_start = pn_start + initial_mod.hp_sample_offset;
-    var sample: [initial_mod.hp_sample_len]u8 = undefined;
-    @memcpy(&sample, buf[sample_start .. sample_start + initial_mod.hp_sample_len]);
+    // Unmask first byte to discover actual PN length (1–4 bytes).
+    const actual_pn_len: usize = ((buf[0] ^ (mask[0] & first_byte_mask)) & 0x03) + 1;
+    const aad_end = pn_start + actual_pn_len;
 
-    // Work on a mutable copy to unmask
-    var header_copy: [1600]u8 = undefined;
-    if (buf.len > header_copy.len) return error.BufferTooShort;
-    @memcpy(header_copy[0..buf.len], buf);
+    // Build a small mutable AAD buffer containing only the header bytes that
+    // need unmasking.  Maximum size: 1 (first byte) + 20 (max DCID) + 4 (max PN) = 25.
+    // This replaces the previous 1600-byte full-packet copy.
+    var aad_buf: [32]u8 = undefined;
+    if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
+    @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
 
-    // Unmask first byte to discover actual PN length
-    const first_byte_mask: u8 = 0x1f; // short header
-    var temp_first = header_copy[0];
-
-    if (chacha20) {
-        // For ChaCha20, we need to use chacha20 header protection
-        const counter = std.mem.readInt(u32, sample[0..4], .little);
-        const cc_nonce = sample[4..16].*;
-        var full_mask: [64]u8 = undefined;
-        std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
-        temp_first ^= full_mask[0] & first_byte_mask;
-    } else {
-        var mask: [16]u8 = undefined;
-        const aes_ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
-        aes_ctx.encrypt(&mask, &sample);
-        temp_first ^= mask[0] & first_byte_mask;
+    // Remove header protection from the local copy.
+    aad_buf[0] ^= mask[0] & first_byte_mask;
+    for (aad_buf[pn_start..aad_end], 1..) |*b, i| {
+        b.* ^= mask[i];
     }
 
-    const actual_pn_len: usize = (temp_first & 0x03) + 1;
-
-    // Now unmask PN bytes (recompute mask for actual PN bytes)
-    var pn_mask: [16]u8 = undefined;
-    if (chacha20) {
-        const counter = std.mem.readInt(u32, sample[0..4], .little);
-        const cc_nonce = sample[4..16].*;
-        var full_mask: [64]u8 = undefined;
-        std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
-        @memcpy(&pn_mask, full_mask[0..16]);
-    } else {
-        const aes_ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
-        aes_ctx.encrypt(&pn_mask, &sample);
-    }
-
-    const pn_bytes = header_copy[pn_start .. pn_start + actual_pn_len];
-    for (pn_bytes, 0..) |*b, i| {
-        b.* ^= pn_mask[1 + i];
-    }
-    header_copy[0] ^= pn_mask[0] & first_byte_mask;
-
-    // Extract truncated packet number
+    // Decode truncated packet number from the unmasked bytes.
     var truncated_pn: u64 = 0;
-    for (pn_bytes) |b| {
+    for (aad_buf[pn_start..aad_end]) |b| {
         truncated_pn = (truncated_pn << 8) | b;
     }
 
-    // Decompress packet number
+    // Decompress full packet number relative to the last received PN.
     const pn_len_bits: u3 = @intCast(actual_pn_len - 1);
     const pn = initial_mod.decompressPacketNumber(truncated_pn, expected_recv_pn, pn_len_bits);
 
-    // AAD = everything up to and including PN
-    const aad_end = pn_start + actual_pn_len;
-    const aad = header_copy[0..aad_end];
+    // Decrypt: ciphertext is read directly from the receive buffer — no copy.
     const nonce = aead_mod.buildNonce(km.iv, pn);
     const ciphertext = buf[aad_end..];
-
     if (ciphertext.len < 16) return error.BufferTooShort;
     const plaintext_len = ciphertext.len - 16;
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
+    const aad = aad_buf[0..aad_end];
     if (chacha20) {
         try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
     } else {
@@ -513,29 +488,34 @@ pub fn unprotect1RttPacket(
     return initial_mod.unprotectInitialPacket(dst, buf, pn_start, buf.len, km);
 }
 
-/// Return the unprotected first byte of a 1-RTT short-header packet.
-/// Removes AES-128 header protection to reveal the Key Phase bit (0x04).
-/// Returns null if the packet is too short to sample.
-fn peekUnprotectedFirstByte(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chacha20: bool) ?u8 {
+/// Compute the 16-byte header-protection mask for a 1-RTT short-header packet.
+/// Encapsulates the AES-128 / ChaCha20 choice so callers only call this once.
+/// Returns null when `buf` is too short to contain the HP sample.
+fn computeHpMask(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chacha20: bool) ?[16]u8 {
     const sample_start = pn_start + initial_mod.hp_sample_offset;
     if (buf.len < sample_start + initial_mod.hp_sample_len) return null;
     var sample: [initial_mod.hp_sample_len]u8 = undefined;
     @memcpy(&sample, buf[sample_start .. sample_start + initial_mod.hp_sample_len]);
-
-    var mask0: u8 = undefined;
+    var mask: [16]u8 = undefined;
     if (chacha20) {
         const counter = std.mem.readInt(u32, sample[0..4], .little);
         const cc_nonce = sample[4..16].*;
         var full_mask: [64]u8 = undefined;
         std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
-        mask0 = full_mask[0];
+        @memcpy(&mask, full_mask[0..16]);
     } else {
-        const ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
-        var mask: [16]u8 = undefined;
-        ctx.encrypt(&mask, &sample);
-        mask0 = mask[0];
+        const aes_ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
+        aes_ctx.encrypt(&mask, &sample);
     }
-    return buf[0] ^ (mask0 & 0x1f); // short header: mask bits 5-0
+    return mask;
+}
+
+/// Return the unprotected first byte of a 1-RTT short-header packet.
+/// Removes AES-128 header protection to reveal the Key Phase bit (0x04).
+/// Returns null if the packet is too short to sample.
+fn peekUnprotectedFirstByte(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chacha20: bool) ?u8 {
+    const mask = computeHpMask(buf, pn_start, km, chacha20) orelse return null;
+    return buf[0] ^ (mask[0] & 0x1f); // short header: mask the low 5 bits
 }
 
 // ── QUIC packet decryption ────────────────────────────────────────────────────
@@ -557,7 +537,7 @@ pub fn decryptLongPacket(
 /// Load the first DER certificate from a PEM file (heap-allocated).
 pub fn loadCertDer(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const pem = std.fs.openFileAbsolute(path, .{}) catch |err| {
-        std.debug.print("io: cannot open cert {s}: {}\n", .{ path, err });
+        dbg("io: cannot open cert {s}: {}\n", .{ path, err });
         return err;
     };
     defer pem.close();
@@ -592,7 +572,7 @@ pub fn loadCertDer(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 /// Load a PrivateKey from a PEM file using tls.zig's parser.
 pub fn loadPrivateKey(allocator: std.mem.Allocator, path: []const u8) !tls_vendor.config.PrivateKey {
     const f = std.fs.openFileAbsolute(path, .{}) catch |err| {
-        std.debug.print("io: cannot open key {s}: {}\n", .{ path, err });
+        dbg("io: cannot open key {s}: {}\n", .{ path, err });
         return err;
     };
     defer f.close();
@@ -794,10 +774,16 @@ pub const ConnState = struct {
     qlog: qlog_writer.Writer = .{},
 
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
-    http09_slots: [2000]Http09OutSlot = [_]Http09OutSlot{.{}} ** 2000,
+    http09_slots: [64]Http09OutSlot = [_]Http09OutSlot{.{}} ** 64,
 
     /// HTTP/3 responses in progress (paced DATA frame sending per connection).
     http3_slots: [32]Http3OutSlot = [_]Http3OutSlot{.{}} ** 32,
+
+    /// Number of currently active HTTP/0.9 response slots (maintained by the server).
+    /// Avoids O(2000) scan in the event-loop poll-timeout calculation.
+    http09_active_count: u32 = 0,
+    /// Number of currently active HTTP/3 response slots.
+    http3_active_count: u32 = 0,
 
     /// 1-RTT frames received while waiting for client Finished (reordering).
     pending_1rtt: [pending_1rtt_cap]Pending1RttPayload = [_]Pending1RttPayload{.{}} ** pending_1rtt_cap,
@@ -1010,14 +996,14 @@ pub const Server = struct {
 
         // Load certificate DER bytes
         const cert_der = loadCertDer(allocator, config.cert_path) catch |err| {
-            std.debug.print("io: cert load failed ({s}): {}\n", .{ config.cert_path, err });
+            dbg("io: cert load failed ({s}): {}\n", .{ config.cert_path, err });
             return err;
         };
         errdefer allocator.free(cert_der);
 
         // Load private key
         const pk = loadPrivateKey(allocator, config.key_path) catch |err| {
-            std.debug.print("io: key load failed ({s}): {}\n", .{ config.key_path, err });
+            dbg("io: key load failed ({s}): {}\n", .{ config.key_path, err });
             return err;
         };
 
@@ -1038,7 +1024,7 @@ pub const Server = struct {
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(sock);
 
-        std.debug.print("io: server bound on 0.0.0.0:{d}\n", .{config.port});
+        dbg("io: server bound on 0.0.0.0:{d}\n", .{config.port});
 
         // Diagnostic raw socket: capture all incoming UDP at IP level.
         // If this sees packets that the main socket doesn't, it indicates
@@ -1048,11 +1034,11 @@ pub const Server = struct {
             std.posix.SOCK.RAW,
             17, // IPPROTO_UDP
         ) catch |err| blk: {
-            std.debug.print("io: raw_sock create failed ({}), no raw diagnostics\n", .{err});
+            dbg("io: raw_sock create failed ({}), no raw diagnostics\n", .{err});
             break :blk null;
         };
         if (raw_sock) |rs| {
-            std.debug.print("io: raw_sock created fd={}\n", .{rs});
+            dbg("io: raw_sock created fd={}\n", .{rs});
         }
 
         // Generate a random Retry token secret for this server lifetime
@@ -1093,7 +1079,7 @@ pub const Server = struct {
             if (slot.*) |*conn| {
                 // Draining period expired.
                 if (conn.draining and conn.draining_deadline_ms > 0 and now >= conn.draining_deadline_ms) {
-                    std.debug.print("io: reaping drained connection (deadline passed)\n", .{});
+                    dbg("io: reaping drained connection (deadline passed)\n", .{});
                     slot.* = null;
                     continue;
                 }
@@ -1101,7 +1087,7 @@ pub const Server = struct {
                 if (conn.phase == .connected and conn.last_recv_ms > 0 and
                     now - conn.last_recv_ms > idle_timeout_ms)
                 {
-                    std.debug.print("io: idle timeout — closing connection\n", .{});
+                    dbg("io: idle timeout — closing connection\n", .{});
                     slot.* = null;
                 }
             }
@@ -1128,15 +1114,20 @@ pub const Server = struct {
             var poll_timeout_ms: i32 = 2000;
             for (&self.conns) |*cslot| {
                 if (cslot.*) |*conn| {
+                    if (conn.http09_active_count > 0 or conn.http3_active_count > 0) {
+                        poll_timeout_ms = 50;
+                        break;
+                    }
+                    // Also check awaiting_fin_ack slots (FIN retransmit needed).
                     for (&conn.http09_slots) |*slot| {
-                        if (slot.active or slot.awaiting_fin_ack) {
+                        if (slot.awaiting_fin_ack) {
                             poll_timeout_ms = 50;
                             break;
                         }
                     }
                     if (poll_timeout_ms != 50) {
                         for (&conn.http3_slots) |*slot| {
-                            if (slot.active or slot.awaiting_fin_ack) {
+                            if (slot.awaiting_fin_ack) {
                                 poll_timeout_ms = 50;
                                 break;
                             }
@@ -1147,7 +1138,7 @@ pub const Server = struct {
             }
 
             const ready = std.posix.poll(fds[0..nfds], poll_timeout_ms) catch |err| {
-                std.debug.print("io: poll error: {}\n", .{err});
+                dbg("io: poll error: {}\n", .{err});
                 self.flushPendingHttp09Responses();
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
@@ -1157,7 +1148,7 @@ pub const Server = struct {
             if (ready == 0) {
                 if (poll_timeout_ms >= 2000) {
                     idle_secs += 2;
-                    std.debug.print("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
+                    dbg("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
                 }
                 self.flushPendingHttp09Responses();
                 self.http09RetransmitPendingFins();
@@ -1185,7 +1176,7 @@ pub const Server = struct {
                     const proto = raw_buf[9];
                     const src_ip = raw_buf[12..16];
                     const dst_ip = raw_buf[16..20];
-                    std.debug.print("io: raw_sock got {} bytes proto={} src={}.{}.{}.{} dst={}.{}.{}.{}\n", .{
+                    dbg("io: raw_sock got {} bytes proto={} src={}.{}.{}.{} dst={}.{}.{}.{}\n", .{
                         rn,        proto,
                         src_ip[0], src_ip[1],
                         src_ip[2], src_ip[3],
@@ -1212,11 +1203,11 @@ pub const Server = struct {
                         &src_len,
                     ) catch |err| {
                         if (drained > 0 and err == error.WouldBlock) break;
-                        std.debug.print("io: recvfrom error: {}\n", .{err});
+                        dbg("io: recvfrom error: {}\n", .{err});
                         break;
                     };
                     drained += 1;
-                    std.debug.print("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
+                    dbg("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
 
                     const src = std.net.Address{ .any = @as(*const std.posix.sockaddr, @ptrCast(&src_addr)).* };
                     self.processPacket(recv_buf[0..n], src);
@@ -1234,7 +1225,7 @@ pub const Server = struct {
     /// Dispatch a received UDP datagram.
     fn processPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
         const src_ip = src.any.data[2..6];
-        std.debug.print("io: server recv {} bytes first_byte=0x{x:0>2} src_ip={}.{}.{}.{}\n", .{
+        dbg("io: server recv {} bytes first_byte=0x{x:0>2} src_ip={}.{}.{}.{}\n", .{
             buf.len,   if (buf.len > 0) buf[0] else 0,
             src_ip[0], src_ip[1],
             src_ip[2], src_ip[3],
@@ -1245,16 +1236,16 @@ pub const Server = struct {
         if (buf[0] & 0x80 != 0 and buf.len >= 5 and
             buf[1] == 0 and buf[2] == 0 and buf[3] == 0 and buf[4] == 0)
         {
-            std.debug.print("io: server discard VN packet\n", .{});
+            dbg("io: server discard VN packet\n", .{});
             return; // discard
         }
 
         if (buf[0] & 0x80 != 0) {
             // Long header
             const version: u32 = (@as(u32, buf[1]) << 24) | (@as(u32, buf[2]) << 16) | (@as(u32, buf[3]) << 8) | buf[4];
-            std.debug.print("io: server long header version=0x{x:0>8}\n", .{version});
+            dbg("io: server long header version=0x{x:0>8}\n", .{version});
             const lh = header_mod.parseLong(buf) catch |err| {
-                std.debug.print("io: server parseLong failed: {}\n", .{err});
+                dbg("io: server parseLong failed: {}\n", .{err});
                 return;
             };
             // RFC 9000 §6.1: respond with Version Negotiation for unsupported
@@ -1263,13 +1254,13 @@ pub const Server = struct {
             if (lh.header.version != version_neg_mod.QUIC_V1 and
                 lh.header.version != version_neg_mod.QUIC_V2)
             {
-                std.debug.print("io: server sendVersionNegotiation to {}.{}.{}.{}\n", .{
+                dbg("io: server sendVersionNegotiation to {}.{}.{}.{}\n", .{
                     src_ip[0], src_ip[1], src_ip[2], src_ip[3],
                 });
                 self.sendVersionNegotiation(lh.header.scid.slice(), lh.header.dcid.slice(), src);
                 return;
             }
-            std.debug.print("io: server pkt_type={any}\n", .{lh.header.packet_type});
+            dbg("io: server pkt_type={any}\n", .{lh.header.packet_type});
             switch (lh.header.packet_type) {
                 .initial => self.processInitialPacket(buf, src),
                 .handshake => self.processHandshakePacket(buf, src),
@@ -1280,7 +1271,7 @@ pub const Server = struct {
             // Short (1-RTT) header
             self.process1RttPacket(buf, src);
         }
-        std.debug.print("io: server processPacket done\n", .{});
+        dbg("io: server processPacket done\n", .{});
     }
 
     /// Find an existing connection by DCID.
@@ -1349,7 +1340,7 @@ pub const Server = struct {
                 return conn;
             }
         }
-        std.debug.print("io: too many connections\n", .{});
+        dbg("io: too many connections\n", .{});
         return null;
     }
 
@@ -1431,7 +1422,7 @@ pub const Server = struct {
         if (self.config.v2 and !conn.use_v2) {
             conn.use_v2 = true;
             conn.init_keys = InitialSecrets.deriveV2(ip.dcid.slice());
-            std.debug.print("io: server upgraded connection to QUIC v2 (compatible version negotiation)\n", .{});
+            dbg("io: server upgraded connection to QUIC v2 (compatible version negotiation)\n", .{});
         }
 
         // Record received PN for ACK
@@ -1478,11 +1469,11 @@ pub const Server = struct {
         // Try findConn first (in case local_cid happens to match), then fall back
         // to a lookup by init_dcid.
         const conn = self.findConn(lh.header.dcid) orelse self.findConnByInitDcid(lh.header.dcid) orelse {
-            std.debug.print("io: 0-RTT dropped — no connection for dcid\n", .{});
+            dbg("io: 0-RTT dropped — no connection for dcid\n", .{});
             return;
         };
         if (!conn.has_early_keys) {
-            std.debug.print("io: 0-RTT dropped — no early keys for connection\n", .{});
+            dbg("io: 0-RTT dropped — no early keys for connection\n", .{});
             return;
         }
 
@@ -1505,10 +1496,10 @@ pub const Server = struct {
             payload_end,
             &conn.early_km,
         ) catch |err| {
-            std.debug.print("io: 0-RTT decrypt failed: {}\n", .{err});
+            dbg("io: 0-RTT decrypt failed: {}\n", .{err});
             return;
         };
-        std.debug.print("io: server 0-RTT decrypted {} bytes\n", .{pt_len});
+        dbg("io: server 0-RTT decrypted {} bytes\n", .{pt_len});
 
         // Walk the decrypted payload for STREAM frames.
         // NOTE: advance fpos past the type byte before calling StreamFrame.parse,
@@ -1603,7 +1594,7 @@ pub const Server = struct {
         ) catch return;
 
         _ = std.posix.sendto(self.sock, buf[0..n], 0, &src.any, src.getOsSockLen()) catch {};
-        std.debug.print("io: sent Retry to client\n", .{});
+        dbg("io: sent Retry to client\n", .{});
     }
 
     fn handleInitialCrypto(
@@ -1629,7 +1620,7 @@ pub const Server = struct {
 
         // Process ClientHello → ServerHello
         const sh_len = conn.tls.processClientHello(data, &conn.sh_bytes) catch |err| {
-            std.debug.print("io: TLS ClientHello failed: {}\n", .{err});
+            dbg("io: TLS ClientHello failed: {}\n", .{err});
             return;
         };
         conn.sh_len = sh_len;
@@ -1662,7 +1653,7 @@ pub const Server = struct {
                 .hp32 = .{0} ** 32,
             };
             conn.has_early_keys = true;
-            std.debug.print("io: server derived 0-RTT early keys\n", .{});
+            dbg("io: server derived 0-RTT early keys\n", .{});
         }
     }
 
@@ -1692,7 +1683,7 @@ pub const Server = struct {
             alpn,
             &conn.flight_bytes,
         ) catch |err| {
-            std.debug.print("io: buildServerFlight failed: {}\n", .{err});
+            dbg("io: buildServerFlight failed: {}\n", .{err});
             return;
         };
         conn.flight_len = flight_len;
@@ -1737,7 +1728,7 @@ pub const Server = struct {
         conn.init_pn += 1;
 
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
-            std.debug.print("io: sendto Initial failed: {}\n", .{err});
+            dbg("io: sendto Initial failed: {}\n", .{err});
         };
     }
 
@@ -1775,7 +1766,7 @@ pub const Server = struct {
             conn.hs_pn += 1;
 
             _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
-                std.debug.print("io: sendto Handshake failed: {}\n", .{err});
+                dbg("io: sendto Handshake failed: {}\n", .{err});
             };
 
             offset += chunk_len;
@@ -1862,11 +1853,11 @@ pub const Server = struct {
         if (data.len < 4 or data[0] != tls_hs.MSG_FINISHED) return;
 
         conn.tls.processClientFinished(data) catch |err| {
-            std.debug.print("io: client Finished verify failed: {}\n", .{err});
+            dbg("io: client Finished verify failed: {}\n", .{err});
             return;
         };
 
-        std.debug.print("io: handshake complete for connection\n", .{});
+        dbg("io: handshake complete for connection\n", .{});
         conn.phase = .connected;
 
         const pending_n = conn.pending_1rtt_n;
@@ -1995,7 +1986,7 @@ pub const Server = struct {
     }
 
     fn process1RttPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
-        std.debug.print("io: process1RttPacket buf_len={}\n", .{buf.len});
+        dbg("io: process1RttPacket buf_len={}\n", .{buf.len});
         // Find connection by scanning CID prefix
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
@@ -2061,12 +2052,12 @@ pub const Server = struct {
                     if (buf.len >= 21 and conn.stateless_reset_token_set) {
                         const tail = buf[buf.len - 16 ..];
                         if (std.mem.eql(u8, tail, &conn.stateless_reset_token)) {
-                            std.debug.print("io: Stateless Reset detected — entering draining\n", .{});
+                            dbg("io: Stateless Reset detected — entering draining\n", .{});
                             conn.draining = true;
                             return;
                         }
                     }
-                    std.debug.print(
+                    dbg(
                         "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
                         .{ buf.len, incoming_phase, conn.peer_key_phase, conn.use_chacha20 },
                     );
@@ -2100,7 +2091,7 @@ pub const Server = struct {
                 return;
             }
         }
-        std.debug.print("io: process1RttPacket: no matching connection found\n", .{});
+        dbg("io: process1RttPacket: no matching connection found\n", .{});
     }
 
     /// Trigger a local key update: rotate send keys and emit a packet with
@@ -2118,7 +2109,7 @@ pub const Server = struct {
     }
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
-        std.debug.print("io: processAppFrames called: {} bytes\n", .{frames.len});
+        dbg("io: processAppFrames called: {} bytes\n", .{frames.len});
         conn.qlog.packetReceived(.one_rtt, conn.app_recv_pn orelse 0, frames.len);
         // RFC 9000 §10.2.2: silently discard all frames while draining.
         if (conn.draining) return;
@@ -2160,7 +2151,7 @@ pub const Server = struct {
                 if (rewind_to < slot.stream_offset) {
                     slot.file.seekTo(rewind_to) catch {};
                     slot.stream_offset = rewind_to;
-                    std.debug.print("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
+                    dbg("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
                 }
             }
             // RFC 9002 §9.4: reset congestion controller and RTT estimator on
@@ -2175,7 +2166,7 @@ pub const Server = struct {
         var pos: usize = 0;
         while (pos < frames.len) {
             const ft_r = varint.decode(frames[pos..]) catch {
-                std.debug.print("io: frame type decode error at pos={}\n", .{pos});
+                dbg("io: frame type decode error at pos={}\n", .{pos});
                 return;
             };
             const ft = ft_r.value;
@@ -2190,7 +2181,7 @@ pub const Server = struct {
                     const largest_ack = lar.value;
                     for (&conn.http09_slots) |*slot| {
                         if (slot.awaiting_fin_ack and slot.fin_pkt_pn <= largest_ack) {
-                            std.debug.print("io: stream_id={} FIN ACKed (fin_pn={} <= largest_ack={})\n", .{ slot.stream_id, slot.fin_pkt_pn, largest_ack });
+                            dbg("io: stream_id={} FIN ACKed (fin_pn={} <= largest_ack={})\n", .{ slot.stream_id, slot.fin_pkt_pn, largest_ack });
                             slot.awaiting_fin_ack = false;
                         }
                     }
@@ -2222,7 +2213,7 @@ pub const Server = struct {
                 pos += v.len;
                 if (v.value > conn.fc_send_max) {
                     conn.fc_send_max = v.value;
-                    std.debug.print("io: MAX_DATA updated send_max={}\n", .{conn.fc_send_max});
+                    dbg("io: MAX_DATA updated send_max={}\n", .{conn.fc_send_max});
                 }
                 continue;
             }
@@ -2262,15 +2253,21 @@ pub const Server = struct {
                 // RESET_STREAM — peer cancelled a stream (RFC 9000 §19.4).
                 const r = transport_frames.ResetStream.parse(frames[pos..]) catch return;
                 pos += r.consumed;
-                std.debug.print("io: RESET_STREAM stream_id={} code={} final_size={}\n", .{
+                dbg("io: RESET_STREAM stream_id={} code={} final_size={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code, r.frame.final_size,
                 });
                 // Cancel any pending response for this stream.
                 for (&conn.http09_slots) |*slot| {
-                    if (slot.active and slot.stream_id == r.frame.stream_id) slot.close();
+                    if (slot.active and slot.stream_id == r.frame.stream_id) {
+                        if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
+                        slot.close();
+                    }
                 }
                 for (&conn.http3_slots) |*slot| {
-                    if (slot.active and slot.stream_id == r.frame.stream_id) slot.active = false;
+                    if (slot.active and slot.stream_id == r.frame.stream_id) {
+                        if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
+                        slot.active = false;
+                    }
                 }
                 continue;
             }
@@ -2278,7 +2275,7 @@ pub const Server = struct {
                 // STOP_SENDING — peer asked us to stop sending on a stream (RFC 9000 §19.5).
                 const r = transport_frames.StopSending.parse(frames[pos..]) catch return;
                 pos += r.consumed;
-                std.debug.print("io: STOP_SENDING stream_id={} code={}\n", .{
+                dbg("io: STOP_SENDING stream_id={} code={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code,
                 });
                 // Respond by resetting the stream.
@@ -2296,7 +2293,7 @@ pub const Server = struct {
                 // CONNECTION_CLOSE — peer is closing the connection.
                 const r = transport_frames.ConnectionClose.parse(frames[pos..], ft == 0x1d) catch return;
                 pos += r.consumed;
-                std.debug.print("io: CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
+                dbg("io: CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
                 conn.draining = true;
                 const pto2 = conn.rtt.pto_ms(25, 0);
                 conn.draining_deadline_ms = std.time.milliTimestamp() + @as(i64, @intCast(3 * pto2));
@@ -2318,7 +2315,7 @@ pub const Server = struct {
                         // Path validated — migrate to the new address.
                         conn.peer = src;
                         conn.path_challenge_data = null;
-                        std.debug.print("io: connection migrated to new address\n", .{});
+                        dbg("io: connection migrated to new address\n", .{});
                     }
                 }
                 continue;
@@ -2327,7 +2324,7 @@ pub const Server = struct {
                 // RETIRE_CONNECTION_ID — peer retires one of our CIDs (RFC 9000 §19.16).
                 const seq_r = varint.decode(frames[pos..]) catch return;
                 pos += seq_r.len;
-                std.debug.print("io: RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
+                dbg("io: RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
                 if (seq_r.value == conn.alt_local_cid_seq) {
                     conn.alt_local_cid = null;
                     // Issue a replacement CID.
@@ -2338,11 +2335,11 @@ pub const Server = struct {
             if (ft >= 0x08 and ft <= 0x0f) {
                 // STREAM frame
                 const sf_r = stream_frame_mod.StreamFrame.parse(frames[pos..], ft) catch |err| {
-                    std.debug.print("io: STREAM frame parse error ft=0x{x:0>2}: {}\n", .{ ft, err });
+                    dbg("io: STREAM frame parse error ft=0x{x:0>2}: {}\n", .{ ft, err });
                     return;
                 };
                 pos += sf_r.consumed;
-                std.debug.print("io: STREAM frame parsed: stream_id={} offset={} data_len={} fin={}\n", .{ sf_r.frame.stream_id, sf_r.frame.offset, sf_r.frame.data.len, sf_r.frame.fin });
+                dbg("io: STREAM frame parsed: stream_id={} offset={} data_len={} fin={}\n", .{ sf_r.frame.stream_id, sf_r.frame.offset, sf_r.frame.data.len, sf_r.frame.fin });
                 // Flow control (RFC 9000 §4.1): track cumulative bytes received.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
                 if (recv_end > conn.fc_bytes_recv) conn.fc_bytes_recv = recv_end;
@@ -2409,16 +2406,16 @@ pub const Server = struct {
             conn.key_phase_bit,
             conn.use_chacha20,
         ) catch |err| {
-            std.debug.print("io: build1RttPacketFull error payload_len={}: {}\n", .{ effective_payload.len, err });
+            dbg("io: build1RttPacketFull error payload_len={}: {}\n", .{ effective_payload.len, err });
             return;
         };
         conn.app_pn += 1;
         conn.qlog.packetSent(.one_rtt, conn.app_pn - 1, pkt_len);
         if (has_fin) {
-            std.debug.print("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
+            dbg("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
         }
         const send_result = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch |err| {
-            std.debug.print("io: sendto error pkt_len={}: {}\n", .{ pkt_len, err });
+            dbg("io: sendto error pkt_len={}: {}\n", .{ pkt_len, err });
             return;
         };
         // Congestion control: update bytes in flight.
@@ -2432,7 +2429,7 @@ pub const Server = struct {
             .in_flight = true,
         });
         if (has_fin) {
-            std.debug.print("io: server FIN PACKET sent {} bytes\n", .{send_result});
+            dbg("io: server FIN PACKET sent {} bytes\n", .{send_result});
         }
     }
 
@@ -2440,21 +2437,23 @@ pub const Server = struct {
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
         var file_buf: [1200]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
-            std.debug.print("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
+            dbg("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
+            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.close();
             return;
         };
         if (n == 0) {
-            std.debug.print("io: http09 stream_id={} EOF (offset={}, file_end={})\n", .{ slot.stream_id, slot.stream_offset, slot.file_end });
+            dbg("io: http09 stream_id={} EOF (offset={}, file_end={})\n", .{ slot.stream_id, slot.stream_offset, slot.file_end });
+            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.close();
             return;
         }
         const fin = slot.stream_offset + @as(u64, @intCast(n)) >= slot.file_end;
         if (slot.stream_offset % 10000 == 0 or fin) {
-            std.debug.print("io: http09 stream_id={} send chunk offset={} n={} file_end={} fin={} (offset+n={})\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end, fin, slot.stream_offset + @as(u64, @intCast(n)) });
+            dbg("io: http09 stream_id={} send chunk offset={} n={} file_end={} fin={} (offset+n={})\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end, fin, slot.stream_offset + @as(u64, @intCast(n)) });
         }
         if (fin) {
-            std.debug.print("io: http09SendNextChunk stream_id={} creating FIN frame offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
+            dbg("io: http09SendNextChunk stream_id={} creating FIN frame offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
         }
         const sf_out = stream_frame_mod.StreamFrame{
             .stream_id = slot.stream_id,
@@ -2467,11 +2466,12 @@ pub const Server = struct {
         slot.stream_offset += @intCast(n);
         var frame_buf: [2048]u8 = undefined;
         const frame_len = sf_out.serialize(&frame_buf) catch |err| {
-            std.debug.print("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
+            dbg("io: http09 stream_id={} serialize error at offset {}: {}\n", .{ slot.stream_id, old_offset, err });
+            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.close();
             return;
         };
-        std.debug.print("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
+        dbg("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
         // Congestion control: only send if cwnd allows.
         if (!conn.cc.canSend(congestion.mss)) {
             // Rewind offset — we didn't actually send this chunk.
@@ -2496,8 +2496,9 @@ pub const Server = struct {
             // slot.active is set to false so flushPendingHttp09Responses
             // stops calling us for new chunks.
             slot.file.close();
+            if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.active = false;
-            std.debug.print("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, fin_pn });
+            dbg("io: http09 stream_id={} FIN sent (pn={}), awaiting ACK\n", .{ slot.stream_id, fin_pn });
         }
     }
 
@@ -2568,7 +2569,7 @@ pub const Server = struct {
                     if (now - slot.fin_last_sent_ms < 200) continue;
 
                     if (slot.fin_retransmit_count >= Http09OutSlot.MAX_FIN_RETRANSMITS) {
-                        std.debug.print("io: stream_id={} FIN retransmit limit reached, giving up\n", .{slot.stream_id});
+                        dbg("io: stream_id={} FIN retransmit limit reached, giving up\n", .{slot.stream_id});
                         slot.awaiting_fin_ack = false;
                         continue;
                     }
@@ -2576,7 +2577,7 @@ pub const Server = struct {
                     slot.fin_retransmit_count += 1;
                     slot.fin_last_sent_ms = now;
                     budget -= 1;
-                    std.debug.print("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, Http09OutSlot.MAX_FIN_RETRANSMITS });
+                    dbg("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, Http09OutSlot.MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
                 }
             }
@@ -2614,7 +2615,7 @@ pub const Server = struct {
         const len = frame.serialize(&buf) catch return;
         // Send before setting draining so send1Rtt does not suppress the frame.
         self.send1Rtt(conn, buf[0..len], dst);
-        std.debug.print("io: sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
+        dbg("io: sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
         conn.draining = true;
         // RFC 9000 §10.2.2: stay in draining state for at least 3×PTO.
         const pto = conn.rtt.pto_ms(25, 0);
@@ -2630,7 +2631,7 @@ pub const Server = struct {
         buf[0] = 0x10; // MAX_DATA frame type
         const enc = varint.encode(buf[1..], conn.fc_recv_max) catch return;
         self.send1Rtt(conn, buf[0 .. 1 + enc.len], dst);
-        std.debug.print("io: sent MAX_DATA new_max={}\n", .{conn.fc_recv_max});
+        dbg("io: sent MAX_DATA new_max={}\n", .{conn.fc_recv_max});
     }
 
     /// Send a MAX_STREAM_DATA frame to extend the peer's send window on one stream.
@@ -2644,7 +2645,7 @@ pub const Server = struct {
         const max_enc = varint.encode(buf[pos..], new_max) catch return;
         pos += max_enc.len;
         self.send1Rtt(conn, buf[0..pos], dst);
-        std.debug.print("io: sent MAX_STREAM_DATA stream_id={} new_max={}\n", .{ stream_id, new_max });
+        dbg("io: sent MAX_STREAM_DATA stream_id={} new_max={}\n", .{ stream_id, new_max });
     }
 
     /// Send a NEW_CONNECTION_ID frame offering a fresh alternative CID to the peer.
@@ -2673,7 +2674,7 @@ pub const Server = struct {
         @memcpy(buf[pos .. pos + 16], &conn.stateless_reset_token);
         pos += 16;
         self.send1Rtt(conn, buf[0..pos], dst);
-        std.debug.print("io: sent NEW_CONNECTION_ID seq={}\n", .{seq});
+        dbg("io: sent NEW_CONNECTION_ID seq={}\n", .{seq});
     }
 
     /// Send a MAX_STREAMS frame granting the peer additional stream budget.
@@ -2682,7 +2683,7 @@ pub const Server = struct {
         buf[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13); // MAX_STREAMS bidi/uni
         const enc = varint.encode(buf[1..], 200) catch return; // grant 200 streams
         self.send1Rtt(conn, buf[0 .. 1 + enc.len], dst);
-        std.debug.print("io: sent MAX_STREAMS bidi={} limit=200\n", .{bidi});
+        dbg("io: sent MAX_STREAMS bidi={} limit=200\n", .{bidi});
     }
 
     /// Initiate a server-side key update (RFC 9001 §6).
@@ -2699,7 +2700,7 @@ pub const Server = struct {
         // Send a PING to deliver the first packet with the new Key Phase bit.
         const padded = [_]u8{ 0x01, 0x00, 0x00 }; // PING + PADDING
         self.send1Rtt(conn, &padded, dst);
-        std.debug.print("io: server initiated key update → key_phase={}\n", .{conn.key_phase_bit});
+        dbg("io: server initiated key update → key_phase={}\n", .{conn.key_phase_bit});
     }
 
     /// Send a GOAWAY frame on the HTTP/3 control stream (stream 3).
@@ -2725,7 +2726,7 @@ pub const Server = struct {
         const frame_len = sf.serialize(&frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], dst);
         conn.h3_ctrl_stream_off += h3_len;
-        std.debug.print("io: sent GOAWAY last_stream_id={}\n", .{last_stream_id});
+        dbg("io: sent GOAWAY last_stream_id={}\n", .{last_stream_id});
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
@@ -2738,14 +2739,14 @@ pub const Server = struct {
 
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
         _ = src;
-        std.debug.print("io: handleHttp09Stream called: stream_id={} data_len={}\n", .{ sf.stream_id, sf.data.len });
+        dbg("io: handleHttp09Stream called: stream_id={} data_len={}\n", .{ sf.stream_id, sf.data.len });
         // Only unidirectional client-initiated streams carry HTTP/0.9 requests
         if (sf.stream_id % 4 != 0 and sf.stream_id % 4 != 2) {
-            std.debug.print("io: http09 stream_id={} rejected (not client-initiated, % 4 = {})\n", .{ sf.stream_id, sf.stream_id % 4 });
+            dbg("io: http09 stream_id={} rejected (not client-initiated, % 4 = {})\n", .{ sf.stream_id, sf.stream_id % 4 });
             return;
         }
         if (sf.data.len == 0) {
-            std.debug.print("io: http09 stream_id={} empty data\n", .{sf.stream_id});
+            dbg("io: http09 stream_id={} empty data\n", .{sf.stream_id});
             return;
         }
 
@@ -2759,19 +2760,19 @@ pub const Server = struct {
         var req_buf: [http09_server.max_request_len]u8 = undefined;
         @memcpy(req_buf[0..sf.data.len], sf.data);
         const req = http09_server.parseRequest(req_buf[0..sf.data.len]) catch |err| {
-            std.debug.print("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
+            dbg("io: http09 stream_id={} parse error: {} (data={})\n", .{ sf.stream_id, err, sf.data.len });
             return;
         };
-        std.debug.print("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
+        dbg("io: http09 stream_id={} parsed path={s}\n", .{ sf.stream_id, req.path });
 
         var path_buf: [512]u8 = undefined;
         const fs_path = http09_server.resolvePath(self.config.www_dir, req.path, &path_buf) catch |err| {
-            std.debug.print("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
+            dbg("io: http09 stream_id={} resolvePath error: {}\n", .{ sf.stream_id, err });
             return;
         };
 
         const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
-            std.debug.print("io: file not found: {s}\n", .{fs_path});
+            dbg("io: file not found: {s}\n", .{fs_path});
             return;
         };
         const file_end = file.getEndPos() catch {
@@ -2788,10 +2789,11 @@ pub const Server = struct {
                 .stream_offset = 0,
                 .file_end = file_end,
             };
-            std.debug.print("io: http09 stream_id={} opened (size={})\n", .{ sf.stream_id, file_end });
+            conn.http09_active_count += 1;
+            dbg("io: http09 stream_id={} opened (size={})\n", .{ sf.stream_id, file_end });
             return;
         }
-        std.debug.print("io: http/0.9 out slots full\n", .{});
+        dbg("io: http/0.9 out slots full\n", .{});
         file.close();
     }
 
@@ -2840,7 +2842,7 @@ pub const Server = struct {
                             // RFC 9204 §2.1.2: buffer the HEADERS block and retry
                             // when new encoder-stream instructions advance the table.
                             self.bufferBlockedH3Stream(conn, sf.stream_id, hf.data[0..hf.len]);
-                            std.debug.print("io: HEADERS stream_id={} blocked on QPACK table (insertion_count={})\n", .{ sf.stream_id, conn.qpack_dec_tbl.insertion_count });
+                            dbg("io: HEADERS stream_id={} blocked on QPACK table (insertion_count={})\n", .{ sf.stream_id, conn.qpack_dec_tbl.insertion_count });
                         }
                         break;
                     };
@@ -2871,7 +2873,7 @@ pub const Server = struct {
             if (slot.active and slot.stream_id == sf.stream_id) return;
         }
 
-        std.debug.print("io: http3 request stream_id={} method={s} path={s}\n", .{ sf.stream_id, method, path });
+        dbg("io: http3 request stream_id={} method={s} path={s}\n", .{ sf.stream_id, method, path });
 
         if (!std.mem.eql(u8, method, "GET")) return;
 
@@ -2921,10 +2923,11 @@ pub const Server = struct {
                 .stream_offset = headers_frame_len,
                 .file_end = file_end,
             };
-            std.debug.print("io: http3 slot registered stream_id={} size={} data_offset={}\n", .{ sf.stream_id, file_end, headers_frame_len });
+            conn.http3_active_count += 1;
+            dbg("io: http3 slot registered stream_id={} size={} data_offset={}\n", .{ sf.stream_id, file_end, headers_frame_len });
             return;
         }
-        std.debug.print("io: http3 out slots full\n", .{});
+        dbg("io: http3 out slots full\n", .{});
         file.close();
     }
 
@@ -2951,7 +2954,7 @@ pub const Server = struct {
             0x00 => {
                 // Client control stream: carries SETTINGS and possibly GOAWAY.
                 // Parse HTTP/3 frames to detect GOAWAY (RFC 9114 §5.2).
-                std.debug.print("io: h3 client control stream received ({} bytes body)\n", .{body.len});
+                dbg("io: h3 client control stream received ({} bytes body)\n", .{body.len});
                 var off: usize = 0;
                 while (off < body.len) {
                     const pr = h3_frame.parseFrame(body[off..]) catch break;
@@ -2959,7 +2962,7 @@ pub const Server = struct {
                     switch (pr.frame) {
                         .goaway => |stream_id| {
                             // Client is done sending requests — we may finish in-flight work.
-                            std.debug.print("io: h3 GOAWAY received from client stream_id={}\n", .{stream_id});
+                            dbg("io: h3 GOAWAY received from client stream_id={}\n", .{stream_id});
                             conn.draining = true;
                         },
                         else => {},
@@ -2976,12 +2979,12 @@ pub const Server = struct {
                         &conn.qpack_dec_tbl,
                         body[off..],
                     ) catch |err| {
-                        std.debug.print("io: QPACK enc stream err={} (applied {} of {} bytes)\n", .{ err, off, body.len });
+                        dbg("io: QPACK enc stream err={} (applied {} of {} bytes)\n", .{ err, off, body.len });
                         break;
                     };
                     off += consumed;
                 }
-                std.debug.print("io: QPACK dec table capacity={} count={} after enc stream\n", .{
+                dbg("io: QPACK dec table capacity={} count={} after enc stream\n", .{
                     conn.qpack_dec_tbl.capacity, conn.qpack_dec_tbl.count,
                 });
                 // RFC 9204 §2.1.2: after the table advances, retry any streams
@@ -2995,7 +2998,7 @@ pub const Server = struct {
             },
             else => {
                 // Unknown stream type — ignore per RFC 9114 §6.2.
-                std.debug.print("io: unknown h3 uni stream type=0x{x} (ignored)\n", .{stream_type});
+                dbg("io: unknown h3 uni stream type=0x{x} (ignored)\n", .{stream_type});
             },
         }
     }
@@ -3020,7 +3023,7 @@ pub const Server = struct {
             slot.header_block_len = copy_len;
             return;
         }
-        std.debug.print("io: QPACK blocked stream buffer full — dropping stream_id={}\n", .{stream_id});
+        dbg("io: QPACK blocked stream buffer full — dropping stream_id={}\n", .{stream_id});
     }
 
     /// After the QPACK decoder table has been advanced by new encoder-stream
@@ -3039,7 +3042,7 @@ pub const Server = struct {
             ) catch |err| {
                 if (err == error.BlockedStream) continue; // still blocked
                 // Other decode error — discard.
-                std.debug.print("io: QPACK blocked retry err={} stream_id={} — discarding\n", .{ err, slot.stream_id });
+                dbg("io: QPACK blocked retry err={} stream_id={} — discarding\n", .{ err, slot.stream_id });
                 slot.active = false;
                 continue;
             };
@@ -3048,7 +3051,7 @@ pub const Server = struct {
             const stream_id = slot.stream_id;
             const has_dyn = h3_qpack.headerBlockHasDynamicRefs(slot.header_block[0..slot.header_block_len]);
             slot.active = false;
-            std.debug.print("io: QPACK unblocked stream_id={}\n", .{stream_id});
+            dbg("io: QPACK unblocked stream_id={}\n", .{stream_id});
 
             // Send Section Ack if the block had dynamic references.
             if (has_dyn) self.sendQpackDecoderInstruction(conn, stream_id, src);
@@ -3069,7 +3072,7 @@ pub const Server = struct {
                     path = path_buf[0..pl];
                 }
             }
-            std.debug.print("io: http3 unblocked request stream_id={} method={s} path={s}\n", .{ stream_id, method, path });
+            dbg("io: http3 unblocked request stream_id={} method={s} path={s}\n", .{ stream_id, method, path });
 
             if (!std.mem.eql(u8, method, "GET")) continue;
 
@@ -3198,7 +3201,7 @@ pub const Server = struct {
         const frame_len = sf.serialize(&frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], src);
         conn.qpack_dec_stream_off += pos;
-        std.debug.print("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
+        dbg("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
     }
 
     /// Send a new Insert instruction on the QPACK encoder stream (stream 7).
@@ -3228,7 +3231,7 @@ pub const Server = struct {
         self.send1Rtt(conn, frame_buf[0..frame_len], src);
         conn.qpack_enc_tbl.insert(name, value) catch {};
         conn.qpack_enc_stream_off += ins_len;
-        std.debug.print("io: QPACK encoder insert name={s} value={s}\n", .{ name, value });
+        dbg("io: QPACK encoder insert name={s} value={s}\n", .{ name, value });
     }
 
     fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: std.net.Address) void {
@@ -3289,7 +3292,8 @@ pub const Server = struct {
         const CHUNK: usize = 900;
         var file_buf: [CHUNK]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
-            std.debug.print("io: http3 stream_id={} read error: {}\n", .{ slot.stream_id, err });
+            dbg("io: http3 stream_id={} read error: {}\n", .{ slot.stream_id, err });
+            if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.close();
             return;
         };
@@ -3315,13 +3319,13 @@ pub const Server = struct {
                     if (tf_len > 0) {
                         self.sendStreamDataH3(conn, slot.stream_id, slot.stream_offset, trailer_frame[0..tf_len], false, conn.peer);
                         slot.stream_offset += tf_len;
-                        std.debug.print("io: http3 stream_id={} trailing HEADERS sent\n", .{slot.stream_id});
+                        dbg("io: http3 stream_id={} trailing HEADERS sent\n", .{slot.stream_id});
                     }
                 }
             }
 
             // Send a zero-length STREAM frame with FIN to close the stream.
-            std.debug.print("io: http3 stream_id={} EOF offset={}\n", .{ slot.stream_id, slot.stream_offset });
+            dbg("io: http3 stream_id={} EOF offset={}\n", .{ slot.stream_id, slot.stream_offset });
             const sf_fin = stream_frame_mod.StreamFrame{
                 .stream_id = slot.stream_id,
                 .offset = slot.stream_offset,
@@ -3331,6 +3335,7 @@ pub const Server = struct {
             };
             var fin_buf: [64]u8 = undefined;
             const fin_len = sf_fin.serialize(&fin_buf) catch {
+                if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
                 slot.close();
                 return;
             };
@@ -3343,14 +3348,16 @@ pub const Server = struct {
             slot.fin_retransmit_count = 0;
             slot.awaiting_fin_ack = true;
             slot.file.close();
+            if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.active = false;
-            std.debug.print("io: http3 stream_id={} FIN sent (pn={})\n", .{ slot.stream_id, fin_pn });
+            dbg("io: http3 stream_id={} FIN sent (pn={})\n", .{ slot.stream_id, fin_pn });
             return;
         }
 
         // Wrap the chunk in an HTTP/3 DATA frame.
         var data_out: [CHUNK + 10]u8 = undefined;
         const data_frame_len = h3_frame.writeFrame(&data_out, @intFromEnum(h3_frame.FrameType.data), file_buf[0..n]) catch {
+            if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.close();
             return;
         };
@@ -3367,6 +3374,7 @@ pub const Server = struct {
         };
         var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const frame_len = sf_out.serialize(&frame_buf) catch {
+            if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.close();
             return;
         };
@@ -3374,7 +3382,7 @@ pub const Server = struct {
         slot.stream_offset += @intCast(data_frame_len);
 
         if (slot.stream_offset % 10000 < CHUNK + 10) {
-            std.debug.print("io: http3 stream_id={} chunk offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
+            dbg("io: http3 stream_id={} chunk offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
         }
     }
 
@@ -3412,14 +3420,14 @@ pub const Server = struct {
                     if (now - slot.fin_last_sent_ms < 200) continue;
 
                     if (slot.fin_retransmit_count >= Http3OutSlot.MAX_FIN_RETRANSMITS) {
-                        std.debug.print("io: http3 stream_id={} FIN retransmit limit reached\n", .{slot.stream_id});
+                        dbg("io: http3 stream_id={} FIN retransmit limit reached\n", .{slot.stream_id});
                         slot.awaiting_fin_ack = false;
                         continue;
                     }
 
                     slot.fin_retransmit_count += 1;
                     slot.fin_last_sent_ms = now;
-                    std.debug.print("io: http3 retransmit FIN stream_id={} attempt {}/{}\n", .{ slot.stream_id, slot.fin_retransmit_count, Http3OutSlot.MAX_FIN_RETRANSMITS });
+                    dbg("io: http3 retransmit FIN stream_id={} attempt {}/{}\n", .{ slot.stream_id, slot.fin_retransmit_count, Http3OutSlot.MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
                 }
             }
@@ -3579,19 +3587,19 @@ pub const Client = struct {
         const server_addr = std.net.Address.parseIp4(self.config.host, self.config.port) catch
             try resolveAddress(self.allocator, self.config.host, self.config.port);
         self.conn.peer = server_addr;
-        std.debug.print("io: client resolved {s} to {any}\n", .{ self.config.host, server_addr });
+        dbg("io: client resolved {s} to {any}\n", .{ self.config.host, server_addr });
 
         if ((self.config.resumption or self.config.early_data) and self.config.urls.len > 0) {
             // ── Connection 1: download the first URL, get a session ticket ──
             const split = @min(1, self.config.urls.len);
             self.active_urls = self.config.urls[0..split];
-            std.debug.print("io: conn-1: downloading {} URL(s)\n", .{split});
+            dbg("io: conn-1: downloading {} URL(s)\n", .{split});
             try self.runEventLoop(server_addr);
 
             // Wait a short while for the server to send NewSessionTicket.
             // RFC 8446 §4.6.1: the server sends the ticket after the handshake.
             if (self.ticket_store.isEmpty()) {
-                std.debug.print("io: waiting up to 2s for session ticket...\n", .{});
+                dbg("io: waiting up to 2s for session ticket...\n", .{});
                 const ticket_deadline = std.time.milliTimestamp() + 2_000;
                 var recv_buf2: [MAX_DATAGRAM_SIZE]u8 = undefined;
                 while (std.time.milliTimestamp() < ticket_deadline and self.ticket_store.isEmpty()) {
@@ -3605,13 +3613,13 @@ pub const Client = struct {
                     }
                 }
             }
-            std.debug.print("io: ticket_store empty={}\n", .{self.ticket_store.isEmpty()});
+            dbg("io: ticket_store empty={}\n", .{self.ticket_store.isEmpty()});
 
             // ── Connection 2: reconnect using PSK (+ 0-RTT if early_data) ──
             const rest_urls = self.config.urls[split..];
             try self.resetForReconnect(server_addr);
             self.active_urls = if (rest_urls.len > 0) rest_urls else self.config.urls;
-            std.debug.print("io: conn-2: downloading {} URL(s) with PSK{s}\n", .{
+            dbg("io: conn-2: downloading {} URL(s) with PSK{s}\n", .{
                 self.active_urls.len,
                 if (self.config.early_data) " + 0-RTT" else "",
             });
@@ -3688,7 +3696,7 @@ pub const Client = struct {
             const now = std.time.milliTimestamp();
             const remaining = deadline - now;
             if (remaining < 0) {
-                std.debug.print("io: client deadline exceeded, {} ms remaining\n", .{remaining});
+                dbg("io: client deadline exceeded, {} ms remaining\n", .{remaining});
                 break;
             }
 
@@ -3701,7 +3709,7 @@ pub const Client = struct {
             const poll_timeout: i32 = @intCast(@min(100, @max(0, remaining)));
             const ready = std.posix.poll(&fds, poll_timeout) catch 0;
             if (ready > 0) {
-                std.debug.print("io: client poll ready={} revents=0x{x}\n", .{ ready, fds[0].revents });
+                dbg("io: client poll ready={} revents=0x{x}\n", .{ ready, fds[0].revents });
             }
 
             // Retransmit any unacknowledged packets (RFC 9002 §6.2).
@@ -3773,9 +3781,9 @@ pub const Client = struct {
                 }
             }
             if (has_fin_type) {
-                std.debug.print("io: client RECEIVED POSSIBLE FIN PACKET {} bytes\n", .{n});
+                dbg("io: client RECEIVED POSSIBLE FIN PACKET {} bytes\n", .{n});
             } else {
-                std.debug.print("io: client recv {} bytes (no FIN type)\n", .{n});
+                dbg("io: client recv {} bytes (no FIN type)\n", .{n});
             }
             self.processPacket(recv_buf[0..n]);
 
@@ -3800,7 +3808,7 @@ pub const Client = struct {
 
             // Wait until all streams complete
             if (self.conn.phase == .connected and self.streams_done >= self.active_urls.len) {
-                std.debug.print("io: client all streams done\n", .{});
+                dbg("io: client all streams done\n", .{});
                 break;
             }
 
@@ -3808,11 +3816,11 @@ pub const Client = struct {
         }
 
         if (self.conn.phase != .connected) {
-            std.debug.print("io: client handshake timed out\n", .{});
+            dbg("io: client handshake timed out\n", .{});
             return error.HandshakeTimeout;
         }
 
-        std.debug.print("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.active_urls.len });
+        dbg("io: client done - phase={any} streams_done={}/{}\n", .{ self.conn.phase, self.streams_done, self.active_urls.len });
     }
 
     fn sendClientHello(self: *Client, server: std.net.Address) !void {
@@ -3857,7 +3865,7 @@ pub const Client = struct {
                         .obfuscated_age = ticket.ageMs(now_ms),
                         .psk = psk_bytes,
                     };
-                    std.debug.print("io: client building ClientHello with PSK + early_data (ticket_len={})\n", .{ticket.ticket_len});
+                    dbg("io: client building ClientHello with PSK + early_data (ticket_len={})\n", .{ticket.ticket_len});
                     const result = try self.tls.buildClientHelloMsgWithPskAndEarlyData(
                         &self.client_hello_bytes,
                         quic_tp,
@@ -3878,10 +3886,10 @@ pub const Client = struct {
                         .hp = early_keys.hp,
                         .hp32 = .{0} ** 32,
                     };
-                    std.debug.print("io: client derived 0-RTT early keys\n", .{});
+                    dbg("io: client derived 0-RTT early keys\n", .{});
                     break :ed_blk result.n;
                 } else {
-                    std.debug.print("io: early_data enabled but no valid ticket — full handshake\n", .{});
+                    dbg("io: early_data enabled but no valid ticket — full handshake\n", .{});
                     break :ed_blk if (self.config.chacha20)
                         try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
                     else
@@ -3897,7 +3905,7 @@ pub const Client = struct {
                         .obfuscated_age = ticket.ageMs(now_ms),
                         .psk = psk_bytes,
                     };
-                    std.debug.print("io: client building ClientHello with PSK (ticket_len={})\n", .{ticket.ticket_len});
+                    dbg("io: client building ClientHello with PSK (ticket_len={})\n", .{ticket.ticket_len});
                     break :psk_blk try self.tls.buildClientHelloMsgWithPsk(
                         &self.client_hello_bytes,
                         quic_tp,
@@ -3906,7 +3914,7 @@ pub const Client = struct {
                         psk_info,
                     );
                 } else {
-                    std.debug.print("io: resumption enabled but no valid ticket — full handshake\n", .{});
+                    dbg("io: resumption enabled but no valid ticket — full handshake\n", .{});
                     break :psk_blk if (self.config.chacha20)
                         try self.tls.buildClientHelloMsgChaCha20(&self.client_hello_bytes, quic_tp, alpn, self.config.host)
                     else
@@ -3954,7 +3962,7 @@ pub const Client = struct {
         // satisfying the interop-runner's "0-RTT size ≥ 1-RTT size" check.
         if (self.early_km != null and self.zerortt_count == 0) {
             self.send0RttRequests(server) catch |err| {
-                std.debug.print("io: 0-RTT send failed: {}\n", .{err});
+                dbg("io: 0-RTT send failed: {}\n", .{err});
             };
         }
     }
@@ -3978,7 +3986,7 @@ pub const Client = struct {
         const start = self.zerortt_count;
         const limit = @min(start + MAX_ZERORTT_BATCH, self.active_urls.len);
         if (start >= limit) return; // nothing left to send
-        std.debug.print("io: client sending 0-RTT batch [{}-{}) of {} total\n", .{ start, limit, self.active_urls.len });
+        dbg("io: client sending 0-RTT batch [{}-{}) of {} total\n", .{ start, limit, self.active_urls.len });
 
         std.fs.makeDirAbsolute(self.config.output_dir) catch {};
 
@@ -4000,7 +4008,7 @@ pub const Client = struct {
             var dl_path_buf: [512]u8 = undefined;
             const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
             const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
-                std.debug.print("io: 0-RTT cannot create {s}\n", .{dl_path});
+                dbg("io: 0-RTT cannot create {s}\n", .{dl_path});
                 continue;
             };
 
@@ -4044,10 +4052,10 @@ pub const Client = struct {
             ) catch continue;
             self.zerortt_pn += 1;
             _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
-            std.debug.print("io: 0-RTT GET {s} stream_id={}\n", .{ path, stream_id });
+            dbg("io: 0-RTT GET {s} stream_id={}\n", .{ path, stream_id });
             self.zerortt_count = i + 1;
         }
-        std.debug.print("io: 0-RTT sent {} total, {} remaining\n", .{
+        dbg("io: 0-RTT sent {} total, {} remaining\n", .{
             self.zerortt_count,
             self.active_urls.len - self.zerortt_count,
         });
@@ -4074,11 +4082,11 @@ pub const Client = struct {
 
         // Verify Retry integrity tag (odcid = our original DCID)
         if (!retry_mod.verifyIntegrityTag(self.conn.remote_cid.slice(), buf)) {
-            std.debug.print("io: Retry integrity tag invalid\n", .{});
+            dbg("io: Retry integrity tag invalid\n", .{});
             return;
         }
 
-        std.debug.print("io: received Retry, re-sending Initial with token\n", .{});
+        dbg("io: received Retry, re-sending Initial with token\n", .{});
 
         // Store the token for the next Initial
         const tlen = @min(rp.token.len, self.conn.retry_token.len);
@@ -4151,7 +4159,7 @@ pub const Client = struct {
                         self.conn.use_v2 = true;
                         self.conn.init_keys = v2km;
                         self.conn.v2_upgrade_keys = null;
-                        std.debug.print("io: client upgraded to QUIC v2 (compatible version negotiation)\n", .{});
+                        dbg("io: client upgraded to QUIC v2 (compatible version negotiation)\n", .{});
                         break :blk pt;
                     } else |_| {}
                 }
@@ -4203,7 +4211,7 @@ pub const Client = struct {
             const cdata = plaintext[pos .. pos + dlen];
             if (cdata.len >= 4 and cdata[0] == tls_hs.MSG_SERVER_HELLO) {
                 self.tls.processServerHello(cdata) catch |err| {
-                    std.debug.print("io: processServerHello failed: {}\n", .{err});
+                    dbg("io: processServerHello failed: {}\n", .{err});
                     return;
                 };
                 // Now we have handshake secrets — derive QUIC keys
@@ -4269,7 +4277,7 @@ pub const Client = struct {
             var fin_buf: [128]u8 = undefined;
             const fin_len = self.tls.processServerFlight(cdata, &fin_buf) catch |err| {
                 if (err != error.NoServerFinished) {
-                    std.debug.print("io: processServerFlight error: {}\n", .{err});
+                    dbg("io: processServerFlight error: {}\n", .{err});
                 }
                 fpos += dlen;
                 continue;
@@ -4313,7 +4321,7 @@ pub const Client = struct {
 
     fn process1RttPacket(self: *Client, buf: []const u8) void {
         if (buf.len == 834) {
-            std.debug.print("io: client process1RttPacket 834-byte packet starting\n", .{});
+            dbg("io: client process1RttPacket 834-byte packet starting\n", .{});
         }
         if (!self.conn.has_app_keys) return;
         const cid_len = self.conn.local_cid.len;
@@ -4327,13 +4335,13 @@ pub const Client = struct {
         // remove HP first before reading it (RFC 9001 §5.4.1).
         const unprotected_first = peekUnprotectedFirstByte(buf, pn_start, &self.conn.app_server_km, self.conn.use_chacha20) orelse {
             if (buf.len == 834) {
-                std.debug.print("io: client 834-byte packet FAILED peekUnprotectedFirstByte!\n", .{});
+                dbg("io: client 834-byte packet FAILED peekUnprotectedFirstByte!\n", .{});
             }
             return;
         };
         const incoming_phase = (unprotected_first & 0x04) != 0;
         if (buf.len == 834) {
-            std.debug.print("io: client 834-byte packet key phase: incoming={} current_peer={}\n", .{ incoming_phase, self.conn.peer_key_phase });
+            dbg("io: client 834-byte packet key phase: incoming={} current_peer={}\n", .{ incoming_phase, self.conn.peer_key_phase });
         }
         if (incoming_phase != self.conn.peer_key_phase) {
             // Server's key phase changed — rotate our receive keys to match.
@@ -4342,7 +4350,7 @@ pub const Client = struct {
             //   2. Server confirming our client-initiated key update
             //      (key_update_pending=true): also rotate and clear the flag.
             if (buf.len == 834) {
-                std.debug.print("io: client 834-byte packet rotating to next key generation\n", .{});
+                dbg("io: client 834-byte packet rotating to next key generation\n", .{});
             }
             self.conn.app_server_km = if (self.conn.use_v2)
                 self.conn.app_server_km.nextGenV2()
@@ -4362,7 +4370,7 @@ pub const Client = struct {
             self.conn.app_recv_pn,
         ) catch |err| {
             if (buf.len == 834) {
-                std.debug.print("io: client FAILED TO DECRYPT 834-byte FIN packet! error={} expected_pn={?}\n", .{ err, self.conn.app_recv_pn });
+                dbg("io: client FAILED TO DECRYPT 834-byte FIN packet! error={} expected_pn={?}\n", .{ err, self.conn.app_recv_pn });
             }
             return;
         };
@@ -4373,7 +4381,7 @@ pub const Client = struct {
         if (decompressed_pn > (self.conn.app_recv_pn orelse 0)) {
             self.conn.app_recv_pn = decompressed_pn;
             if (buf.len == 834) {
-                std.debug.print("io: client 834-byte packet updated app_recv_pn to {}\n", .{decompressed_pn});
+                dbg("io: client 834-byte packet updated app_recv_pn to {}\n", .{decompressed_pn});
             }
         }
         self.conn.qlog.packetReceived(.one_rtt, decompressed_pn, buf.len);
@@ -4399,7 +4407,7 @@ pub const Client = struct {
                 continue;
             }
             if (ft == 0x1e) { // HANDSHAKE_DONE
-                std.debug.print("io: client received HANDSHAKE_DONE\n", .{});
+                dbg("io: client received HANDSHAKE_DONE\n", .{});
                 self.conn.phase = .connected;
                 if (self.config.keylog_path) |kpath| {
                     writeKeylog(kpath, self.tls.client_random, &self.tls.secrets);
@@ -4437,7 +4445,7 @@ pub const Client = struct {
                 if (self.conn.path_challenge_data) |expected| {
                     if (std.mem.eql(u8, &pr.frame.data, &expected)) {
                         self.conn.path_challenge_data = null;
-                        std.debug.print("io: client path validated\n", .{});
+                        dbg("io: client path validated\n", .{});
                     }
                 }
                 continue;
@@ -4448,7 +4456,7 @@ pub const Client = struct {
                 pos += v.len;
                 if (v.value > self.conn.fc_send_max) {
                     self.conn.fc_send_max = v.value;
-                    std.debug.print("io: client MAX_DATA updated send_max={}\n", .{self.conn.fc_send_max});
+                    dbg("io: client MAX_DATA updated send_max={}\n", .{self.conn.fc_send_max});
                 }
                 continue;
             }
@@ -4481,7 +4489,7 @@ pub const Client = struct {
                 // RESET_STREAM — server cancelled a stream.
                 const r = transport_frames.ResetStream.parse(plaintext[pos..pt_len]) catch return;
                 pos += r.consumed;
-                std.debug.print("io: client RESET_STREAM stream_id={} code={}\n", .{
+                dbg("io: client RESET_STREAM stream_id={} code={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code,
                 });
                 continue;
@@ -4490,7 +4498,7 @@ pub const Client = struct {
                 // STOP_SENDING — server asked us to stop sending on a stream.
                 const r = transport_frames.StopSending.parse(plaintext[pos..pt_len]) catch return;
                 pos += r.consumed;
-                std.debug.print("io: client STOP_SENDING stream_id={} code={}\n", .{
+                dbg("io: client STOP_SENDING stream_id={} code={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code,
                 });
                 continue;
@@ -4499,7 +4507,7 @@ pub const Client = struct {
                 // CONNECTION_CLOSE — server is closing the connection.
                 const r = transport_frames.ConnectionClose.parse(plaintext[pos..pt_len], ft == 0x1d) catch return;
                 pos += r.consumed;
-                std.debug.print("io: client CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
+                dbg("io: client CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
                 self.conn.draining = true;
                 continue;
             }
@@ -4523,7 +4531,7 @@ pub const Client = struct {
                 pos += 16;
                 if (seq_r.value == 1) {
                     self.conn.next_remote_cid = new_cid;
-                    std.debug.print("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
+                    dbg("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
                 }
                 continue;
             }
@@ -4531,7 +4539,7 @@ pub const Client = struct {
                 // RETIRE_CONNECTION_ID — server retires one of our CIDs.
                 const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += seq_r.len;
-                std.debug.print("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
+                dbg("io: client RETIRE_CONNECTION_ID seq={}\n", .{seq_r.value});
                 continue;
             }
             if (ft == 0x16 or ft == 0x17) {
@@ -4542,13 +4550,13 @@ pub const Client = struct {
             }
             if (ft >= 0x08 and ft <= 0x0f) {
                 // STREAM frame — write data to download file
-                std.debug.print("io: client received STREAM frame type=0x{x:0>2} fin_bit={}\n", .{ ft, (ft & 0x01) != 0 });
+                dbg("io: client received STREAM frame type=0x{x:0>2} fin_bit={}\n", .{ ft, (ft & 0x01) != 0 });
                 const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[pos..pt_len], ft) catch |err| {
-                    std.debug.print("io: client STREAM parse error: {}\n", .{err});
+                    dbg("io: client STREAM parse error: {}\n", .{err});
                     return;
                 };
                 pos += sf_r.consumed;
-                std.debug.print("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
+                dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
                 self.handleStreamResponse(&sf_r.frame);
                 continue;
             }
@@ -4604,7 +4612,7 @@ pub const Client = struct {
             &self.conn.peer.any,
             self.conn.peer.getOsSockLen(),
         ) catch {};
-        std.debug.print("io: client flushed deferred ACK largest_pn={}\n", .{largest_pn});
+        dbg("io: client flushed deferred ACK largest_pn={}\n", .{largest_pn});
     }
 
     fn handleAppCrypto(self: *Client, data: []const u8) void {
@@ -4654,7 +4662,7 @@ pub const Client = struct {
             .received_at_ms = @intCast(std.time.milliTimestamp()),
         };
         self.ticket_store.store(ticket);
-        std.debug.print("io: stored session ticket (lifetime={}s)\n", .{lifetime_s});
+        dbg("io: stored session ticket (lifetime={}s)\n", .{lifetime_s});
     }
 
     /// Respond to a server-sent PATH_CHALLENGE with a matching PATH_RESPONSE.
@@ -4689,7 +4697,7 @@ pub const Client = struct {
         ) catch return;
         self.conn.app_pn += 1;
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
-        std.debug.print("io: client initiated key update → key_phase={}\n", .{self.conn.key_phase_bit});
+        dbg("io: client initiated key update → key_phase={}\n", .{self.conn.key_phase_bit});
     }
 
     fn sendClientPathResponse(self: *Client, data: [8]u8) void {
@@ -4710,7 +4718,7 @@ pub const Client = struct {
     }
 
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
-        std.debug.print("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
+        dbg("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
 
         // Server-initiated unidirectional streams (stream_id % 4 == 3):
         //   id=3  → server control stream (SETTINGS, GOAWAY, …)
@@ -4729,7 +4737,7 @@ pub const Client = struct {
                     ) catch break;
                     off += consumed;
                 }
-                std.debug.print("io: client QPACK dec table capacity={} count={}\n", .{
+                dbg("io: client QPACK dec table capacity={} count={}\n", .{
                     self.conn.qpack_dec_tbl.capacity, self.conn.qpack_dec_tbl.count,
                 });
             } else if (stream_type_byte == 0x00) {
@@ -4742,7 +4750,7 @@ pub const Client = struct {
                     switch (pr.frame) {
                         .goaway => |stream_id| {
                             // Server is done processing new requests past this ID.
-                            std.debug.print("io: GOAWAY received from server last_stream_id={}\n", .{stream_id});
+                            dbg("io: GOAWAY received from server last_stream_id={}\n", .{stream_id});
                             self.conn.draining = true;
                         },
                         else => {},
@@ -4757,7 +4765,7 @@ pub const Client = struct {
                 if (self.config.http3) {
                     self.handleH3StreamData(s, sf);
                 } else {
-                    std.debug.print("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
+                    dbg("io: found matching stream {}, writing {} bytes\n", .{ sf.stream_id, sf.data.len });
                     // Write at the exact stream offset so retransmitted or
                     // out-of-order STREAM frames (possible after a NAT rebind
                     // triggers server-side retransmit) land at the right place.
@@ -4767,13 +4775,13 @@ pub const Client = struct {
                         s.file.close();
                         s.active = false;
                         self.streams_done += 1;
-                        std.debug.print("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.active_urls.len });
+                        dbg("io: stream {} download complete (total: {}/{})\n", .{ sf.stream_id, self.streams_done, self.active_urls.len });
                     }
                 }
                 return;
             }
         }
-        std.debug.print("io: client stream {} not found (fin={})\n", .{ sf.stream_id, sf.fin });
+        dbg("io: client stream {} not found (fin={})\n", .{ sf.stream_id, sf.fin });
     }
 
     /// Parse HTTP/3 frames from incoming STREAM data for one download slot.
@@ -4816,11 +4824,11 @@ pub const Client = struct {
                     if (h3_qpack.headerBlockHasDynamicRefs(hf.data[0..hf.len])) {
                         self.sendQpackDecoderInstruction(s.stream_id);
                     }
-                    std.debug.print("io: h3 stream_id={} HEADERS frame parsed\n", .{s.stream_id});
+                    dbg("io: h3 stream_id={} HEADERS frame parsed\n", .{s.stream_id});
                 },
                 .data => |d| {
                     _ = s.file.write(d) catch {};
-                    std.debug.print("io: h3 stream_id={} DATA {} bytes written\n", .{ s.stream_id, d.len });
+                    dbg("io: h3 stream_id={} DATA {} bytes written\n", .{ s.stream_id, d.len });
                 },
                 else => {},
             }
@@ -4830,7 +4838,7 @@ pub const Client = struct {
             s.file.close();
             s.active = false;
             self.streams_done += 1;
-            std.debug.print("io: h3 stream {} download complete ({}/{})\n", .{ s.stream_id, self.streams_done, self.active_urls.len });
+            dbg("io: h3 stream {} download complete ({}/{})\n", .{ s.stream_id, self.streams_done, self.active_urls.len });
         }
     }
 
@@ -4842,7 +4850,7 @@ pub const Client = struct {
     /// arrive at our new socket (RFC 9000 §9.2).
     fn rebindMigrateSocket(self: *Client, server: std.net.Address) void {
         const new_sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch |err| {
-            std.debug.print("io: migrate: new socket failed: {}\n", .{err});
+            dbg("io: migrate: new socket failed: {}\n", .{err});
             return;
         };
         var sk_buf: i32 = 8 * 1024 * 1024;
@@ -4870,7 +4878,7 @@ pub const Client = struct {
             self.conn.key_phase_bit,
             self.conn.use_chacha20,
         ) catch |err| {
-            std.debug.print("io: migrate: PING build failed: {}\n", .{err});
+            dbg("io: migrate: PING build failed: {}\n", .{err});
             return;
         };
         self.conn.app_pn += 1;
@@ -4880,10 +4888,10 @@ pub const Client = struct {
             self.conn.remote_cid = migration_dcid;
         }
         _ = std.posix.sendto(new_sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch |err| {
-            std.debug.print("io: migrate: PING send failed: {}\n", .{err});
+            dbg("io: migrate: PING send failed: {}\n", .{err});
             return;
         };
-        std.debug.print("io: migrate: rebound to new socket, PING sent to trigger PATH_CHALLENGE\n", .{});
+        dbg("io: migrate: rebound to new socket, PING sent to trigger PATH_CHALLENGE\n", .{});
     }
 
     /// Send the HTTP/3 client control stream (stream_id=2, client-initiated unidirectional)
@@ -4922,7 +4930,7 @@ pub const Client = struct {
         ) catch return;
         self.conn.app_pn += 1;
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
-        std.debug.print("io: h3 client control stream sent\n", .{});
+        dbg("io: h3 client control stream sent\n", .{});
 
         // QPACK encoder stream (stream_id=6, next client-initiated unidirectional).
         // Stream type 0x02 + Set Capacity + Insert commonly-used request headers
@@ -4970,7 +4978,7 @@ pub const Client = struct {
         ) catch return;
         self.conn.app_pn += 1;
         _ = std.posix.sendto(self.sock, enc_send_buf[0..enc_pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
-        std.debug.print("io: h3 client QPACK encoder stream sent\n", .{});
+        dbg("io: h3 client QPACK encoder stream sent\n", .{});
     }
 
     /// Send a Section Acknowledgement for `request_stream_id` on the client's
@@ -5010,11 +5018,11 @@ pub const Client = struct {
         self.conn.app_pn += 1;
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
         self.conn.qpack_dec_stream_off += pos;
-        std.debug.print("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
+        dbg("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
     }
 
     fn downloadUrls(self: *Client, server: std.net.Address) !void {
-        std.debug.print("io: sending {} {s} requests\n", .{ self.active_urls.len, if (self.config.http3) @as([]const u8, "HTTP/3") else @as([]const u8, "HTTP/0.9") });
+        dbg("io: sending {} {s} requests\n", .{ self.active_urls.len, if (self.config.http3) @as([]const u8, "HTTP/3") else @as([]const u8, "HTTP/0.9") });
 
         // Ensure output directory exists
         std.fs.makeDirAbsolute(self.config.output_dir) catch {};
@@ -5036,7 +5044,7 @@ pub const Client = struct {
             const batch_end = @min(batch_start + BATCH_SIZE, self.active_urls.len);
             const batch = self.active_urls[batch_start..batch_end];
 
-            std.debug.print("io: downloadUrls batch [{}-{}) of {}\n", .{ batch_start, batch_end, self.active_urls.len });
+            dbg("io: downloadUrls batch [{}-{}) of {}\n", .{ batch_start, batch_end, self.active_urls.len });
 
             // Send requests for this batch. Use global index for stream_id so each
             // stream has a unique, non-overlapping ID across batches.
@@ -5060,17 +5068,17 @@ pub const Client = struct {
                 // would create duplicate slots.  The responses will arrive independently
                 // (either during the handshake phase or via server FIN retransmits).
                 if (global_i < self.zerortt_count) {
-                    std.debug.print("io: stream {} ({s}) already sent as 0-RTT, skipping\n", .{ stream_id, path });
+                    dbg("io: stream {} ({s}) already sent as 0-RTT, skipping\n", .{ stream_id, path });
                     continue;
                 }
 
-                std.debug.print("io: downloadUrl[{}] path={s} stream_id={}\n", .{ global_i, path, stream_id });
+                dbg("io: downloadUrl[{}] path={s} stream_id={}\n", .{ global_i, path, stream_id });
 
                 // Open output file
                 var dl_path_buf: [512]u8 = undefined;
                 const dl_path = http09_client.downloadPath(self.config.output_dir, path, &dl_path_buf) catch continue;
                 const out_file = std.fs.createFileAbsolute(dl_path, .{}) catch {
-                    std.debug.print("io: cannot create {s}\n", .{dl_path});
+                    dbg("io: cannot create {s}\n", .{dl_path});
                     continue;
                 };
 
@@ -5079,14 +5087,14 @@ pub const Client = struct {
                 for (&self.streams) |*s| {
                     if (!s.active) {
                         s.* = .{ .stream_id = stream_id, .file = out_file, .active = true };
-                        std.debug.print("io: registered stream {} for download\n", .{stream_id});
+                        dbg("io: registered stream {} for download\n", .{stream_id});
                         registered = true;
                         break;
                     }
                 }
                 if (!registered) {
                     out_file.close();
-                    std.debug.print("io: streams array full\n", .{});
+                    dbg("io: streams array full\n", .{});
                     continue;
                 }
 
@@ -5115,7 +5123,7 @@ pub const Client = struct {
                         .has_length = true,
                     };
                     frame_len = sf.serialize(&frame_buf) catch continue;
-                    std.debug.print("io: h3 GET {s} stream_id={}\n", .{ path, stream_id });
+                    dbg("io: h3 GET {s} stream_id={}\n", .{ path, stream_id });
                 } else {
                     // HTTP/0.9: send a raw "GET /path\r\n" request.
                     var req_buf: [4096]u8 = undefined;
@@ -5147,7 +5155,7 @@ pub const Client = struct {
 
             // Wait for all downloads in this batch to complete.
             const batch_target = batch_end;
-            std.debug.print("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
+            dbg("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
             var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
             const dl_deadline = std.time.milliTimestamp() + 60_000;
             var dl_iter: u32 = 0;
@@ -5157,15 +5165,15 @@ pub const Client = struct {
                 const remaining = dl_deadline - now;
 
                 if (remaining <= 0) {
-                    std.debug.print("io: downloadUrls DEADLINE EXCEEDED batch_target={} streams_done={}\n", .{ batch_target, self.streams_done });
+                    dbg("io: downloadUrls DEADLINE EXCEEDED batch_target={} streams_done={}\n", .{ batch_target, self.streams_done });
                     break;
                 }
 
                 if (dl_iter % 100 == 0) {
-                    std.debug.print("io: downloadUrls iteration {} streams_done={}/{} remaining={}ms\n", .{ dl_iter, self.streams_done, batch_target, remaining });
+                    dbg("io: downloadUrls iteration {} streams_done={}/{} remaining={}ms\n", .{ dl_iter, self.streams_done, batch_target, remaining });
                 }
                 if (self.streams_done >= batch_target) {
-                    std.debug.print("io: downloadUrls batch done streams_done={}\n", .{self.streams_done});
+                    dbg("io: downloadUrls batch done streams_done={}\n", .{self.streams_done});
                     break;
                 }
 
@@ -5198,16 +5206,16 @@ pub const Client = struct {
                         )) |pkt_len| {
                             self.conn.app_pn += 1;
                             _ = std.posix.sendto(self.sock, ping_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
-                            std.debug.print("io: downloadUrls sent keepalive PING (streams_done={}/{})\n", .{ self.streams_done, self.active_urls.len });
+                            dbg("io: downloadUrls sent keepalive PING (streams_done={}/{})\n", .{ self.streams_done, self.active_urls.len });
                         } else |err| {
-                            std.debug.print("io: downloadUrls PING build failed: {}\n", .{err});
+                            dbg("io: downloadUrls PING build failed: {}\n", .{err});
                         }
                     }
                     continue;
                 }
                 if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
-                std.debug.print("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
+                dbg("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
                 var drained: usize = 0;
                 while (true) {
                     var src_addr: std.posix.sockaddr.storage = undefined;
@@ -5215,11 +5223,11 @@ pub const Client = struct {
                     const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
                     const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
                         if (drained > 0 and err == error.WouldBlock) break;
-                        std.debug.print("io: downloadUrls recvfrom error: {}\n", .{err});
+                        dbg("io: downloadUrls recvfrom error: {}\n", .{err});
                         break;
                     };
                     drained += 1;
-                    std.debug.print("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
+                    dbg("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
                     self.processPacket(recv_buf[0..n]);
                 }
                 // Send one cumulative ACK after draining all pending packets.
@@ -5230,7 +5238,7 @@ pub const Client = struct {
 
             batch_start = batch_end;
         }
-        std.debug.print("io: downloadUrls done streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
+        dbg("io: downloadUrls done streams_done={}/{}\n", .{ self.streams_done, self.active_urls.len });
 
         // Close all stream files
         for (&self.streams) |*s| {
