@@ -70,6 +70,34 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // ── Benchmarks ───────────────────────────────────────────────────────────
+    // zig build bench        — crypto path microbenchmark (runs immediately)
+    // zig build bench-e2e    — end-to-end loopback transfer (needs server+client)
+    {
+        const bench_step = b.step("bench", "Run crypto path microbenchmark");
+        const m = b.createModule(.{
+            .root_source_file = b.path("benchmarks/crypto_bench.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        const exe = b.addExecutable(.{ .name = "crypto_bench", .root_module = m });
+        const run = b.addRunArtifact(exe);
+        if (b.args) |a| run.addArgs(a);
+        bench_step.dependOn(&run.step);
+    }
+    {
+        const bench_e2e_step = b.step("bench-e2e", "Run end-to-end loopback throughput benchmark");
+        const m = b.createModule(.{
+            .root_source_file = b.path("benchmarks/throughput_bench.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        const exe = b.addExecutable(.{ .name = "throughput_bench", .root_module = m });
+        const run = b.addRunArtifact(exe);
+        if (b.args) |a| run.addArgs(a);
+        bench_e2e_step.dependOn(&run.step);
+    }
+
     // Examples
     const examples_step = b.step("examples", "Build all examples");
     const example_files = [_][]const u8{
