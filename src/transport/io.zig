@@ -2047,7 +2047,7 @@ pub const Server = struct {
                         srv_decrypted_pn = r.pn;
                         break :decrypt r.pt_len;
                     } else |_| {}
-                    if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
+                    if (incoming_phase != conn.peer_key_phase) {
                         var nk = if (conn.use_v2) conn.app_client_km.nextGenV2() else conn.app_client_km.nextGen();
                         if (unprotect1RttPacketWithPnTracking(
                             &plaintext,
@@ -2058,11 +2058,17 @@ pub const Server = struct {
                             conn.app_recv_pn,
                         )) |r| {
                             conn.app_client_km = nk;
-                            // Peer initiated a key update — also rotate our send keys so
-                            // the server's outgoing packets carry the new key phase bit
-                            // (RFC 9001 §6.1: both endpoints must send with the new phase).
-                            conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
-                            conn.key_phase_bit = !conn.key_phase_bit;
+                            if (!conn.key_update_pending) {
+                                // Peer (client) initiated a key update — also rotate our send
+                                // keys so the server's outgoing packets carry the new phase bit
+                                // (RFC 9001 §6.1: both endpoints must use the new phase).
+                                conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
+                                conn.key_phase_bit = !conn.key_phase_bit;
+                            }
+                            // Either path: server-initiated or peer-initiated, the client
+                            // receive key has been advanced to match the new phase.
+                            // Clear the pending flag — the update is now confirmed.
+                            conn.key_update_pending = false;
                             srv_decrypted_pn = r.pn;
                             break :decrypt r.pt_len;
                         } else |_| {}
@@ -4498,9 +4504,11 @@ pub const Client = struct {
         if (incoming_phase != self.conn.peer_key_phase) {
             // Server's key phase changed — rotate our receive keys to match.
             // This covers two cases:
-            //   1. Server-initiated key update (key_update_pending=false): rotate.
+            //   1. Server-initiated key update (key_update_pending=false): rotate
+            //      receive keys AND our own send keys so outgoing packets use the
+            //      new phase (RFC 9001 §6.1: "MUST respond with the same Key Phase").
             //   2. Server confirming our client-initiated key update
-            //      (key_update_pending=true): also rotate and clear the flag.
+            //      (key_update_pending=true): rotate receive keys and clear the flag.
             if (buf.len == 834) {
                 dbg("io: client 834-byte packet rotating to next key generation\n", .{});
             }
@@ -4509,8 +4517,16 @@ pub const Client = struct {
             else
                 self.conn.app_server_km.nextGen();
             if (self.conn.key_update_pending) {
-                // Server has confirmed our key update.
+                // Server has confirmed our client-initiated key update.
                 self.conn.key_update_pending = false;
+            } else {
+                // Server-initiated key update: rotate our own send keys so we
+                // respond with the new key phase (RFC 9001 §6.1).
+                self.conn.app_client_km = if (self.conn.use_v2)
+                    self.conn.app_client_km.nextGenV2()
+                else
+                    self.conn.app_client_km.nextGen();
+                self.conn.key_phase_bit = !self.conn.key_phase_bit;
             }
         }
         const decrypt_result = unprotect1RttPacketWithPnTracking(
