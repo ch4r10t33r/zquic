@@ -3696,6 +3696,10 @@ const StreamDownload = struct {
     /// Small buffer for incomplete HTTP/3 frame headers that span two STREAM frames.
     h3_leftover: [256]u8 = [_]u8{0} ** 256,
     h3_leftover_len: usize = 0,
+    /// HTTP/3 only: the QUIC stream offset we have consumed up to.
+    /// Used to detect and discard duplicate/retransmitted STREAM frames so that
+    /// the leftover-buffer state machine is not corrupted by re-delivered data.
+    h3_quic_offset: u64 = 0,
 };
 
 // ── QUIC Client ───────────────────────────────────────────────────────────────
@@ -5041,14 +5045,39 @@ pub const Client = struct {
     /// The server sends:  HEADERS frame (offset=0)  then  DATA frame(s).
     /// We skip the HEADERS frame and write DATA payloads straight to the file.
     fn handleH3StreamData(self: *Client, s: *StreamDownload, sf: *const stream_frame_mod.StreamFrame) void {
+        // Detect duplicate/retransmitted STREAM frames: skip any data the parser
+        // has already consumed (sf.offset < s.h3_quic_offset).  Without this guard
+        // a retransmitted frame would be fed into the leftover-buffer state machine
+        // a second time, corrupting the H3 frame parser.
+        if (sf.offset + sf.data.len <= s.h3_quic_offset) {
+            dbg("io: h3 stream_id={} duplicate STREAM frame offset={} (already at {}), skipping\n", .{ sf.stream_id, sf.offset, s.h3_quic_offset });
+            if (sf.fin) {
+                s.file.close();
+                s.active = false;
+                self.streams_done += 1;
+            }
+            return;
+        }
+        // Partial overlap: trim away the already-consumed prefix before processing.
+        // This happens when a retransmit covers data we partly have.
+        var trimmed_data: []const u8 = sf.data;
+        if (sf.offset < s.h3_quic_offset) {
+            const skip = @as(usize, @intCast(s.h3_quic_offset - sf.offset));
+            if (skip < sf.data.len) {
+                trimmed_data = sf.data[skip..];
+            } else {
+                trimmed_data = &.{};
+            }
+        }
+
         // Combine any leftover bytes from the previous STREAM frame with the new data.
         var combined: [256 + MAX_DATAGRAM_SIZE]u8 = undefined;
-        var data: []const u8 = sf.data;
+        var data: []const u8 = trimmed_data;
         if (s.h3_leftover_len > 0) {
-            const total = s.h3_leftover_len + sf.data.len;
+            const total = s.h3_leftover_len + trimmed_data.len;
             if (total <= combined.len) {
                 @memcpy(combined[0..s.h3_leftover_len], s.h3_leftover[0..s.h3_leftover_len]);
-                @memcpy(combined[s.h3_leftover_len..total], sf.data);
+                @memcpy(combined[s.h3_leftover_len..total], trimmed_data);
                 data = combined[0..total];
             }
             s.h3_leftover_len = 0;
@@ -5077,10 +5106,13 @@ pub const Client = struct {
                         self.sendQpackDecoderInstruction(s.stream_id);
                     }
                     dbg("io: h3 stream_id={} HEADERS frame parsed\n", .{s.stream_id});
+                    s.h3_quic_offset += @intCast(pr.consumed);
                 },
                 .data => |d| {
                     _ = s.file.write(d) catch {};
                     dbg("io: h3 stream_id={} DATA {} bytes written\n", .{ s.stream_id, d.len });
+                    // Track consumed QUIC stream bytes so duplicate frames are rejected.
+                    s.h3_quic_offset += @intCast(pr.consumed);
                 },
                 else => {},
             }
