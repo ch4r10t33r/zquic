@@ -36,6 +36,7 @@ const version_neg_mod = @import("../packet/version_negotiation.zig");
 const congestion = @import("../loss/congestion.zig");
 const recovery = @import("../loss/recovery.zig");
 const build_options = @import("build_options");
+const batch_io = @import("batch_io.zig");
 
 /// Compile-time-eliminated debug logger. With `-Dverbose=true` prints to stderr;
 /// in production builds all calls are removed by the optimizer with zero overhead.
@@ -1016,6 +1017,9 @@ pub const Server = struct {
     /// Pacing timestamp for http09RetransmitPendingFins: at most one burst per 50ms.
     http09_retransmit_last_ms: i64 = 0,
     /// (Removed: was a 50ms pacing gate for HTTP/3. CC-based rate-limiting is now sufficient.)
+    /// Batched-send buffer: outgoing datagrams are enqueued here and flushed in
+    /// a single sendmmsg(2) call (Linux) or a tight sendto(2) loop (other OS).
+    send_batch: batch_io.SendBatch = .{},
     /// Initialize server: load cert/key and create UDP socket.
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !*Server {
         // Heap-allocate the Server to avoid blowing the stack: the conns array
@@ -1126,7 +1130,6 @@ pub const Server = struct {
 
     /// Run the server event loop (blocking).
     pub fn run(self: *Server) !void {
-        var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         var idle_secs: u32 = 0;
 
         while (true) {
@@ -1173,6 +1176,7 @@ pub const Server = struct {
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
                 self.http3RetransmitPendingFins();
+                self.flushSendBatch();
                 continue;
             };
             if (ready == 0) {
@@ -1187,6 +1191,7 @@ pub const Server = struct {
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
                 self.http3RetransmitPendingFins();
+                self.flushSendBatch();
                 self.reapDrainedConnections();
                 continue;
             }
@@ -1219,31 +1224,16 @@ pub const Server = struct {
                 }
             }
 
-            // Read from main UDP socket — first datagram blocking (matches POLL.IN),
-            // then drain the rest with DONTWAIT so ACK batches are not processed
-            // one wakeup per datagram.
+            // Receive from main UDP socket using a batch recv call: up to
+            // batch_io.BATCH_SIZE datagrams per syscall (recvmmsg on Linux,
+            // tight recvfrom loop on other OS).  This drains the kernel recv
+            // queue in one shot so ACK batches are not processed piecemeal.
             if (fds[0].revents & std.posix.POLL.IN != 0) {
-                var drained: usize = 0;
-                while (true) {
-                    var src_addr: std.posix.sockaddr.storage = undefined;
-                    var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-                    const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
-                    const n = std.posix.recvfrom(
-                        self.sock,
-                        &recv_buf,
-                        flags,
-                        @ptrCast(&src_addr),
-                        &src_len,
-                    ) catch |err| {
-                        if (drained > 0 and err == error.WouldBlock) break;
-                        dbg("io: recvfrom error: {}\n", .{err});
-                        break;
-                    };
-                    drained += 1;
-                    dbg("io: server recvfrom OK n={} src_len={}\n", .{ n, src_len });
-
-                    const src = std.net.Address{ .any = @as(*const std.posix.sockaddr, @ptrCast(&src_addr)).* };
-                    self.processPacket(recv_buf[0..n], src);
+                var rb = batch_io.RecvBatch{};
+                const n_recv = rb.recv(self.sock, true);
+                dbg("io: server recvBatch n={}\n", .{n_recv});
+                for (rb.entries[0..n_recv]) |*e| {
+                    self.processPacket(e.buf[0..e.len], e.addr);
                 }
             }
 
@@ -1251,6 +1241,8 @@ pub const Server = struct {
             self.http09RetransmitPendingFins();
             self.flushPendingHttp3Responses();
             self.http3RetransmitPendingFins();
+            // Flush all enqueued outgoing packets in one sendmmsg(2) syscall.
+            self.flushSendBatch();
             self.reapDrainedConnections();
         }
     }
@@ -2589,10 +2581,13 @@ pub const Server = struct {
         if (has_fin) {
             dbg("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
         }
-        const send_result = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &dst.any, dst.getOsSockLen()) catch |err| {
-            dbg("io: sendto error pkt_len={}: {}\n", .{ pkt_len, err });
-            return;
-        };
+        // Enqueue in the outgoing batch.  The packet is physically transmitted
+        // when the batch is flushed (either because it is now full or because
+        // flushSendBatch() is called at the end of the event-loop iteration).
+        if (self.send_batch.enqueue(send_buf[0..pkt_len], dst)) {
+            // Batch full — flush immediately before enqueuing more.
+            self.send_batch.flush(self.sock);
+        }
         // Congestion control: update bytes in flight.
         conn.cc.onPacketSent(@intCast(pkt_len));
         // Loss detection: record this packet.
@@ -2604,8 +2599,15 @@ pub const Server = struct {
             .in_flight = true,
         });
         if (has_fin) {
-            dbg("io: server FIN PACKET sent {} bytes\n", .{send_result});
+            dbg("io: server FIN PACKET enqueued {} bytes\n", .{pkt_len});
         }
+    }
+
+    /// Flush all buffered outgoing packets via a single sendmmsg(2) call
+    /// (Linux) or a tight sendto(2) loop (other OS).  Call this once per
+    /// event-loop iteration after all sends for the current cycle are queued.
+    fn flushSendBatch(self: *Server) void {
+        self.send_batch.flush(self.sock);
     }
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
