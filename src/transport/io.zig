@@ -2598,7 +2598,7 @@ pub const Server = struct {
                 if (sid_type == 0 or sid_type == 2) { // client-initiated
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
                     if (sid_type == 0) {
-                        // Bidirectional
+                        // Bidirectional: enforce hard limit (RFC 9000 §4.6).
                         if (stream_count > conn.max_streams_bidi_recv) {
                             dbg("io: STREAM_LIMIT_ERROR bidi stream_id={} count={} limit={}\n", .{ sf_r.frame.stream_id, stream_count, conn.max_streams_bidi_recv });
                             self.sendConnectionClose(conn, 0x4, "stream limit exceeded", src);
@@ -2606,8 +2606,14 @@ pub const Server = struct {
                         }
                         if (stream_count > conn.peer_bidi_stream_count)
                             conn.peer_bidi_stream_count = stream_count;
+                        // Proactively raise the limit when 75% consumed — mirrors how
+                        // MAX_DATA is sent at 50% (RFC 9000 §4.2).  Prevents the
+                        // client from needing to send STREAMS_BLOCKED in the common
+                        // case of a burst of requests (e.g. multiplexing test).
+                        if (conn.peer_bidi_stream_count * 4 >= conn.max_streams_bidi_recv * 3)
+                            self.sendMaxStreams(conn, true, src);
                     } else {
-                        // Unidirectional
+                        // Unidirectional: enforce hard limit.
                         if (stream_count > conn.max_streams_uni_recv) {
                             dbg("io: STREAM_LIMIT_ERROR uni stream_id={} count={} limit={}\n", .{ sf_r.frame.stream_id, stream_count, conn.max_streams_uni_recv });
                             self.sendConnectionClose(conn, 0x4, "stream limit exceeded", src);
@@ -2615,6 +2621,9 @@ pub const Server = struct {
                         }
                         if (stream_count > conn.peer_uni_stream_count)
                             conn.peer_uni_stream_count = stream_count;
+                        // Proactively raise uni limit at 75% consumed.
+                        if (conn.peer_uni_stream_count * 4 >= conn.max_streams_uni_recv * 3)
+                            self.sendMaxStreams(conn, false, src);
                     }
                 }
                 // Flow control (RFC 9000 §4.1): track cumulative bytes received.
