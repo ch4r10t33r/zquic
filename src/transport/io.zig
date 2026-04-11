@@ -2649,7 +2649,7 @@ pub const Server = struct {
 
     /// Send a NEW_CONNECTION_ID frame offering a fresh alternative CID to the peer.
     fn sendNewConnectionId(self: *Server, conn: *ConnState, seq: u64, dst: std.net.Address) void {
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ @as(i64, seq)));
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ @as(i64, @bitCast(seq))));
         const new_cid = ConnectionId.random(prng.random(), 8);
         conn.alt_local_cid = new_cid;
         conn.alt_local_cid_seq = seq;
