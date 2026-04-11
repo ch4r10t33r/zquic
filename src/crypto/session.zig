@@ -19,13 +19,12 @@
 //! - `deriveEarlyKeys`: HKDF derivation for 0-RTT from a stored ticket.
 
 // ── 0-RTT Anti-Replay (RFC 9001 §8.1 / RFC 8446 §8) ─────────────────────────
-// zquic accepts 0-RTT early data without a server-side replay cache.
-// This is compliant for read-only workloads (file serving) where replayed
-// requests produce idempotent responses.  Implementations that handle
-// non-idempotent operations MUST implement a per-ticket nonce cache or
-// reject all 0-RTT data.
-//
-// TODO(#75): implement a 64-entry nonce cache keyed by (ticket_age, client_random[0..4]).
+// zquic implements a 64-entry nonce cache keyed by the first 8 bytes of the
+// PSK identity (ticket blob).  On a resumed connection the PSK identity is
+// unique per ticket issuance; using its prefix as a nonce prevents replay of
+// the same 0-RTT flight within the cache window.
+// For read-only workloads (file serving) replays are idempotent, but the
+// cache ensures correct RFC compliance for non-idempotent future extensions.
 
 const std = @import("std");
 const crypto_keys = @import("keys.zig");
@@ -266,6 +265,43 @@ pub fn deriveEarlyKeys(ticket: *const SessionTicket) EarlyDataKeys {
 }
 
 // ---------------------------------------------------------------------------
+// 0-RTT Anti-Replay Nonce Cache
+// ---------------------------------------------------------------------------
+
+/// 64-entry ring-buffer nonce cache for 0-RTT anti-replay (RFC 9001 §8.1).
+///
+/// Key = first 8 bytes of the PSK identity (ticket blob).  Each ticket blob
+/// is unique per issuance, so this prefix reliably distinguishes replays
+/// within the cache window.
+///
+/// Usage:
+///   if (!server.nonce_cache.checkAndInsert(key)) {
+///       // Replay detected — do not activate early keys.
+///   }
+pub const NonceCache = struct {
+    entries: [64][8]u8 = [_][8]u8{[_]u8{0} ** 8} ** 64,
+    /// Number of valid entries (saturates at 64).
+    count: usize = 0,
+    /// Next write position in the ring.
+    head: usize = 0,
+
+    /// Check whether `key` has been seen before.
+    /// Returns `true` (new) if the key is fresh and inserts it.
+    /// Returns `false` (replay) if the key already exists.
+    pub fn checkAndInsert(self: *NonceCache, key: [8]u8) bool {
+        const n = @min(self.count, 64);
+        for (0..n) |i| {
+            if (std.mem.eql(u8, &self.entries[i], &key)) return false; // replay
+        }
+        // Fresh key — insert at head.
+        self.entries[self.head] = key;
+        self.head = (self.head + 1) % 64;
+        if (self.count < 64) self.count += 1;
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -356,4 +392,29 @@ test "session: early data key derivation" {
     try std.testing.expect(!std.mem.allEqual(u8, &keys.key, 0));
     try std.testing.expect(!std.mem.allEqual(u8, &keys.iv, 0));
     try std.testing.expect(!std.mem.allEqual(u8, &keys.hp, 0));
+}
+
+test "nonce_cache: detects replay" {
+    const testing = std.testing;
+    var cache = NonceCache{};
+    const key: [8]u8 = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    try testing.expect(cache.checkAndInsert(key)); // first use: fresh
+    try testing.expect(!cache.checkAndInsert(key)); // second use: replay
+}
+
+test "nonce_cache: ring eviction" {
+    var cache = NonceCache{};
+    // Fill all 64 slots.
+    for (0..64) |i| {
+        var k: [8]u8 = .{0} ** 8;
+        k[0] = @intCast(i);
+        try std.testing.expect(cache.checkAndInsert(k));
+    }
+    // A 65th distinct key should succeed (evicts oldest).
+    const new_key: [8]u8 = .{0xff} ** 8;
+    try std.testing.expect(cache.checkAndInsert(new_key));
+    // The original key 0 may have been evicted; inserting it again is allowed
+    // (cache ring wrapped around).  We just verify no panic occurs.
+    const evicted: [8]u8 = .{0} ** 8;
+    _ = cache.checkAndInsert(evicted);
 }

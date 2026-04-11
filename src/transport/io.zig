@@ -767,6 +767,11 @@ pub const ConnState = struct {
     init_crypto_offset: u64 = 0,
     app_crypto_offset: u64 = 0,
 
+    // CRYPTO frame reorder buffers: hold out-of-order fragments per encryption
+    // level until the missing prefix arrives (RFC 9000 §7, RFC 9001 §4.1.3).
+    init_crypto_reorder: quic_tls_mod.CryptoReorderBuf = .{},
+    hs_crypto_reorder: quic_tls_mod.CryptoReorderBuf = .{},
+
     // HTTP/3 state: whether the server control stream was sent
     h3_settings_sent: bool = false,
 
@@ -855,6 +860,17 @@ pub const ConnState = struct {
     // Connection migration (RFC 9000 §9): pending PATH_CHALLENGE data.
     // Non-null while waiting for a PATH_RESPONSE from the new address.
     path_challenge_data: ?[8]u8 = null,
+
+    // ── Stream limit enforcement (RFC 9000 §4.6) ──────────────────────────────
+    // The server advertises initial_max_streams_bidi=100 and
+    // initial_max_streams_uni=100 in transport parameters.  Stream IDs that
+    // exceed these limits trigger a STREAM_LIMIT_ERROR (0x4).
+    // max_streams_*_recv is updated when we send MAX_STREAMS frames.
+    // peer_*_stream_count tracks the highest stream number used so far.
+    max_streams_bidi_recv: u64 = 100,
+    max_streams_uni_recv: u64 = 100,
+    peer_bidi_stream_count: u64 = 0,
+    peer_uni_stream_count: u64 = 0,
 
     // ── Connection-level flow control (RFC 9000 §4) ───────────────────────────
     // Both sides advertise initial_max_data = 64 MiB in transport parameters.
@@ -1020,6 +1036,9 @@ pub const Server = struct {
     /// Batched-send buffer: outgoing datagrams are enqueued here and flushed in
     /// a single sendmmsg(2) call (Linux) or a tight sendto(2) loop (other OS).
     send_batch: batch_io.SendBatch = .{},
+    /// 0-RTT anti-replay nonce cache (RFC 9001 §8.1).
+    /// Keyed by the first 8 bytes of the PSK identity from each ClientHello.
+    nonce_cache: session_mod.NonceCache = .{},
     /// Initialize server: load cert/key and create UDP socket.
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !*Server {
         // Heap-allocate the Server to avoid blowing the stack: the conns array
@@ -1539,6 +1558,19 @@ pub const Server = struct {
             if (ft >= 0x08 and ft <= 0x0f) {
                 const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[fpos..pt_len], ft) catch break;
                 fpos += sf_r.consumed;
+                // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
+                const sid_type = sf_r.frame.stream_id & 3;
+                if (sid_type == 0 or sid_type == 2) {
+                    const stream_count = (sf_r.frame.stream_id >> 2) + 1;
+                    if (sid_type == 0 and stream_count > conn.max_streams_bidi_recv) {
+                        dbg("io: 0-RTT STREAM_LIMIT_ERROR bidi stream_id={}\n", .{sf_r.frame.stream_id});
+                        break; // drop packet (cannot send CONNECTION_CLOSE in 0-RTT context)
+                    }
+                    if (sid_type == 2 and stream_count > conn.max_streams_uni_recv) {
+                        dbg("io: 0-RTT STREAM_LIMIT_ERROR uni stream_id={}\n", .{sf_r.frame.stream_id});
+                        break;
+                    }
+                }
                 self.handleStreamData(conn, &sf_r.frame, src);
                 continue;
             }
@@ -1629,13 +1661,25 @@ pub const Server = struct {
         offset: u64,
         src: std.net.Address,
     ) void {
-        // Simple in-order reassembly: only accept data at expected offset
-        if (offset != conn.init_crypto_offset) return;
+        // In-order reassembly with reorder buffering (RFC 9001 §4.1.3).
+        // If data arrives out-of-order, buffer it and wait for the missing prefix.
+        if (offset != conn.init_crypto_offset) {
+            conn.init_crypto_reorder.insert(offset, data);
+            return;
+        }
+        // Advance the expected offset now that we have the contiguous segment.
         conn.init_crypto_offset += data.len;
 
         // Only process ClientHello in initial phase
-        if (conn.phase != .initial) return;
-        if (data.len < 4 or data[0] != tls_hs.MSG_CLIENT_HELLO) return;
+        if (conn.phase != .initial) {
+            // Drain any now-contiguous buffered segments even if we skip processing.
+            self.drainInitCryptoReorder(conn, src);
+            return;
+        }
+        if (data.len < 4 or data[0] != tls_hs.MSG_CLIENT_HELLO) {
+            self.drainInitCryptoReorder(conn, src);
+            return;
+        }
 
         // Initialize TLS if needed
         if (!conn.tls_inited) {
@@ -1646,6 +1690,7 @@ pub const Server = struct {
         // Process ClientHello → ServerHello
         const sh_len = conn.tls.processClientHello(data, &conn.sh_bytes) catch |err| {
             dbg("io: TLS ClientHello failed: {}\n", .{err});
+            self.drainInitCryptoReorder(conn, src);
             return;
         };
         conn.sh_len = sh_len;
@@ -1665,20 +1710,48 @@ pub const Server = struct {
         // The PSK identity sent by the client (ticket blob) IS the PSK, so we
         // can derive client_early_traffic_secret directly.
         if (conn.tls.ch.has_early_data and conn.tls.ch.psk_identity_len >= 32) {
-            var psk: [32]u8 = .{0} ** 32;
-            @memcpy(&psk, conn.tls.ch.psk_identity[0..32]);
-            const cets = session_mod.deriveEarlyTrafficSecret(psk, conn.tls.ch_hash);
-            const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
-            conn.early_km = KeyMaterial{
-                .secret = cets,
-                .key = early_keys.key,
-                .key32 = .{0} ** 32,
-                .iv = early_keys.iv,
-                .hp = early_keys.hp,
-                .hp32 = .{0} ** 32,
-            };
-            conn.has_early_keys = true;
-            dbg("io: server derived 0-RTT early keys\n", .{});
+            // 0-RTT anti-replay check (RFC 9001 §8.1 / RFC 8446 §8).
+            // Key = first 8 bytes of the PSK identity (ticket blob), which is
+            // unique per ticket issuance.  Reject early data if the key was
+            // already seen (replayed 0-RTT flight).
+            var replay_key: [8]u8 = .{0} ** 8;
+            const rk_len = @min(conn.tls.ch.psk_identity_len, 8);
+            @memcpy(replay_key[0..rk_len], conn.tls.ch.psk_identity[0..rk_len]);
+            if (!self.nonce_cache.checkAndInsert(replay_key)) {
+                dbg("io: 0-RTT replay detected — not activating early keys\n", .{});
+            } else {
+                var psk: [32]u8 = .{0} ** 32;
+                @memcpy(&psk, conn.tls.ch.psk_identity[0..32]);
+                const cets = session_mod.deriveEarlyTrafficSecret(psk, conn.tls.ch_hash);
+                const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
+                conn.early_km = KeyMaterial{
+                    .secret = cets,
+                    .key = early_keys.key,
+                    .key32 = .{0} ** 32,
+                    .iv = early_keys.iv,
+                    .hp = early_keys.hp,
+                    .hp32 = .{0} ** 32,
+                };
+                conn.has_early_keys = true;
+                dbg("io: server derived 0-RTT early keys\n", .{});
+            }
+        }
+
+        // Drain any out-of-order Initial CRYPTO segments that are now contiguous.
+        self.drainInitCryptoReorder(conn, src);
+    }
+
+    /// Drain contiguous segments from the Initial CRYPTO reorder buffer.
+    /// Called after in-order delivery in `handleInitialCrypto`.
+    /// Segments are re-fed into `handleInitialCrypto` so that a fragmented
+    /// ClientHello (or any follow-on Initial CRYPTO data) is fully processed.
+    fn drainInitCryptoReorder(self: *Server, conn: *ConnState, src: std.net.Address) void {
+        var drain_buf: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
+        while (true) {
+            const n = conn.init_crypto_reorder.take(conn.init_crypto_offset, &drain_buf);
+            if (n == 0) break;
+            // Re-feed through handleInitialCrypto; it will advance init_crypto_offset.
+            self.handleInitialCrypto(conn, drain_buf[0..n], conn.init_crypto_offset, src);
         }
     }
 
@@ -1860,6 +1933,17 @@ pub const Server = struct {
                 if (off_r.value == conn.hs_crypto_offset) {
                     conn.hs_crypto_offset += dlen;
                     self.handleHandshakeCrypto(conn, cdata, src);
+                    // Drain any now-contiguous buffered Handshake CRYPTO segments.
+                    var hs_drain: [quic_tls_mod.REORDER_SLOT_SIZE]u8 = undefined;
+                    while (true) {
+                        const dn = conn.hs_crypto_reorder.take(conn.hs_crypto_offset, &hs_drain);
+                        if (dn == 0) break;
+                        conn.hs_crypto_offset += dn;
+                        self.handleHandshakeCrypto(conn, hs_drain[0..dn], src);
+                    }
+                } else {
+                    // Out-of-order: buffer for later reassembly.
+                    conn.hs_crypto_reorder.insert(off_r.value, cdata);
                 }
                 fpos += dlen;
             } else if (plaintext[fpos] == 0x02 or plaintext[fpos] == 0x03) {
@@ -2507,6 +2591,32 @@ pub const Server = struct {
                 };
                 pos += sf_r.consumed;
                 dbg("io: STREAM frame parsed: stream_id={} offset={} data_len={} fin={}\n", .{ sf_r.frame.stream_id, sf_r.frame.offset, sf_r.frame.data.len, sf_r.frame.fin });
+                // Stream limit enforcement (RFC 9000 §4.6).
+                // stream_count = (stream_id >> 2) + 1 (RFC 9000 §2.1).
+                // Client-initiated bidi: stream_id & 3 == 0; uni: stream_id & 3 == 2.
+                const sid_type = sf_r.frame.stream_id & 3;
+                if (sid_type == 0 or sid_type == 2) { // client-initiated
+                    const stream_count = (sf_r.frame.stream_id >> 2) + 1;
+                    if (sid_type == 0) {
+                        // Bidirectional
+                        if (stream_count > conn.max_streams_bidi_recv) {
+                            dbg("io: STREAM_LIMIT_ERROR bidi stream_id={} count={} limit={}\n", .{ sf_r.frame.stream_id, stream_count, conn.max_streams_bidi_recv });
+                            self.sendConnectionClose(conn, 0x4, "stream limit exceeded", src);
+                            return;
+                        }
+                        if (stream_count > conn.peer_bidi_stream_count)
+                            conn.peer_bidi_stream_count = stream_count;
+                    } else {
+                        // Unidirectional
+                        if (stream_count > conn.max_streams_uni_recv) {
+                            dbg("io: STREAM_LIMIT_ERROR uni stream_id={} count={} limit={}\n", .{ sf_r.frame.stream_id, stream_count, conn.max_streams_uni_recv });
+                            self.sendConnectionClose(conn, 0x4, "stream limit exceeded", src);
+                            return;
+                        }
+                        if (stream_count > conn.peer_uni_stream_count)
+                            conn.peer_uni_stream_count = stream_count;
+                    }
+                }
                 // Flow control (RFC 9000 §4.1): track cumulative bytes received.
                 const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
                 if (recv_end > conn.fc_bytes_recv) conn.fc_bytes_recv = recv_end;
@@ -2903,11 +3013,23 @@ pub const Server = struct {
 
     /// Send a MAX_STREAMS frame granting the peer additional stream budget.
     fn sendMaxStreams(self: *Server, conn: *ConnState, bidi: bool, dst: std.net.Address) void {
+        // Raise the limit by 100 streams each time we receive STREAMS_BLOCKED.
+        const new_limit: u64 = if (bidi)
+            conn.max_streams_bidi_recv + 100
+        else
+            conn.max_streams_uni_recv + 100;
+
+        if (bidi) {
+            conn.max_streams_bidi_recv = new_limit;
+        } else {
+            conn.max_streams_uni_recv = new_limit;
+        }
+
         var buf: [16]u8 = undefined;
         buf[0] = if (bidi) @as(u8, 0x12) else @as(u8, 0x13); // MAX_STREAMS bidi/uni
-        const enc = varint.encode(buf[1..], 200) catch return; // grant 200 streams
+        const enc = varint.encode(buf[1..], new_limit) catch return;
         self.send1Rtt(conn, buf[0 .. 1 + enc.len], dst);
-        dbg("io: sent MAX_STREAMS bidi={} limit=200\n", .{bidi});
+        dbg("io: sent MAX_STREAMS bidi={} limit={}\n", .{ bidi, new_limit });
     }
 
     /// Initiate a server-side key update (RFC 9001 §6).
