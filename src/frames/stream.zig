@@ -64,11 +64,6 @@ pub const StreamFrame = struct {
         if (self.offset != 0) ft |= OFF_BIT;
         if (self.fin) ft |= FIN_BIT;
 
-        if (self.fin) {
-            const std_debug = @import("std").debug;
-            std_debug.print("stream.zig: serialize stream_id={} fin=true ft=0x{x:0>2} offset={} data_len={}\n", .{ self.stream_id, ft, self.offset, self.data.len });
-        }
-
         var w = varint.Writer.init(buf);
         try w.writeVarint(ft);
         try w.writeVarint(self.stream_id);

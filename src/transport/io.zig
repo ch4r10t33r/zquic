@@ -3346,7 +3346,15 @@ pub const Server = struct {
                     .file = file,
                     .stream_offset = headers_frame_len,
                     .file_end = file_end,
+                    .file_offset = 0,
+                    .stream_offset_base = headers_frame_len,
                 };
+                // Store the file path for re-opening on retransmission.
+                const path_len = @min(fs_path.len, http3_slot.file_path.len);
+                @memcpy(http3_slot.file_path[0..path_len], fs_path[0..path_len]);
+                http3_slot.file_path_len = path_len;
+                conn.http3_active_count += 1;
+                dbg("io: http3 unblocked slot registered stream_id={} size={} data_offset={}\n", .{ stream_id, file_end, headers_frame_len });
                 break;
             } else {
                 file.close();
@@ -5081,6 +5089,16 @@ pub const Client = struct {
             }
             return;
         }
+        // Gap: sf.offset > h3_quic_offset — out-of-order delivery (e.g. a preceding
+        // QUIC packet was dropped by the NS3 queue).  We cannot correctly parse the
+        // H3 byte stream starting mid-frame.  Drop the frame here; the server's loss
+        // detector (k_packet_threshold / PTO) will retransmit the lost packet and
+        // then re-send all subsequent data from that rewind point, so these bytes
+        // will arrive again in the correct order.
+        if (sf.offset > s.h3_quic_offset) {
+            dbg("io: h3 stream_id={} out-of-order STREAM frame offset={} (at {}), dropping\n", .{ sf.stream_id, sf.offset, s.h3_quic_offset });
+            return;
+        }
         // Partial overlap: trim away the already-consumed prefix before processing.
         // This happens when a retransmit covers data we partly have.
         var trimmed_data: []const u8 = sf.data;
@@ -5137,7 +5155,12 @@ pub const Client = struct {
                     // Track consumed QUIC stream bytes so duplicate frames are rejected.
                     s.h3_quic_offset += @intCast(pr.consumed);
                 },
-                else => {},
+                else => {
+                    // Unknown/extension frame: skip its bytes in the stream so
+                    // h3_quic_offset stays in sync with pos and duplicate detection
+                    // continues to work correctly for subsequent frames.
+                    s.h3_quic_offset += @intCast(pr.consumed);
+                },
             }
         }
 
