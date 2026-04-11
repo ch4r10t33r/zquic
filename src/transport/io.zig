@@ -2185,12 +2185,35 @@ pub const Server = struct {
             // are idempotent (seekTo + writeAll overwrites the same bytes).
             const REWIND_BYTES: u64 = 200 * 1200;
             for (&conn.http09_slots) |*slot| {
-                if (!slot.active) continue;
-                const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
-                if (rewind_to < slot.stream_offset) {
-                    slot.file.seekTo(rewind_to) catch {};
-                    slot.stream_offset = rewind_to;
-                    dbg("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
+                if (slot.active) {
+                    // Active slot: rewind to re-send data that went to the dead port.
+                    const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
+                    if (rewind_to < slot.stream_offset) {
+                        slot.file.seekTo(rewind_to) catch {};
+                        slot.stream_offset = rewind_to;
+                        dbg("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
+                    }
+                } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
+                    // The FIN was already sent (file closed) but data may not have
+                    // reached the client on the old path.  Reopen the file and
+                    // re-activate so flushPendingHttp09Responses re-sends everything.
+                    const fp = slot.file_path[0..slot.file_path_len];
+                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / 1200)
+                        (slot.fin_pkt_pn - REWIND_BYTES / 1200) * 1200
+                    else
+                        0;
+                    if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                        f.seekTo(rewind_to) catch {
+                            f.close();
+                            continue;
+                        };
+                        slot.file = f;
+                        slot.stream_offset = rewind_to;
+                        slot.active = true;
+                        slot.awaiting_fin_ack = false;
+                        conn.http09_active_count += 1;
+                        dbg("io: path change: reopened FIN slot stream_id={} rewind to {}\n", .{ slot.stream_id, rewind_to });
+                    } else |_| {}
                 }
             }
             // RFC 9002 §9.4: reset congestion controller and RTT estimator on
