@@ -659,6 +659,25 @@ const Http3OutSlot = struct {
     }
 };
 
+/// Maximum number of HTTP/3 request streams that can be blocked waiting for
+/// QPACK dynamic table insertions (RFC 9204 §2.1.2).  We advertise this value
+/// in SETTINGS_QPACK_BLOCKED_STREAMS.  Must be ≥ 1 to be non-trivial; 16 is
+/// a reasonable balance between memory and compression flexibility.
+pub const QPACK_BLOCKED_STREAMS_MAX: usize = 16;
+
+/// A buffered HTTP/3 request stream whose HEADERS block cannot yet be decoded
+/// because the decoder table has fewer insertions than the block's RIC.
+/// Retried each time new encoder stream instructions arrive.
+const QpackBlockedH3Stream = struct {
+    active: bool = false,
+    stream_id: u64 = 0,
+    /// Required Insert Count needed to decode this block.
+    required_insert_count: usize = 0,
+    /// Raw QPACK-encoded HEADERS block (copy of HeadersFrame.data[0..len]).
+    header_block: [h3_frame.max_header_block]u8 = undefined,
+    header_block_len: usize = 0,
+};
+
 const pending_1rtt_cap: usize = 8;
 
 /// Decrypted 1-RTT coalesced payload queued until the handshake is confirmed.
@@ -749,6 +768,12 @@ pub const ConnState = struct {
     // (server: stream 11; client: stream 10).  Tracks how many bytes we have
     // sent, including the leading stream-type byte (0x03).
     qpack_dec_stream_off: u64 = 0,
+
+    /// Buffered HEADERS blocks that arrived before the QPACK dynamic table had
+    /// enough insertions to decode them (RFC 9204 §2.1.2).  Retried each time
+    /// new encoder-stream instructions advance the decoder table.
+    qpack_blocked: [QPACK_BLOCKED_STREAMS_MAX]QpackBlockedH3Stream =
+        [_]QpackBlockedH3Stream{.{}} ** QPACK_BLOCKED_STREAMS_MAX,
 
     // QLOG writer for this connection.  Null when qlog_dir is not configured.
     qlog: qlog_writer.Writer = .{},
@@ -2402,7 +2427,7 @@ pub const Server = struct {
 
         // Route client-initiated unidirectional streams (control=2, QPACK enc=6, dec=10…).
         if (sf.stream_id % 4 == 2) {
-            self.handleH3ClientUniStream(conn, sf);
+            self.handleH3ClientUniStream(conn, sf, src);
             return;
         }
 
@@ -2428,7 +2453,15 @@ pub const Server = struct {
             switch (pr.frame) {
                 .headers => |hf| {
                     var decoded = h3_qpack.DecodedHeaders{ .headers = undefined, .count = 0 };
-                    h3_qpack.decodeHeaders(hf.data[0..hf.len], &conn.qpack_dec_tbl, &decoded) catch {};
+                    h3_qpack.decodeHeaders(hf.data[0..hf.len], &conn.qpack_dec_tbl, &decoded) catch |err| {
+                        if (err == error.BlockedStream) {
+                            // RFC 9204 §2.1.2: buffer the HEADERS block and retry
+                            // when new encoder-stream instructions advance the table.
+                            self.bufferBlockedH3Stream(conn, sf.stream_id, hf.data[0..hf.len]);
+                            std.debug.print("io: HEADERS stream_id={} blocked on QPACK table (insertion_count={})\n", .{ sf.stream_id, conn.qpack_dec_tbl.insertion_count });
+                        }
+                        break;
+                    };
                     // RFC 9204 §4.4.1: send a Section Acknowledgement on our
                     // QPACK decoder stream (stream 11) when the client's HEADERS
                     // block contained dynamic table references (RIC > 0).
@@ -2449,6 +2482,11 @@ pub const Server = struct {
                 },
                 else => {},
             }
+        }
+
+        // If the request was buffered as a blocked stream, defer the response.
+        for (&conn.qpack_blocked) |*slot| {
+            if (slot.active and slot.stream_id == sf.stream_id) return;
         }
 
         std.debug.print("io: http3 request stream_id={} method={s} path={s}\n", .{ sf.stream_id, method, path });
@@ -2518,8 +2556,7 @@ pub const Server = struct {
     /// The first byte of the stream payload is the stream type; subsequent bytes
     /// are the stream body.  We only dispatch on the first STREAM frame per stream
     /// (offset == 0); later frames for the same stream continue the same body.
-    fn handleH3ClientUniStream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame) void {
-        _ = self;
+    fn handleH3ClientUniStream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, sf_src: std.net.Address) void {
         if (sf.data.len == 0) return;
 
         // The stream type byte is present only in the first frame (offset == 0).
@@ -2554,6 +2591,9 @@ pub const Server = struct {
                 std.debug.print("io: QPACK dec table capacity={} count={} after enc stream\n", .{
                     conn.qpack_dec_tbl.capacity, conn.qpack_dec_tbl.count,
                 });
+                // RFC 9204 §2.1.2: after the table advances, retry any streams
+                // that were blocked waiting for these insertions.
+                self.retryBlockedH3Streams(conn, sf_src);
             },
             0x03 => {
                 // QPACK decoder stream: Section Acks, Insert Count Increments, etc.
@@ -2567,6 +2607,124 @@ pub const Server = struct {
         }
     }
 
+    /// Buffer a HEADERS block whose Required Insert Count exceeds the current
+    /// decoder table size (RFC 9204 §2.1.2).  The block is stored in the first
+    /// free slot of `conn.qpack_blocked` and will be retried when the table
+    /// advances.  If all slots are occupied the block is silently dropped — the
+    /// peer will time out and we will close the connection.
+    fn bufferBlockedH3Stream(
+        _: *Server,
+        conn: *ConnState,
+        stream_id: u64,
+        header_block: []const u8,
+    ) void {
+        for (&conn.qpack_blocked) |*slot| {
+            if (slot.active) continue;
+            slot.active = true;
+            slot.stream_id = stream_id;
+            const copy_len = @min(header_block.len, slot.header_block.len);
+            @memcpy(slot.header_block[0..copy_len], header_block[0..copy_len]);
+            slot.header_block_len = copy_len;
+            return;
+        }
+        std.debug.print("io: QPACK blocked stream buffer full — dropping stream_id={}\n", .{stream_id});
+    }
+
+    /// After the QPACK decoder table has been advanced by new encoder-stream
+    /// instructions, attempt to decode every buffered (blocked) HEADERS block.
+    /// Streams that can now be decoded are dispatched as normal HTTP/3 requests;
+    /// streams that are still blocked remain in the buffer.
+    fn retryBlockedH3Streams(self: *Server, conn: *ConnState, src: std.net.Address) void {
+        for (&conn.qpack_blocked) |*slot| {
+            if (!slot.active) continue;
+
+            var decoded = h3_qpack.DecodedHeaders{ .headers = undefined, .count = 0 };
+            h3_qpack.decodeHeaders(
+                slot.header_block[0..slot.header_block_len],
+                &conn.qpack_dec_tbl,
+                &decoded,
+            ) catch |err| {
+                if (err == error.BlockedStream) continue; // still blocked
+                // Other decode error — discard.
+                std.debug.print("io: QPACK blocked retry err={} stream_id={} — discarding\n", .{ err, slot.stream_id });
+                slot.active = false;
+                continue;
+            };
+
+            // Successfully decoded — clear the slot and process the request.
+            const stream_id = slot.stream_id;
+            const has_dyn = h3_qpack.headerBlockHasDynamicRefs(slot.header_block[0..slot.header_block_len]);
+            slot.active = false;
+            std.debug.print("io: QPACK unblocked stream_id={}\n", .{stream_id});
+
+            // Send Section Ack if the block had dynamic references.
+            if (has_dyn) self.sendQpackDecoderInstruction(conn, stream_id, src);
+
+            // Dispatch the request.
+            var method_buf: [8]u8 = undefined;
+            var path_buf: [512]u8 = undefined;
+            var method: []const u8 = "GET";
+            var path: []const u8 = "/";
+            for (decoded.headers[0..decoded.count]) |fld| {
+                if (std.mem.eql(u8, fld.name, ":method")) {
+                    const ml = @min(fld.value.len, method_buf.len);
+                    @memcpy(method_buf[0..ml], fld.value[0..ml]);
+                    method = method_buf[0..ml];
+                } else if (std.mem.eql(u8, fld.name, ":path")) {
+                    const pl = @min(fld.value.len, path_buf.len);
+                    @memcpy(path_buf[0..pl], fld.value[0..pl]);
+                    path = path_buf[0..pl];
+                }
+            }
+            std.debug.print("io: http3 unblocked request stream_id={} method={s} path={s}\n", .{ stream_id, method, path });
+
+            if (!std.mem.eql(u8, method, "GET")) continue;
+
+            var fs_path_buf: [512]u8 = undefined;
+            const fs_path = http09_server.resolvePath(self.config.www_dir, path, &fs_path_buf) catch continue;
+            const file = std.fs.openFileAbsolute(fs_path, .{}) catch {
+                self.sendH3Response(conn, stream_id, 404, &.{}, src);
+                continue;
+            };
+            const file_end = file.getEndPos() catch {
+                file.close();
+                self.sendH3Response(conn, stream_id, 500, &.{}, src);
+                continue;
+            };
+
+            var size_buf: [20]u8 = undefined;
+            const size_str = std.fmt.bufPrint(&size_buf, "{}", .{file_end}) catch "0";
+            var header_block_out: [512]u8 = undefined;
+            const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
+                .{ .name = ":status", .value = "200" },
+                .{ .name = "content-length", .value = size_str },
+            }, &header_block_out, .{ .table = &conn.qpack_enc_tbl }) catch {
+                file.close();
+                continue;
+            };
+            var headers_out: [600]u8 = undefined;
+            const headers_frame_len = h3_frame.writeFrame(&headers_out, @intFromEnum(h3_frame.FrameType.headers), header_block_out[0..hb_len]) catch {
+                file.close();
+                continue;
+            };
+            self.sendStreamDataH3(conn, stream_id, 0, headers_out[0..headers_frame_len], false, src);
+
+            for (&conn.http3_slots) |*http3_slot| {
+                if (http3_slot.active or http3_slot.awaiting_fin_ack) continue;
+                http3_slot.* = .{
+                    .active = true,
+                    .stream_id = stream_id,
+                    .file = file,
+                    .stream_offset = headers_frame_len,
+                    .file_end = file_end,
+                };
+                break;
+            } else {
+                file.close();
+            }
+        }
+    }
+
     fn sendH3ControlStream(self: *Server, conn: *ConnState, src: std.net.Address) void {
         // Server control stream: stream_id=3 (server-initiated unidirectional).
         // First byte identifies stream type: 0x00 = control stream.
@@ -2576,9 +2734,11 @@ pub const Server = struct {
 
         // SETTINGS: advertise non-zero QPACK_MAX_TABLE_CAPACITY so the peer
         // knows it may insert entries into our dynamic table (RFC 9204 §3.2.3).
+        // Advertise QPACK_BLOCKED_STREAMS so the peer knows we can tolerate
+        // up to QPACK_BLOCKED_STREAMS_MAX streams blocked on table insertions.
         const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
             .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = h3_qpack.DEFAULT_DYN_TABLE_CAPACITY },
-            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = 0 },
+            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = QPACK_BLOCKED_STREAMS_MAX },
         }) catch return;
         pos += settings_len;
 
@@ -4182,7 +4342,7 @@ pub const Client = struct {
         var pos: usize = 1;
         const settings_len = h3_frame.writeSettings(buf[pos..], &[_]h3_frame.Setting{
             .{ .id = h3_frame.SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = h3_qpack.DEFAULT_DYN_TABLE_CAPACITY },
-            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = 0 },
+            .{ .id = h3_frame.SETTINGS_QPACK_BLOCKED_STREAMS, .value = QPACK_BLOCKED_STREAMS_MAX },
         }) catch return;
         pos += settings_len;
 

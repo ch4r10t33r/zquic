@@ -1419,3 +1419,56 @@ test "qpack: dynamic table encode/decode round-trip" {
     try testing.expectEqualSlices(u8, "x-custom", decoded.headers[0].name);
     try testing.expectEqualSlices(u8, "myvalue", decoded.headers[0].value);
 }
+
+// --- Blocked stream tests (RFC 9204 §2.1.2) ---
+
+test "qpack: decodeHeaders returns BlockedStream when decoder table is empty" {
+    const testing = std.testing;
+
+    // Encode a HEADERS block that references a dynamic table entry.
+    var enc_tbl = DynamicTable{};
+    enc_tbl.capacity = 4096;
+    try enc_tbl.insert(":status", "200");
+
+    var buf: [64]u8 = undefined;
+    const written = try encodeHeaders(&[_]Header{
+        .{ .name = ":status", .value = "200" },
+    }, &buf, .{ .table = &enc_tbl });
+
+    // A decoder table with no insertions cannot satisfy RIC=1 — must block.
+    var dec_tbl = DynamicTable{};
+    dec_tbl.capacity = 4096;
+    var out = DecodedHeaders{ .headers = undefined, .count = 0 };
+    const result = decodeHeaders(buf[0..written], &dec_tbl, &out);
+    try testing.expectError(error.BlockedStream, result);
+}
+
+test "qpack: decodeHeaders succeeds after decoder table catches up" {
+    const testing = std.testing;
+
+    // Encoder inserts ":custom: value", then encodes a HEADERS block using it.
+    var enc_tbl = DynamicTable{};
+    enc_tbl.capacity = 4096;
+    try enc_tbl.insert(":custom", "value");
+
+    var buf: [64]u8 = undefined;
+    const written = try encodeHeaders(&[_]Header{
+        .{ .name = ":custom", .value = "value" },
+    }, &buf, .{ .table = &enc_tbl });
+
+    // Simulated decoder table with no entries yet → stream is blocked.
+    var dec_tbl = DynamicTable{};
+    dec_tbl.capacity = 4096;
+    var out = DecodedHeaders{ .headers = undefined, .count = 0 };
+    try testing.expectError(error.BlockedStream, decodeHeaders(buf[0..written], &dec_tbl, &out));
+
+    // Simulate receiving encoder-stream instruction: decoder applies same insertion.
+    try dec_tbl.insert(":custom", "value");
+
+    // Now the decoder table has insertion_count=1 which satisfies RIC=1.
+    out = DecodedHeaders{ .headers = undefined, .count = 0 };
+    try decodeHeaders(buf[0..written], &dec_tbl, &out);
+    try testing.expectEqual(@as(usize, 1), out.count);
+    try testing.expectEqualSlices(u8, ":custom", out.headers[0].name);
+    try testing.expectEqualSlices(u8, "value", out.headers[0].value);
+}
