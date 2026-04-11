@@ -2128,6 +2128,13 @@ pub const Server = struct {
                     std.debug.print("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
                 }
             }
+            // RFC 9002 §9.4: reset congestion controller and RTT estimator on
+            // path change.  bytes_in_flight from the old path is stale — those
+            // packets will never be ACKed on the new path — so we must clear it
+            // or the CC gate will block retransmissions indefinitely.
+            conn.cc = congestion.NewReno.init();
+            conn.rtt = .{};
+            conn.ld = .{};
         }
 
         var pos: usize = 0;
