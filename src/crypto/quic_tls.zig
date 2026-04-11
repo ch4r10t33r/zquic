@@ -203,6 +203,91 @@ pub const CryptoStream = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// CRYPTO Frame Reorder Buffer
+// ---------------------------------------------------------------------------
+
+/// Maximum number of out-of-order segments held per encryption level.
+pub const REORDER_SLOTS: usize = 8;
+/// Maximum byte length of a single buffered CRYPTO fragment.
+pub const REORDER_SLOT_SIZE: usize = 1024;
+
+const CryptoReorderSlot = struct {
+    offset: u64 = 0,
+    used: bool = false,
+    len: usize = 0,
+    data: [REORDER_SLOT_SIZE]u8 = undefined,
+};
+
+/// Small reorder buffer for CRYPTO frames that arrive out-of-order.
+///
+/// TLS handshake messages (especially the client Finished) can arrive before
+/// their preceding fragments due to UDP reordering.  Without buffering, the
+/// out-of-order fragment is silently dropped and the handshake stalls.
+///
+/// Usage (server, Initial level):
+///   if (offset != expected_offset) {
+///       conn.init_crypto_reorder.insert(offset, data);
+///   } else {
+///       process(data); expected_offset += data.len;
+///       // Drain any now-contiguous buffered segments.
+///       var drain_buf: [REORDER_SLOT_SIZE]u8 = undefined;
+///       while (true) {
+///           const n = conn.init_crypto_reorder.take(expected_offset, &drain_buf);
+///           if (n == 0) break;
+///           process(drain_buf[0..n]); expected_offset += n;
+///       }
+///   }
+pub const CryptoReorderBuf = struct {
+    slots: [REORDER_SLOTS]CryptoReorderSlot = [_]CryptoReorderSlot{.{}} ** REORDER_SLOTS,
+
+    /// Buffer an out-of-order CRYPTO segment.
+    /// Silently drops if the buffer is full or the segment exceeds REORDER_SLOT_SIZE.
+    pub fn insert(self: *CryptoReorderBuf, offset: u64, data: []const u8) void {
+        if (data.len > REORDER_SLOT_SIZE) return;
+        // Idempotent: ignore duplicates.
+        for (&self.slots) |*slot| {
+            if (slot.used and slot.offset == offset) return;
+        }
+        // Find an empty slot.
+        for (&self.slots) |*slot| {
+            if (!slot.used) {
+                slot.offset = offset;
+                slot.len = data.len;
+                slot.used = true;
+                @memcpy(slot.data[0..data.len], data);
+                return;
+            }
+        }
+        // Buffer full — evict the segment with the smallest offset (oldest).
+        var oldest: usize = 0;
+        for (1..REORDER_SLOTS) |i| {
+            if (self.slots[i].used and self.slots[i].offset < self.slots[oldest].offset) {
+                oldest = i;
+            }
+        }
+        self.slots[oldest].offset = offset;
+        self.slots[oldest].len = data.len;
+        self.slots[oldest].used = true;
+        @memcpy(self.slots[oldest].data[0..data.len], data);
+    }
+
+    /// If a segment starting at `next_offset` is buffered, copy it into `out`
+    /// (up to `out.len` bytes) and free the slot.  Returns the segment length,
+    /// or 0 if no matching segment is found.
+    pub fn take(self: *CryptoReorderBuf, next_offset: u64, out: []u8) usize {
+        for (&self.slots) |*slot| {
+            if (slot.used and slot.offset == next_offset) {
+                const n = @min(slot.len, out.len);
+                @memcpy(out[0..n], slot.data[0..n]);
+                slot.used = false;
+                return n;
+            }
+        }
+        return 0;
+    }
+};
+
 test "byte_buffer: write and read" {
     const testing = std.testing;
     var bb = ByteBuffer{};
@@ -242,4 +327,45 @@ test "crypto_stream: in-order feed" {
     try cs.feedRecv(3, "def");
     try testing.expectEqual(@as(u64, 6), cs.recv_offset);
     try testing.expectEqual(@as(usize, 6), cs.recv_buf.len());
+}
+
+test "crypto_reorder_buf: insert and take" {
+    const testing = std.testing;
+    var rb = CryptoReorderBuf{};
+
+    // Insert segment at offset 10, then take it.
+    rb.insert(10, "hello");
+    var out: [32]u8 = undefined;
+    const n = rb.take(10, &out);
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqualSlices(u8, "hello", out[0..n]);
+
+    // Slot should now be free — take again returns 0.
+    try testing.expectEqual(@as(usize, 0), rb.take(10, &out));
+}
+
+test "crypto_reorder_buf: drain sequence" {
+    const testing = std.testing;
+    var rb = CryptoReorderBuf{};
+
+    // Simulate out-of-order arrival: segment at offset 5 arrives before offset 0.
+    rb.insert(5, "world");
+    rb.insert(0, "hello");
+
+    var expected_offset: u64 = 0;
+    var out: [32]u8 = undefined;
+
+    // Drain contiguous run starting at 0.
+    var n = rb.take(expected_offset, &out);
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqualSlices(u8, "hello", out[0..n]);
+    expected_offset += n;
+
+    n = rb.take(expected_offset, &out);
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqualSlices(u8, "world", out[0..n]);
+    expected_offset += n;
+
+    try testing.expectEqual(@as(u64, 10), expected_offset);
+    try testing.expectEqual(@as(usize, 0), rb.take(expected_offset, &out));
 }
