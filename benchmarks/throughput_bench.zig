@@ -59,8 +59,8 @@ pub fn main() !void {
     // Create a temporary www directory with a test file.
     const www_dir = "/tmp/zquic_bench_www";
     const dl_dir = "/tmp/zquic_bench_dl";
-    try fs.makeDirAbsolute(www_dir) catch |e| if (e != error.PathAlreadyExists) return e;
-    try fs.makeDirAbsolute(dl_dir) catch |e| if (e != error.PathAlreadyExists) return e;
+    fs.makeDirAbsolute(www_dir) catch |e| if (e != error.PathAlreadyExists) return e;
+    fs.makeDirAbsolute(dl_dir) catch |e| if (e != error.PathAlreadyExists) return e;
 
     const test_file = www_dir ++ "/bench.bin";
     const expected_bytes = size_mb * 1024 * 1024;
@@ -103,7 +103,7 @@ pub fn main() !void {
     try server_proc.spawn();
 
     // Give the server a moment to bind.
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     // Launch client and time the download.
     const dl_file = try std.fmt.allocPrint(alloc, "{s}/bench.bin", .{dl_dir});
