@@ -4635,11 +4635,33 @@ pub const Client = struct {
 
         if (buf[0] & 0x80 != 0) {
             const lh = header_mod.parseLong(buf) catch return;
+            // Determine this packet's total length for coalesced packet handling
+            // (RFC 9000 §12.2).  For Initial packets the Length field starts after
+            // the token; for Handshake packets it starts right after the header.
+            const pkt_end: usize = blk: {
+                var pos = lh.consumed;
+                if (lh.header.packet_type == .initial) {
+                    // Skip token_len + token.
+                    const tok_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    pos += tok_r.len + @as(usize, @intCast(tok_r.value));
+                }
+                if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
+                    if (pos >= buf.len) break :blk buf.len;
+                    const len_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    pos += len_r.len + @as(usize, @intCast(len_r.value));
+                    break :blk @min(pos, buf.len);
+                }
+                break :blk buf.len;
+            };
             switch (lh.header.packet_type) {
-                .initial => self.processInitialPacket(buf),
-                .handshake => self.processHandshakePacket(buf),
+                .initial => self.processInitialPacket(buf[0..pkt_end]),
+                .handshake => self.processHandshakePacket(buf[0..pkt_end]),
                 .retry => self.processRetryPacket(buf),
                 else => {},
+            }
+            // RFC 9000 §12.2: process remaining coalesced packets in same datagram.
+            if (pkt_end < buf.len) {
+                self.processPacket(buf[pkt_end..]);
             }
         } else {
             self.process1RttPacket(buf);
