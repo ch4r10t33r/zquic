@@ -601,6 +601,11 @@ const Http09OutSlot = struct {
     file: std.fs.File = undefined,
     stream_offset: u64 = 0,
     file_end: u64 = 0,
+    /// Absolute filesystem path, stored so we can reopen the file for
+    /// retransmission after it has been closed when transitioning to the
+    /// awaiting_fin_ack state.
+    file_path: [512]u8 = [_]u8{0} ** 512,
+    file_path_len: usize = 0,
 
     /// FIN retransmission state.
     /// After sending the final STREAM frame (FIN=true), the slot transitions
@@ -2231,7 +2236,7 @@ pub const Server = struct {
                 // Loss detection + RTT estimation (RFC 9002).
                 // Pass first_ack_range so the loss detector can correctly
                 // distinguish acked packets from those in gaps.
-                var lost_buf: [32]u64 = undefined;
+                var lost_buf: [32]recovery.SentPacket = undefined;
                 const ld_result = conn.ld.onAck(
                     largest_ack,
                     first_ack_range,
@@ -2251,10 +2256,46 @@ pub const Server = struct {
                 if (ld_result.lost_bytes > 0) {
                     conn.cc.bytes_in_flight -|= ld_result.lost_bytes;
                 }
-                // Signal loss events to CC for cwnd reduction.
+                // Signal loss events to CC and rewind any affected HTTP/0.9
+                // stream slots so lost data is retransmitted (RFC 9000 §3.3).
                 var li: usize = 0;
                 while (li < ld_result.lost_count) : (li += 1) {
-                    conn.cc.onLoss(lost_buf[li]);
+                    const lp = lost_buf[li];
+                    conn.cc.onLoss(lp.pn);
+                    // Retransmit: if the lost packet carried stream data, rewind
+                    // the corresponding http09 slot so the data is re-sent.
+                    if (lp.has_stream_data) {
+                        for (&conn.http09_slots) |*slot| {
+                            if (slot.stream_id != lp.stream_id) continue;
+                            if (slot.active) {
+                                // Normal case: slot is still sending; rewind offset.
+                                if (lp.stream_offset < slot.stream_offset) {
+                                    slot.stream_offset = lp.stream_offset;
+                                    slot.file.seekTo(lp.stream_offset) catch {};
+                                    dbg("io: retransmit stream_id={} rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
+                                }
+                            } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
+                                // The FIN was already sent and the file closed, but a
+                                // pre-FIN packet was lost.  Reopen the file and re-
+                                // activate the slot so flushPendingHttp09Responses
+                                // will retransmit the missing data.
+                                const fp = slot.file_path[0..slot.file_path_len];
+                                if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                                    f.seekTo(lp.stream_offset) catch {
+                                        f.close();
+                                        break;
+                                    };
+                                    slot.file = f;
+                                    slot.stream_offset = lp.stream_offset;
+                                    slot.active = true;
+                                    slot.awaiting_fin_ack = false;
+                                    conn.http09_active_count += 1;
+                                    dbg("io: retransmit stream_id={} reopened file, rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
+                                } else |_| {}
+                            }
+                            break;
+                        }
+                    }
                 }
                 // ACK received — reset PTO backoff counter and record timestamp
                 // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
@@ -2536,6 +2577,14 @@ pub const Server = struct {
             return;
         }
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
+        // Patch stream metadata into the last recorded SentPacket so that the
+        // loss detector can surface it for retransmission if this packet is lost.
+        if (conn.ld.sent_count > 0) {
+            const last = &conn.ld.sent[conn.ld.sent_count - 1];
+            last.has_stream_data = true;
+            last.stream_id = slot.stream_id;
+            last.stream_offset = old_offset;
+        }
         if (fin) {
             // Save FIN frame for retransmission in case the packet is dropped
             // by the NS3 network simulator.  We keep the slot alive in the
@@ -2884,6 +2933,11 @@ pub const Server = struct {
                 .stream_offset = 0,
                 .file_end = file_end,
             };
+            // Store the file path so we can reopen it for retransmission if a
+            // pre-FIN packet is lost after the file has been closed.
+            const path_len = @min(fs_path.len, slot.file_path.len);
+            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
+            slot.file_path_len = path_len;
             conn.http09_active_count += 1;
             dbg("io: http09 stream_id={} opened (size={})\n", .{ sf.stream_id, file_end });
             return;
