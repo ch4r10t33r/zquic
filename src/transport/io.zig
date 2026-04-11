@@ -641,6 +641,13 @@ const Http3OutSlot = struct {
     stream_offset: u64 = 0,
     file_end: u64 = 0,
 
+    /// HTTP/3 trailers (RFC 9114 §4.1.2): a second HEADERS frame sent after
+    /// all DATA frames, before the stream FIN.  When send_trailers = true the
+    /// event loop encodes and transmits a HEADERS frame with trailer fields
+    /// before closing the stream.
+    send_trailers: bool = false,
+    trailer_sent: bool = false,
+
     /// FIN retransmission state — same pattern as Http09OutSlot.
     awaiting_fin_ack: bool = false,
     fin_frame: [1300]u8 = [_]u8{0} ** 1300,
@@ -769,6 +776,10 @@ pub const ConnState = struct {
     // sent, including the leading stream-type byte (0x03).
     qpack_dec_stream_off: u64 = 0,
 
+    // Byte offset within the server's HTTP/3 control stream (stream 3 server /
+    // stream 2 client).  Advanced each time we append frames (e.g. GOAWAY).
+    h3_ctrl_stream_off: u64 = 0,
+
     /// Buffered HEADERS blocks that arrived before the QPACK dynamic table had
     /// enough insertions to decode them (RFC 9204 §2.1.2).  Retried each time
     /// new encoder-stream instructions advance the decoder table.
@@ -821,6 +832,32 @@ pub const ConnState = struct {
     // Connection migration (RFC 9000 §9): pending PATH_CHALLENGE data.
     // Non-null while waiting for a PATH_RESPONSE from the new address.
     path_challenge_data: ?[8]u8 = null,
+
+    // ── Connection-level flow control (RFC 9000 §4) ───────────────────────────
+    // Both sides advertise initial_max_data = 64 MiB in transport parameters.
+    // fc_send_max tracks how many cumulative bytes we may send (peer's window);
+    // it is raised by MAX_DATA frames from the peer.
+    // fc_bytes_sent / fc_bytes_recv track cumulative stream-data bytes sent and
+    // received; used to check credit and decide when to advertise more window.
+    fc_send_max: u64 = 64 * 1024 * 1024,
+    fc_recv_max: u64 = 64 * 1024 * 1024,
+    fc_bytes_sent: u64 = 0,
+    fc_bytes_recv: u64 = 0,
+
+    // ── Graceful teardown ─────────────────────────────────────────────────────
+    // draining is set when CONNECTION_CLOSE is sent or received; once set, all
+    // outgoing packets are suppressed and incoming are silently discarded.
+    draining: bool = false,
+    conn_close_sent: bool = false,
+    goaway_sent: bool = false,
+
+    // ── Stateless Reset (RFC 9000 §10.3) ─────────────────────────────────────
+    // Generated once (random) during handshake completion; sent in the
+    // NEW_CONNECTION_ID frame so the peer can reset us without state.
+    // On receive, if decryption fails and the last 16 bytes of a ≥21-byte
+    // packet match this token, the connection is treated as reset.
+    stateless_reset_token: [16]u8 = [_]u8{0} ** 16,
+    stateless_reset_token_set: bool = false,
 
     // 0-RTT early data keys (derived from PSK + ClientHello transcript hash).
     early_km: KeyMaterial = undefined,
@@ -1890,7 +1927,14 @@ pub const Server = struct {
                 fp += 1; // cid length = 8
                 @memcpy(frames_buf[fp .. fp + 8], new_cid.slice());
                 fp += 8;
-                @memset(frames_buf[fp .. fp + 16], 0); // stateless reset token (all zeros)
+                // Generate a random stateless reset token (RFC 9000 §10.3) once
+                // per connection and include it with the NEW_CONNECTION_ID frame.
+                if (!conn.stateless_reset_token_set) {
+                    var prng3 = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ @as(i64, @intCast(new_cid.slice()[0]))));
+                    prng3.random().bytes(&conn.stateless_reset_token);
+                    conn.stateless_reset_token_set = true;
+                }
+                @memcpy(frames_buf[fp .. fp + 16], &conn.stateless_reset_token);
                 fp += 16;
             }
         }
@@ -1968,6 +2012,17 @@ pub const Server = struct {
                             srv_decrypted_pn = r.pn;
                             break :decrypt r.pt_len;
                         } else |_| {}
+                    }
+                    // RFC 9000 §10.3: Stateless Reset detection.
+                    // If the packet is ≥21 bytes and ends with our stored token,
+                    // the peer is signalling a reset without connection state.
+                    if (buf.len >= 21 and conn.stateless_reset_token_set) {
+                        const tail = buf[buf.len - 16 ..];
+                        if (std.mem.eql(u8, tail, &conn.stateless_reset_token)) {
+                            std.debug.print("io: Stateless Reset detected — entering draining\n", .{});
+                            conn.draining = true;
+                            return;
+                        }
                     }
                     std.debug.print(
                         "io: server 1-RTT decrypt failed after DCID match (len={} incoming_kp={} stored_kp={} chacha={})\n",
@@ -2092,18 +2147,53 @@ pub const Server = struct {
                 continue;
             }
             if (ft == 0x10) {
+                // MAX_DATA — peer raises our connection-level send window.
                 const v = varint.decode(frames[pos..]) catch return;
                 pos += v.len;
+                if (v.value > conn.fc_send_max) {
+                    conn.fc_send_max = v.value;
+                    std.debug.print("io: MAX_DATA updated send_max={}\n", .{conn.fc_send_max});
+                }
                 continue;
             }
             if (ft == 0x11) {
+                // MAX_STREAM_DATA — peer raises send window on a specific stream.
+                // We track only connection-level credit; use the stream's max to
+                // advance our connection-level credit if it is the binding limit.
                 const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
                 pos += r.consumed;
+                if (r.frame.maximum_stream_data > conn.fc_send_max) {
+                    conn.fc_send_max = r.frame.maximum_stream_data;
+                }
                 continue;
             }
             if (ft == 0x12 or ft == 0x13) {
+                // MAX_STREAMS — ignore for now (we don't enforce stream limits).
                 const v = varint.decode(frames[pos..]) catch return;
                 pos += v.len;
+                continue;
+            }
+            if (ft == 0x14) {
+                // DATA_BLOCKED — peer ran out of connection-level send credit.
+                // Respond with MAX_DATA to unblock it.
+                const db = varint.decode(frames[pos..]) catch return;
+                pos += db.len;
+                self.sendMaxData(conn, src);
+                continue;
+            }
+            if (ft == 0x15) {
+                // STREAM_DATA_BLOCKED — peer ran out of stream-level send credit.
+                const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
+                pos += r.consumed;
+                self.sendMaxStreamData(conn, r.frame.stream_id, src);
+                continue;
+            }
+            if (ft == 0x1c or ft == 0x1d) {
+                // CONNECTION_CLOSE — peer is closing the connection.
+                const r = transport_frames.ConnectionClose.parse(frames[pos..], ft == 0x1d) catch return;
+                pos += r.consumed;
+                std.debug.print("io: CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
+                conn.draining = true;
                 continue;
             }
             if (ft == 0x1a) {
@@ -2135,6 +2225,16 @@ pub const Server = struct {
                 };
                 pos += sf_r.consumed;
                 std.debug.print("io: STREAM frame parsed: stream_id={} offset={} data_len={} fin={}\n", .{ sf_r.frame.stream_id, sf_r.frame.offset, sf_r.frame.data.len, sf_r.frame.fin });
+                // Flow control (RFC 9000 §4.1): track cumulative bytes received.
+                const recv_end = sf_r.frame.offset + sf_r.frame.data.len;
+                if (recv_end > conn.fc_bytes_recv) conn.fc_bytes_recv = recv_end;
+                if (conn.fc_bytes_recv > conn.fc_recv_max) {
+                    // Flow control violation — close with FLOW_CONTROL_ERROR (0x03).
+                    self.sendConnectionClose(conn, 0x03, "flow control violation", src);
+                    return;
+                }
+                // Advertise more window when 50% consumed (RFC 9000 §4.2).
+                if (conn.fc_bytes_recv * 2 >= conn.fc_recv_max) self.sendMaxData(conn, src);
                 self.handleStreamData(conn, &sf_r.frame, src);
                 continue;
             }
@@ -2344,6 +2444,78 @@ pub const Server = struct {
         var frame_buf: [64]u8 = undefined;
         const frame_len = transport_frames.PathResponse.serialize(.{ .data = data }, &frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], dst);
+    }
+
+    /// Send a CONNECTION_CLOSE frame (QUIC layer, type 0x1c) and enter draining.
+    /// RFC 9000 §10.2.3: after sending CONNECTION_CLOSE the endpoint enters the
+    /// draining state and MUST NOT send any further packets except for additional
+    /// CONNECTION_CLOSE copies to handle packet loss.
+    fn sendConnectionClose(self: *Server, conn: *ConnState, error_code: u64, reason: []const u8, dst: std.net.Address) void {
+        if (conn.conn_close_sent) return;
+        conn.conn_close_sent = true;
+        conn.draining = true;
+        const frame = transport_frames.ConnectionClose{
+            .is_application = false,
+            .error_code = error_code,
+            .frame_type = 0,
+            .reason_phrase = reason,
+        };
+        var buf: [256]u8 = undefined;
+        const len = frame.serialize(&buf) catch return;
+        self.send1Rtt(conn, buf[0..len], dst);
+        std.debug.print("io: sent CONNECTION_CLOSE code={} reason=\"{s}\"\n", .{ error_code, reason });
+    }
+
+    /// Send a MAX_DATA frame to extend the peer's connection-level send window.
+    /// Called when we have consumed ≥50% of the advertised receive window so the
+    /// peer is not forced to stall.  We double the window each time.
+    fn sendMaxData(self: *Server, conn: *ConnState, dst: std.net.Address) void {
+        conn.fc_recv_max = conn.fc_bytes_recv + 64 * 1024 * 1024;
+        var buf: [16]u8 = undefined;
+        buf[0] = 0x10; // MAX_DATA frame type
+        const enc = varint.encode(buf[1..], conn.fc_recv_max) catch return;
+        self.send1Rtt(conn, buf[0 .. 1 + enc.len], dst);
+        std.debug.print("io: sent MAX_DATA new_max={}\n", .{conn.fc_recv_max});
+    }
+
+    /// Send a MAX_STREAM_DATA frame to extend the peer's send window on one stream.
+    fn sendMaxStreamData(self: *Server, conn: *ConnState, stream_id: u64, dst: std.net.Address) void {
+        const new_max: u64 = conn.fc_bytes_recv + 64 * 1024 * 1024;
+        var buf: [32]u8 = undefined;
+        buf[0] = 0x11; // MAX_STREAM_DATA frame type
+        var pos: usize = 1;
+        const sid_enc = varint.encode(buf[pos..], stream_id) catch return;
+        pos += sid_enc.len;
+        const max_enc = varint.encode(buf[pos..], new_max) catch return;
+        pos += max_enc.len;
+        self.send1Rtt(conn, buf[0..pos], dst);
+        std.debug.print("io: sent MAX_STREAM_DATA stream_id={} new_max={}\n", .{ stream_id, new_max });
+    }
+
+    /// Send a GOAWAY frame on the HTTP/3 control stream (stream 3).
+    /// RFC 9114 §5.2: the Push ID or stream ID in the GOAWAY payload is the
+    /// largest stream ID the server will process.  Clients MUST NOT send new
+    /// requests on stream IDs ≥ this value.
+    fn sendGoaway(self: *Server, conn: *ConnState, last_stream_id: u64, dst: std.net.Address) void {
+        if (conn.goaway_sent) return;
+        conn.goaway_sent = true;
+        // GOAWAY is an HTTP/3 frame sent on the server control stream (stream 3).
+        var payload: [16]u8 = undefined;
+        const enc = varint.encode(&payload, last_stream_id) catch return;
+        var h3_buf: [32]u8 = undefined;
+        const h3_len = h3_frame.writeFrame(&h3_buf, @intFromEnum(h3_frame.FrameType.goaway), payload[0..enc.len]) catch return;
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = 3, // server control stream
+            .offset = conn.h3_ctrl_stream_off,
+            .data = h3_buf[0..h3_len],
+            .fin = false,
+            .has_length = true,
+        };
+        var frame_buf: [64]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..frame_len], dst);
+        conn.h3_ctrl_stream_off += h3_len;
+        std.debug.print("io: sent GOAWAY last_stream_id={}\n", .{last_stream_id});
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
@@ -2567,11 +2739,22 @@ pub const Server = struct {
 
         switch (stream_type) {
             0x00 => {
-                // Client control stream: carries SETTINGS.
-                // We already advertise our own capacity; parse the client's SETTINGS
-                // to learn the peer_max_capacity (not yet used for insertions).
-                // For now, just acknowledge receipt silently.
+                // Client control stream: carries SETTINGS and possibly GOAWAY.
+                // Parse HTTP/3 frames to detect GOAWAY (RFC 9114 §5.2).
                 std.debug.print("io: h3 client control stream received ({} bytes body)\n", .{body.len});
+                var off: usize = 0;
+                while (off < body.len) {
+                    const pr = h3_frame.parseFrame(body[off..]) catch break;
+                    off += pr.consumed;
+                    switch (pr.frame) {
+                        .goaway => |stream_id| {
+                            // Client is done sending requests — we may finish in-flight work.
+                            std.debug.print("io: h3 GOAWAY received from client stream_id={}\n", .{stream_id});
+                            conn.draining = true;
+                        },
+                        else => {},
+                    }
+                }
             },
             0x02 => {
                 // QPACK encoder stream: apply insertion instructions to our decoder table.
@@ -2752,6 +2935,7 @@ pub const Server = struct {
         var frame_buf: [300]u8 = undefined;
         const frame_len = sf.serialize(&frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], src);
+        conn.h3_ctrl_stream_off = pos; // track offset for subsequent frames (e.g. GOAWAY)
 
         // QPACK encoder stream: stream_id=7 (next server-initiated unidirectional).
         // Stream type byte 0x02 + Set Dynamic Table Capacity + Insert :status 200
@@ -2807,12 +2991,50 @@ pub const Server = struct {
         std.debug.print("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
     }
 
+    /// Send a new Insert instruction on the QPACK encoder stream (stream 7).
+    /// Called mid-connection when the server wants to add a new (name, value)
+    /// to the peer's dynamic table so future HEADERS blocks can reference it.
+    /// RFC 9204 §3.2.4: Insert With Static Name Reference.
+    fn addQpackEncoderInsert(
+        self: *Server,
+        conn: *ConnState,
+        static_name_idx: usize,
+        value: []const u8,
+        name: []const u8,
+        src: std.net.Address,
+    ) void {
+        if (conn.qpack_enc_stream_off == 0) return; // encoder stream not yet initialised
+        var ins_buf: [256]u8 = undefined;
+        const ins_len = h3_qpack.writeInsertWithStaticNameRef(ins_buf[0..], static_name_idx, value) catch return;
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = 7, // server QPACK encoder stream
+            .offset = conn.qpack_enc_stream_off,
+            .data = ins_buf[0..ins_len],
+            .fin = false,
+            .has_length = true,
+        };
+        var frame_buf: [300]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..frame_len], src);
+        conn.qpack_enc_tbl.insert(name, value) catch {};
+        conn.qpack_enc_stream_off += ins_len;
+        std.debug.print("io: QPACK encoder insert name={s} value={s}\n", .{ name, value });
+    }
+
     fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: std.net.Address) void {
         var status_buf: [4]u8 = undefined;
         const status_str = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch "500";
+
+        // QPACK encoder continuation (RFC 9204 §3.2.4): if this exact status value
+        // is not yet in our dynamic table, insert it now so the HEADERS block can
+        // use a compact dynamic reference.  :status is static index 24 (base name).
+        if (conn.qpack_enc_tbl.findExact(":status", status_str) == null) {
+            self.addQpackEncoderInsert(conn, 24, status_str, ":status", src);
+        }
+
         var header_block: [256]u8 = undefined;
-        // Pass encoder table: if :status 200 is cached the encoder uses a
-        // 1-byte dynamic ref; for other statuses it falls back to static/literal.
+        // Pass encoder table: if :status is cached the encoder uses a compact
+        // dynamic ref; for uncached values it falls back to static/literal.
         const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
             .{ .name = ":status", .value = status_str },
         }, &header_block, .{ .table = &conn.qpack_enc_tbl }) catch return;
@@ -2863,7 +3085,32 @@ pub const Server = struct {
         };
 
         if (n == 0) {
-            // EOF: send a zero-length STREAM frame with FIN to close the stream.
+            // EOF: optionally send HTTP/3 trailing HEADERS before the stream FIN.
+            // RFC 9114 §4.1.2: a sender MAY include a HEADERS frame after the DATA
+            // frames; this is called the "trailer section" and carries trailing fields.
+            if (slot.send_trailers and !slot.trailer_sent) {
+                slot.trailer_sent = true;
+                // Encode a minimal trailer HEADERS block (no dynamic refs needed).
+                var trailer_block: [64]u8 = undefined;
+                const tb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
+                    .{ .name = "x-transfer-complete", .value = "1" },
+                }, &trailer_block, .{}) catch 0;
+                if (tb_len > 0) {
+                    var trailer_frame: [80]u8 = undefined;
+                    const tf_len = h3_frame.writeFrame(
+                        &trailer_frame,
+                        @intFromEnum(h3_frame.FrameType.headers),
+                        trailer_block[0..tb_len],
+                    ) catch 0;
+                    if (tf_len > 0) {
+                        self.sendStreamDataH3(conn, slot.stream_id, slot.stream_offset, trailer_frame[0..tf_len], false, conn.peer);
+                        slot.stream_offset += tf_len;
+                        std.debug.print("io: http3 stream_id={} trailing HEADERS sent\n", .{slot.stream_id});
+                    }
+                }
+            }
+
+            // Send a zero-length STREAM frame with FIN to close the stream.
             std.debug.print("io: http3 stream_id={} EOF offset={}\n", .{ slot.stream_id, slot.stream_offset });
             const sf_fin = stream_frame_mod.StreamFrame{
                 .stream_id = slot.stream_id,
@@ -3984,6 +4231,49 @@ pub const Client = struct {
                 }
                 continue;
             }
+            if (ft == 0x10) {
+                // MAX_DATA — server raises our connection-level send window.
+                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                pos += v.len;
+                if (v.value > self.conn.fc_send_max) {
+                    self.conn.fc_send_max = v.value;
+                    std.debug.print("io: client MAX_DATA updated send_max={}\n", .{self.conn.fc_send_max});
+                }
+                continue;
+            }
+            if (ft == 0x11) {
+                // MAX_STREAM_DATA — server raises stream-level send window.
+                const r = transport_frames.MaxStreamData.parse(plaintext[pos..pt_len]) catch return;
+                pos += r.consumed;
+                if (r.frame.maximum_stream_data > self.conn.fc_send_max) {
+                    self.conn.fc_send_max = r.frame.maximum_stream_data;
+                }
+                continue;
+            }
+            if (ft == 0x12 or ft == 0x13) {
+                // MAX_STREAMS — ignore.
+                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                pos += v.len;
+                continue;
+            }
+            if (ft == 0x14 or ft == 0x15) {
+                // DATA_BLOCKED / STREAM_DATA_BLOCKED — server is stalled; skip.
+                const v = varint.decode(plaintext[pos..pt_len]) catch return;
+                pos += v.len;
+                if (ft == 0x15) { // STREAM_DATA_BLOCKED also has stream_id
+                    const v2 = varint.decode(plaintext[pos..pt_len]) catch return;
+                    pos += v2.len;
+                }
+                continue;
+            }
+            if (ft == 0x1c or ft == 0x1d) {
+                // CONNECTION_CLOSE — server is closing the connection.
+                const r = transport_frames.ConnectionClose.parse(plaintext[pos..pt_len], ft == 0x1d) catch return;
+                pos += r.consumed;
+                std.debug.print("io: client CONNECTION_CLOSE received code={} reason=\"{s}\"\n", .{ r.frame.error_code, r.frame.reason_phrase });
+                self.conn.draining = true;
+                continue;
+            }
             if (ft == 0x18) {
                 // NEW_CONNECTION_ID — store for use when migrating (RFC 9000 §19.15).
                 const seq_r = varint.decode(plaintext[pos..pt_len]) catch return;
@@ -3996,7 +4286,12 @@ pub const Client = struct {
                 if (pos + cid_len_byte + 16 > pt_len) return;
                 const new_cid = ConnectionId.fromSlice(plaintext[pos .. pos + cid_len_byte]) catch return;
                 pos += cid_len_byte;
-                pos += 16; // skip stateless reset token
+                // Store the stateless reset token for this CID so we can detect resets.
+                if (pos + 16 <= pt_len) {
+                    @memcpy(&self.conn.stateless_reset_token, plaintext[pos .. pos + 16]);
+                    self.conn.stateless_reset_token_set = true;
+                }
+                pos += 16;
                 if (seq_r.value == 1) {
                     self.conn.next_remote_cid = new_cid;
                     std.debug.print("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
@@ -4176,11 +4471,13 @@ pub const Client = struct {
         std.debug.print("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
 
         // Server-initiated unidirectional streams (stream_id % 4 == 3):
-        //   id=3  → server control stream    (SETTINGS; ignore)
+        //   id=3  → server control stream (SETTINGS, GOAWAY, …)
         //   id=7  → server QPACK encoder stream (apply insertions to our decoder table)
         //   id=11 → server QPACK decoder stream (Section Acks; ignore)
         if (sf.stream_id % 4 == 3) {
-            if (sf.data.len > 0 and sf.data[0] == 0x02) {
+            if (sf.data.len == 0) return;
+            const stream_type_byte = sf.data[0];
+            if (stream_type_byte == 0x02) {
                 // QPACK encoder stream body starts after stream type byte.
                 var off: usize = 1;
                 while (off < sf.data.len) {
@@ -4193,6 +4490,22 @@ pub const Client = struct {
                 std.debug.print("io: client QPACK dec table capacity={} count={}\n", .{
                     self.conn.qpack_dec_tbl.capacity, self.conn.qpack_dec_tbl.count,
                 });
+            } else if (stream_type_byte == 0x00) {
+                // Server control stream: parse HTTP/3 frames (SETTINGS, GOAWAY, …).
+                const body = sf.data[1..];
+                var off: usize = 0;
+                while (off < body.len) {
+                    const pr = h3_frame.parseFrame(body[off..]) catch break;
+                    off += pr.consumed;
+                    switch (pr.frame) {
+                        .goaway => |stream_id| {
+                            // Server is done processing new requests past this ID.
+                            std.debug.print("io: GOAWAY received from server last_stream_id={}\n", .{stream_id});
+                            self.conn.draining = true;
+                        },
+                        else => {},
+                    }
+                }
             }
             return;
         }

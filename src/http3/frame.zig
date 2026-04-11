@@ -253,3 +253,37 @@ test "http3 frame: BufferTooShort" {
     const buf = [_]u8{0x00}; // type=DATA but no length
     try std.testing.expectError(error.BufferTooShort, parseFrame(&buf));
 }
+
+test "http3 frame: GOAWAY in control stream body" {
+    // Simulate the body of a server control stream: SETTINGS then GOAWAY.
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    // SETTINGS with two entries
+    const settings_len = writeSettings(buf[pos..], &[_]Setting{
+        .{ .id = SETTINGS_QPACK_MAX_TABLE_CAPACITY, .value = 4096 },
+    }) catch unreachable;
+    pos += settings_len;
+    // GOAWAY with last_stream_id=8
+    var goaway_payload: [4]u8 = undefined;
+    var w = @import("../varint.zig").Writer{ .buf = &goaway_payload, .pos = 0 };
+    w.writeVarint(8) catch unreachable;
+    const goaway_len = writeFrame(buf[pos..], @intFromEnum(FrameType.goaway), goaway_payload[0..w.pos]) catch unreachable;
+    pos += goaway_len;
+
+    // Parse the whole body as a sequence of frames.
+    var off: usize = 0;
+    var saw_goaway = false;
+    while (off < pos) {
+        const pr = parseFrame(buf[off..pos]) catch break;
+        off += pr.consumed;
+        switch (pr.frame) {
+            .goaway => |sid| {
+                try testing.expectEqual(@as(u64, 8), sid);
+                saw_goaway = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_goaway);
+}

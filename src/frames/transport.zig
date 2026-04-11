@@ -235,3 +235,37 @@ test "transport: MAX_DATA parse" {
     const r = try frame.parseOne(&buf);
     try testing.expectEqual(@as(u64, 0x1234), r.frame.max_data.maximum_data);
 }
+
+test "transport: CONNECTION_CLOSE application close round-trip" {
+    const testing = std.testing;
+    // Application-level close (type 0x1d) has no frame_type field.
+    const frame = ConnectionClose{
+        .is_application = true,
+        .error_code = 0x0100, // H3_NO_ERROR
+        .frame_type = 0,
+        .reason_phrase = "shutdown",
+    };
+    var buf: [64]u8 = undefined;
+    const written = try frame.serialize(&buf);
+    // buf[0] should be type byte 0x1d
+    try testing.expectEqual(@as(u8, 0x1d), buf[0]);
+    const r = try ConnectionClose.parse(buf[1..written], true);
+    try testing.expectEqual(@as(u64, 0x0100), r.frame.error_code);
+    try testing.expectEqualSlices(u8, "shutdown", r.frame.reason_phrase);
+    try testing.expect(r.frame.is_application);
+}
+
+test "transport: DATA_BLOCKED and STREAM_DATA_BLOCKED frame types" {
+    const testing = std.testing;
+    // DATA_BLOCKED (type 0x14) carries a varint limit.
+    const frame = @import("frame.zig");
+    var db_buf = [_]u8{ 0x14, 0x40, 0x64 }; // type=0x14, limit=100 (2-byte varint)
+    const db_r = try frame.parseOne(&db_buf);
+    try testing.expectEqual(@as(u64, 100), db_r.frame.data_blocked.maximum_data);
+
+    // STREAM_DATA_BLOCKED (type 0x15) carries stream_id then limit.
+    var sdb_buf = [_]u8{ 0x15, 0x04, 0x40, 0x64 }; // type, stream_id=4, limit=100
+    const sdb_r = try frame.parseOne(&sdb_buf);
+    try testing.expectEqual(@as(u64, 4), sdb_r.frame.stream_data_blocked.stream_id);
+    try testing.expectEqual(@as(u64, 100), sdb_r.frame.stream_data_blocked.maximum_stream_data);
+}
