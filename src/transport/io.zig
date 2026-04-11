@@ -640,6 +640,18 @@ const Http3OutSlot = struct {
     /// Byte offset in the QUIC stream (includes the HEADERS frame already sent).
     stream_offset: u64 = 0,
     file_end: u64 = 0,
+    /// Raw file position in bytes (separate from stream_offset which includes
+    /// HEADERS frame and DATA frame header overhead).  Used for retransmission:
+    /// when a packet is declared lost, we seek the file to file_offset and
+    /// rewind stream_offset to the corresponding QUIC stream position.
+    file_offset: u64 = 0,
+    /// Initial QUIC stream offset when file data starts (= HEADERS frame length).
+    /// Used to convert between QUIC stream offset and raw file position.
+    stream_offset_base: u64 = 0,
+    /// Absolute path for reopening the file after it has been closed in the
+    /// awaiting_fin_ack state (same pattern as Http09OutSlot).
+    file_path: [512]u8 = [_]u8{0} ** 512,
+    file_path_len: usize = 0,
 
     /// HTTP/3 trailers (RFC 9114 §4.1.2): a second HEADERS frame sent after
     /// all DATA frames, before the stream FIN.  When send_trailers = true the
@@ -2269,8 +2281,9 @@ pub const Server = struct {
                     const lp = lost_buf[li];
                     conn.cc.onLoss(lp.pn);
                     // Retransmit: if the lost packet carried stream data, rewind
-                    // the corresponding http09 slot so the data is re-sent.
+                    // the corresponding slot so the data is re-sent.
                     if (lp.has_stream_data) {
+                        // HTTP/0.9 slots: stream_offset == file offset directly.
                         for (&conn.http09_slots) |*slot| {
                             if (slot.stream_id != lp.stream_id) continue;
                             if (slot.active) {
@@ -2278,7 +2291,7 @@ pub const Server = struct {
                                 if (lp.stream_offset < slot.stream_offset) {
                                     slot.stream_offset = lp.stream_offset;
                                     slot.file.seekTo(lp.stream_offset) catch {};
-                                    dbg("io: retransmit stream_id={} rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
+                                    dbg("io: retransmit h09 stream_id={} rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
                                 }
                             } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
                                 // The FIN was already sent and the file closed, but a
@@ -2296,8 +2309,44 @@ pub const Server = struct {
                                     slot.active = true;
                                     slot.awaiting_fin_ack = false;
                                     conn.http09_active_count += 1;
-                                    dbg("io: retransmit stream_id={} reopened file, rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
+                                    dbg("io: retransmit h09 stream_id={} reopened file, rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
                                 } else |_| {}
+                            }
+                            break;
+                        }
+                        // HTTP/3 slots: stream_offset is the QUIC stream offset.
+                        // Derive file offset from QUIC stream offset and DATA frame
+                        // overhead: each 900-byte chunk is wrapped in a 3-byte DATA
+                        // frame header (type 0x00 + 2-byte varint length for len=900).
+                        for (&conn.http3_slots) |*slot| {
+                            if (slot.stream_id != lp.stream_id) continue;
+                            if (lp.stream_offset < slot.stream_offset) {
+                                const data_bytes = lp.stream_offset -| slot.stream_offset_base;
+                                // Each full 900-byte chunk contributes 903 QUIC bytes (3 H3 overhead).
+                                const full_chunks = data_bytes / 903;
+                                const partial_quic = data_bytes % 903;
+                                const file_pos = full_chunks * 900 + if (partial_quic > 3) partial_quic - 3 else 0;
+                                if (slot.active) {
+                                    slot.stream_offset = lp.stream_offset;
+                                    slot.file_offset = file_pos;
+                                    slot.file.seekTo(file_pos) catch {};
+                                    dbg("io: retransmit h3 stream_id={} rewind quic_off={} file_pos={}\n", .{ lp.stream_id, lp.stream_offset, file_pos });
+                                } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
+                                    const fp = slot.file_path[0..slot.file_path_len];
+                                    if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                                        f.seekTo(file_pos) catch {
+                                            f.close();
+                                            break;
+                                        };
+                                        slot.file = f;
+                                        slot.stream_offset = lp.stream_offset;
+                                        slot.file_offset = file_pos;
+                                        slot.active = true;
+                                        slot.awaiting_fin_ack = false;
+                                        conn.http3_active_count += 1;
+                                        dbg("io: retransmit h3 stream_id={} reopened, rewind to file_pos={}\n", .{ lp.stream_id, file_pos });
+                                    } else |_| {}
+                                }
                             }
                             break;
                         }
@@ -3077,7 +3126,13 @@ pub const Server = struct {
                 .file = file,
                 .stream_offset = headers_frame_len,
                 .file_end = file_end,
+                .file_offset = 0,
+                .stream_offset_base = headers_frame_len,
             };
+            // Store the file path for re-opening on retransmission.
+            const path_len = @min(fs_path.len, slot.file_path.len);
+            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
+            slot.file_path_len = path_len;
             conn.http3_active_count += 1;
             dbg("io: http3 slot registered stream_id={} size={} data_offset={}\n", .{ sf.stream_id, file_end, headers_frame_len });
             return;
@@ -3533,8 +3588,24 @@ pub const Server = struct {
             slot.close();
             return;
         };
+        // Congestion control: only send if cwnd allows.  Rewind file position if blocked.
+        if (!conn.cc.canSend(congestion.mss)) {
+            slot.file.seekTo(slot.file_offset) catch {};
+            return;
+        }
+        const old_stream_offset = slot.stream_offset;
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
         slot.stream_offset += @intCast(data_frame_len);
+        slot.file_offset += @intCast(n);
+        // Patch stream metadata into the last SentPacket for retransmission on loss.
+        // Store the QUIC stream offset so the retransmit handler can rewind both
+        // stream_offset and file_offset (file_offset is derived from stream_offset_base).
+        if (conn.ld.sent_count > 0) {
+            const last = &conn.ld.sent[conn.ld.sent_count - 1];
+            last.has_stream_data = true;
+            last.stream_id = slot.stream_id;
+            last.stream_offset = old_stream_offset; // QUIC stream offset before this chunk
+        }
 
         if (slot.stream_offset % 10000 < CHUNK + 10) {
             dbg("io: http3 stream_id={} chunk offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
@@ -3552,6 +3623,8 @@ pub const Server = struct {
                     for (&conn.http3_slots) |*slot| {
                         if (!slot.active) continue;
                         if (budget == 0) return;
+                        // Pre-check CC: skip if cwnd is exhausted to avoid null sends.
+                        if (!conn.cc.canSend(congestion.mss)) break;
                         self.http3SendNextChunk(conn, slot);
                         progressed = true;
                         budget -= 1;
