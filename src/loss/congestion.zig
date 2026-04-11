@@ -92,6 +92,68 @@ pub const NewReno = struct {
     }
 };
 
+/// Tagged union wrapping available congestion controllers.
+/// All variants expose the same interface so callers use `cc.onAck(...)` etc.
+pub const CongestionController = union(enum) {
+    new_reno: NewReno,
+    cubic: @import("cubic.zig").Cubic,
+
+    pub fn init(comptime tag: std.meta.Tag(CongestionController)) CongestionController {
+        return switch (tag) {
+            .new_reno => .{ .new_reno = NewReno.init() },
+            .cubic => .{ .cubic = @import("cubic.zig").Cubic.init() },
+        };
+    }
+
+    pub fn onAck(self: *CongestionController, bytes_acked: u64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onAck(bytes_acked),
+        }
+    }
+
+    pub fn onLoss(self: *CongestionController, largest_lost_pn: u64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onLoss(largest_lost_pn),
+        }
+    }
+
+    pub fn onPacketSent(self: *CongestionController, bytes: u64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.onPacketSent(bytes),
+        }
+    }
+
+    pub fn sendCredit(self: *const CongestionController) u64 {
+        switch (self.*) {
+            inline else => |*cc| return cc.sendCredit(),
+        }
+    }
+
+    pub fn canSend(self: *const CongestionController, packet_size: u64) bool {
+        switch (self.*) {
+            inline else => |*cc| return cc.canSend(packet_size),
+        }
+    }
+
+    pub fn getBytesInFlight(self: *const CongestionController) u64 {
+        switch (self.*) {
+            inline else => |cc| return cc.bytes_in_flight,
+        }
+    }
+
+    pub fn setBytesInFlight(self: *CongestionController, val: u64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.bytes_in_flight = val,
+        }
+    }
+
+    pub fn subBytesInFlight(self: *CongestionController, val: u64) void {
+        switch (self.*) {
+            inline else => |*cc| cc.bytes_in_flight -|= val,
+        }
+    }
+};
+
 test "new_reno: slow start growth" {
     const testing = std.testing;
     var cc = NewReno.init();
@@ -138,4 +200,25 @@ test "new_reno: can_send check" {
     try testing.expect(!cc.canSend(1));
     cc.onAck(mss);
     try testing.expect(cc.canSend(mss));
+}
+
+test "congestion_controller: tagged union dispatches correctly" {
+    const testing = std.testing;
+
+    // NewReno variant
+    var nr = CongestionController.init(.new_reno);
+    nr.onPacketSent(mss);
+    try testing.expectEqual(@as(u64, mss), nr.getBytesInFlight());
+    try testing.expect(nr.canSend(mss));
+    nr.onAck(mss);
+    try testing.expectEqual(@as(u64, 0), nr.getBytesInFlight());
+
+    // CUBIC variant
+    var cubic = CongestionController.init(.cubic);
+    cubic.onPacketSent(mss);
+    try testing.expectEqual(@as(u64, mss), cubic.getBytesInFlight());
+    try testing.expect(cubic.canSend(mss));
+    cubic.onLoss(1);
+    // After loss, CUBIC sets cwnd = cwnd × β (0.7).
+    try testing.expect(cubic.canSend(mss));
 }

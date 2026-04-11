@@ -938,8 +938,8 @@ pub const ConnState = struct {
     ecn_ce_recv: u64 = 0,
 
     // ── Congestion control + loss detection (RFC 9002) ────────────────────────
-    // New Reno CC: cwnd, ssthresh, bytes_in_flight.
-    cc: congestion.NewReno = congestion.NewReno.init(),
+    // Congestion controller: NewReno (default) or CUBIC (configurable).
+    cc: congestion.CongestionController = congestion.CongestionController.init(.new_reno),
     // RTT estimator: smoothed RTT, RTT variance, min RTT.
     rtt: recovery.RttEstimator = .{},
     // Loss detector: tracks in-flight packets by PN, detects loss via packet threshold.
@@ -1020,6 +1020,8 @@ pub const ServerConfig = struct {
     /// Also suppresses Version Negotiation for QUIC_V2 packets regardless of
     /// this flag, so the server auto-negotiates down to v1 if needed.
     v2: bool = false,
+    /// Use CUBIC congestion control instead of NewReno (RFC 9438).
+    cubic: bool = false,
     /// Directory to write qlog files into.  When non-null, one `<cid>.sqlog`
     /// file is created per connection.  Set via --qlog-dir on the command line.
     qlog_dir: ?[]const u8 = null,
@@ -1384,6 +1386,9 @@ pub const Server = struct {
                     .use_v2 = is_v2,
                 };
                 const conn = &(slot.*.?);
+                if (self.config.cubic) {
+                    conn.cc = congestion.CongestionController.init(.cubic);
+                }
                 conn.deriveInitialKeys(dcid);
                 // Open qlog file named after the original destination CID (ODCID).
                 if (self.config.qlog_dir) |qd| {
@@ -1805,12 +1810,110 @@ pub const Server = struct {
         // App secrets are now derived inside buildServerFlight; derive QUIC keys.
         conn.deriveAppKeys(&conn.tls.secrets);
 
-        // Send Initial packet with ServerHello CRYPTO frame
-        self.sendInitialServerHello(conn, src);
-        // Send Handshake packet with server flight CRYPTO frame
-        self.sendHandshakeServerFlight(conn, src);
+        // Coalesce Initial + Handshake packets into a single UDP datagram
+        // (RFC 9000 §12.2).  Fall back to separate sends for any remainder.
+        self.sendCoalescedServerFlight(conn, src);
 
         conn.phase = .waiting_finished;
+    }
+
+    /// Coalesce Initial + Handshake packets into as few UDP datagrams as
+    /// possible (RFC 9000 §12.2).  The first datagram packs the Initial
+    /// (ServerHello) plus as many Handshake CRYPTO chunks as fit within
+    /// MAX_DATAGRAM_SIZE.  Any remaining Handshake chunks are sent as
+    /// separate datagrams via sendHandshakeServerFlight.
+    fn sendCoalescedServerFlight(self: *Server, conn: *ConnState, src: std.net.Address) void {
+        var coalesced_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        var coalesced_len: usize = 0;
+
+        // ── Build Initial packet (ServerHello) ──────────────────────────────
+        {
+            var frames_buf: [1024]u8 = undefined;
+            var fp: usize = 0;
+            if (conn.init_recv_pn) |pn| {
+                const ack_len = buildAckFrame(frames_buf[fp..], pn, 0) catch return;
+                fp += ack_len;
+            }
+            const crypto_len = buildCryptoFrame(frames_buf[fp..], 0, conn.sh_bytes[0..conn.sh_len]) catch return;
+            fp += crypto_len;
+
+            const init_km = conn.init_keys orelse return;
+            const pkt_len = buildInitialPacket(
+                &coalesced_buf,
+                conn.remote_cid,
+                conn.local_cid,
+                &.{},
+                frames_buf[0..fp],
+                conn.init_pn,
+                &init_km.server,
+                conn.quicVersion(),
+            ) catch return;
+
+            if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+                dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
+                return;
+            }
+            conn.init_pn += 1;
+            conn.anti_amp_bytes_sent += pkt_len;
+            coalesced_len = pkt_len;
+        }
+
+        // ── Append Handshake packet(s) into the same datagram ───────────────
+        if (conn.has_hs_keys) {
+            const flight = conn.flight_bytes[0..conn.flight_len];
+            const max_crypto_per_pkt = 1100;
+            var offset: usize = 0;
+
+            while (offset < flight.len) {
+                var frames_buf: [8192]u8 = undefined;
+                const chunk_len = @min(flight.len - offset, max_crypto_per_pkt);
+                const crypto_len = buildCryptoFrame(
+                    &frames_buf,
+                    @intCast(offset),
+                    flight[offset .. offset + chunk_len],
+                ) catch break;
+
+                // Try to fit this Handshake packet into the coalesced datagram.
+                const remaining = coalesced_buf[coalesced_len..];
+                const pkt_len = buildHandshakePacket(
+                    remaining,
+                    conn.remote_cid,
+                    conn.local_cid,
+                    frames_buf[0..crypto_len],
+                    conn.hs_pn,
+                    &conn.hs_server_km,
+                    conn.quicVersion(),
+                ) catch break; // not enough room — send what we have, rest goes separately
+
+                if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+                    dbg("io: amplification limit reached, deferring Handshake flight\n", .{});
+                    break;
+                }
+                conn.hs_pn += 1;
+                conn.anti_amp_bytes_sent += pkt_len;
+                coalesced_len += pkt_len;
+                offset += chunk_len;
+            }
+
+            // Flush the coalesced datagram.
+            if (coalesced_len > 0) {
+                _ = std.posix.sendto(self.sock, coalesced_buf[0..coalesced_len], 0, &src.any, src.getOsSockLen()) catch |err| {
+                    dbg("io: sendto coalesced flight failed: {}\n", .{err});
+                };
+            }
+
+            // Send any remaining Handshake chunks that did not fit as separate datagrams.
+            if (offset < flight.len) {
+                self.sendHandshakeServerFlightFrom(conn, src, offset);
+            }
+        } else {
+            // No handshake keys yet — just send the Initial packet alone.
+            if (coalesced_len > 0) {
+                _ = std.posix.sendto(self.sock, coalesced_buf[0..coalesced_len], 0, &src.any, src.getOsSockLen()) catch |err| {
+                    dbg("io: sendto Initial failed: {}\n", .{err});
+                };
+            }
+        }
     }
 
     fn sendInitialServerHello(self: *Server, conn: *ConnState, src: std.net.Address) void {
@@ -1855,16 +1958,21 @@ pub const Server = struct {
     }
 
     fn sendHandshakeServerFlight(self: *Server, conn: *ConnState, src: std.net.Address) void {
+        self.sendHandshakeServerFlightFrom(conn, src, 0);
+    }
+
+    /// Send Handshake CRYPTO frames starting from `start_offset` in the
+    /// server flight buffer, one packet per UDP datagram.
+    fn sendHandshakeServerFlightFrom(self: *Server, conn: *ConnState, src: std.net.Address, start_offset: usize) void {
         if (!conn.has_hs_keys) return;
 
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         var frames_buf: [8192]u8 = undefined;
         var fp: usize = 0;
 
-        // CRYPTO frame with server flight (may need to be split across packets)
         const flight = conn.flight_bytes[0..conn.flight_len];
-        const max_crypto_per_pkt = 1100; // leave room for headers + AEAD tag
-        var offset: usize = 0;
+        const max_crypto_per_pkt = 1100;
+        var offset: usize = start_offset;
 
         while (offset < flight.len) {
             fp = 0;
@@ -1886,7 +1994,6 @@ pub const Server = struct {
                 conn.quicVersion(),
             ) catch return;
 
-            // Anti-amplification (RFC 9000 §8.1): do not exceed 3× received bytes.
             if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
                 dbg("io: amplification limit reached, deferring Handshake flight\n", .{});
                 return;
@@ -2336,7 +2443,10 @@ pub const Server = struct {
             // path change.  bytes_in_flight from the old path is stale — those
             // packets will never be ACKed on the new path — so we must clear it
             // or the CC gate will block retransmissions indefinitely.
-            conn.cc = congestion.NewReno.init();
+            conn.cc = switch (conn.cc) {
+                .new_reno => congestion.CongestionController.init(.new_reno),
+                .cubic => congestion.CongestionController.init(.cubic),
+            };
             conn.rtt = .{};
             conn.ld = .{};
         }
@@ -2411,7 +2521,7 @@ pub const Server = struct {
                 // Remove lost-packet bytes from bytes_in_flight (RFC 9002 §7.5:
                 // lost packets are no longer "in flight").
                 if (ld_result.lost_bytes > 0) {
-                    conn.cc.bytes_in_flight -|= ld_result.lost_bytes;
+                    conn.cc.subBytesInFlight(ld_result.lost_bytes);
                 }
                 // Signal loss events to CC and rewind any affected HTTP/0.9
                 // stream slots so lost data is retransmitted (RFC 9000 §3.3).
@@ -2914,7 +3024,7 @@ pub const Server = struct {
             if (conn.draining) continue;
             // Only probe when there are packets in flight (otherwise there is
             // nothing to recover and no need to elicit an ACK).
-            if (conn.cc.bytes_in_flight == 0) continue;
+            if (conn.cc.getBytesInFlight() == 0) continue;
             // Require at least one ACK to have been received so we have a
             // meaningful RTT estimate; before that, last_ack_ms == 0.
             if (conn.last_ack_ms == 0) continue;
@@ -2928,7 +3038,7 @@ pub const Server = struct {
                 conn.last_pto_ms = now_ms;
                 conn.pto_count +|= 1;
                 dbg("io: PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
-                    conn.app_pn - 1, conn.pto_count, pto_delay, conn.cc.bytes_in_flight,
+                    conn.app_pn - 1, conn.pto_count, pto_delay, conn.cc.getBytesInFlight(),
                 });
             }
         }
@@ -3893,6 +4003,8 @@ pub const ClientConfig = struct {
     migrate: bool = false,
     /// Use QUIC v2 (RFC 9369) for this connection.
     v2: bool = false,
+    /// Use CUBIC congestion control instead of NewReno (RFC 9438).
+    cubic: bool = false,
     /// Directory to write qlog files into.  When non-null, one `<cid>.sqlog`
     /// file is created for the connection.  Set via --qlog-dir on the command line.
     qlog_dir: ?[]const u8 = null,
@@ -3997,6 +4109,9 @@ pub const Client = struct {
             // once the server's v2 Initial is successfully decrypted.
             .use_v2 = false,
         };
+        if (config.cubic) {
+            conn.cc = congestion.CongestionController.init(.cubic);
+        }
         conn.init_keys = InitialSecrets.derive(dcid.slice());
         if (config.v2) {
             // Pre-derive v2 keys so processInitialPacket can detect and handle
@@ -4107,6 +4222,9 @@ pub const Client = struct {
             .remote_cid = dcid,
             .peer = server_addr,
         };
+        if (self.config.cubic) {
+            self.conn.cc = congestion.CongestionController.init(.cubic);
+        }
         self.conn.init_keys = InitialSecrets.derive(dcid.slice());
 
         // Fresh TLS handshake state.
@@ -4517,11 +4635,33 @@ pub const Client = struct {
 
         if (buf[0] & 0x80 != 0) {
             const lh = header_mod.parseLong(buf) catch return;
+            // Determine this packet's total length for coalesced packet handling
+            // (RFC 9000 §12.2).  For Initial packets the Length field starts after
+            // the token; for Handshake packets it starts right after the header.
+            const pkt_end: usize = blk: {
+                var pos = lh.consumed;
+                if (lh.header.packet_type == .initial) {
+                    // Skip token_len + token.
+                    const tok_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    pos += tok_r.len + @as(usize, @intCast(tok_r.value));
+                }
+                if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
+                    if (pos >= buf.len) break :blk buf.len;
+                    const len_r = varint.decode(buf[pos..]) catch break :blk buf.len;
+                    pos += len_r.len + @as(usize, @intCast(len_r.value));
+                    break :blk @min(pos, buf.len);
+                }
+                break :blk buf.len;
+            };
             switch (lh.header.packet_type) {
-                .initial => self.processInitialPacket(buf),
-                .handshake => self.processHandshakePacket(buf),
+                .initial => self.processInitialPacket(buf[0..pkt_end]),
+                .handshake => self.processHandshakePacket(buf[0..pkt_end]),
                 .retry => self.processRetryPacket(buf),
                 else => {},
+            }
+            // RFC 9000 §12.2: process remaining coalesced packets in same datagram.
+            if (pkt_end < buf.len) {
+                self.processPacket(buf[pkt_end..]);
             }
         } else {
             self.process1RttPacket(buf);

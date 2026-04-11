@@ -278,8 +278,18 @@ pub fn deriveEarlyKeys(ticket: *const SessionTicket) EarlyDataKeys {
 ///   if (!server.nonce_cache.checkAndInsert(key)) {
 ///       // Replay detected — do not activate early keys.
 ///   }
+/// Maximum age (ms) for a nonce cache entry.  Entries older than this are
+/// considered expired and silently evicted.  10 seconds covers typical
+/// 0-RTT replay windows while limiting the cache's effective memory.
+const NONCE_TTL_MS: i64 = 10_000;
+
 pub const NonceCache = struct {
-    entries: [64][8]u8 = [_][8]u8{[_]u8{0} ** 8} ** 64,
+    const Entry = struct {
+        key: [8]u8 = .{0} ** 8,
+        inserted_ms: i64 = 0,
+    };
+
+    entries: [64]Entry = [_]Entry{.{}} ** 64,
     /// Number of valid entries (saturates at 64).
     count: usize = 0,
     /// Next write position in the ring.
@@ -287,14 +297,22 @@ pub const NonceCache = struct {
 
     /// Check whether `key` has been seen before.
     /// Returns `true` (new) if the key is fresh and inserts it.
-    /// Returns `false` (replay) if the key already exists.
+    /// Returns `false` (replay) if the key already exists and is not expired.
     pub fn checkAndInsert(self: *NonceCache, key: [8]u8) bool {
+        const now_ms = std.time.milliTimestamp();
+        return self.checkAndInsertAt(key, now_ms);
+    }
+
+    /// Testable version that accepts an explicit timestamp.
+    pub fn checkAndInsertAt(self: *NonceCache, key: [8]u8, now_ms: i64) bool {
         const n = @min(self.count, 64);
         for (0..n) |i| {
-            if (std.mem.eql(u8, &self.entries[i], &key)) return false; // replay
+            // Skip expired entries.
+            if (now_ms - self.entries[i].inserted_ms > NONCE_TTL_MS) continue;
+            if (std.mem.eql(u8, &self.entries[i].key, &key)) return false; // replay
         }
         // Fresh key — insert at head.
-        self.entries[self.head] = key;
+        self.entries[self.head] = .{ .key = key, .inserted_ms = now_ms };
         self.head = (self.head + 1) % 64;
         if (self.count < 64) self.count += 1;
         return true;
@@ -417,4 +435,15 @@ test "nonce_cache: ring eviction" {
     // (cache ring wrapped around).  We just verify no panic occurs.
     const evicted: [8]u8 = .{0} ** 8;
     _ = cache.checkAndInsert(evicted);
+}
+
+test "nonce_cache: expired entries allow re-use" {
+    const testing = std.testing;
+    var cache = NonceCache{};
+    const key: [8]u8 = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x00, 0x00, 0x01 };
+    const t0: i64 = 1_000_000;
+    try testing.expect(cache.checkAndInsertAt(key, t0)); // fresh
+    try testing.expect(!cache.checkAndInsertAt(key, t0 + 5_000)); // still within TTL
+    // After TTL expires, the same key should be accepted again.
+    try testing.expect(cache.checkAndInsertAt(key, t0 + 10_001));
 }

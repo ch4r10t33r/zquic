@@ -27,6 +27,7 @@ pub const crypto = struct {
 pub const loss = struct {
     pub const recovery = @import("loss/recovery.zig");
     pub const congestion = @import("loss/congestion.zig");
+    pub const cubic = @import("loss/cubic.zig");
 };
 pub const tls = struct {
     pub const handshake = @import("tls/handshake.zig");
@@ -75,6 +76,7 @@ test {
     _ = @import("tls/handshake.zig");
     _ = @import("loss/recovery.zig");
     _ = @import("loss/congestion.zig");
+    _ = @import("loss/cubic.zig");
     _ = @import("transport/connection.zig");
     _ = @import("transport/endpoint.zig");
     _ = @import("transport/flow_control.zig");

@@ -13,6 +13,12 @@
 //!   PUSH_PROMISE(0x05) – server push promise
 //!   GOAWAY      (0x07) – graceful shutdown
 //!   MAX_PUSH_ID (0x0d) – upper bound on push IDs
+//!
+//! Note: Server Push (PUSH_PROMISE / CANCEL_PUSH / MAX_PUSH_ID) is
+//! intentionally not implemented.  Server push is optional per RFC 9114 §4.6,
+//! has been deprecated by all major browsers, and introduces significant
+//! complexity with minimal real-world benefit.  The frame types are parsed for
+//! protocol correctness but never generated.
 
 const std = @import("std");
 const varint = @import("../varint.zig");
