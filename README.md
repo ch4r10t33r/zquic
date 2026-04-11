@@ -159,7 +159,7 @@ src/
     client.zig            HTTP/0.9 request builder + download path helper
   http3/
     frame.zig             HTTP/3 frame codec (RFC 9114 §7)
-    qpack.zig             QPACK static table + literal header encode/decode
+    qpack.zig             QPACK: static table, static-indexed encoding, dynamic table (RFC 9204)
   cmd/
     server.zig            QUIC server binary (interop runner entry point)
     client.zig            QUIC client binary (interop runner entry point)
@@ -206,7 +206,7 @@ full test suite. The Docker image is built on every merge to `master`.
 
 | Area | What's missing |
 |------|----------------|
-| **QPACK dynamic table** | `decodeHeaders` handles static table and literal fields only; dynamic table capacity is hardcoded to 0 |
+| **QPACK Phase 3b** | `DynamicTable` data structure is complete; io.zig integration pending: advertise non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY`, wire encoder/decoder unidirectional streams, send Section Acknowledgements |
 | **qlog** | Structured QUIC event logging to `$QLOGDIR` is not written |
 
 ## License
