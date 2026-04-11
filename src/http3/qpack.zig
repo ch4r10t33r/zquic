@@ -924,6 +924,20 @@ pub fn processEncoderStreamInstruction(
 }
 
 // ---------------------------------------------------------------------------
+// Header block prefix helpers
+// ---------------------------------------------------------------------------
+
+/// Returns true when the QPACK header block's Required Insert Count is > 0,
+/// meaning at least one field references the dynamic table.
+///
+/// RFC 9204 §4.5.1: the first byte of the block is the encoded Required Insert
+/// Count.  When RIC = 0 the encoded value is 0x00; any other first byte means
+/// RIC > 0.
+pub fn headerBlockHasDynamicRefs(buf: []const u8) bool {
+    return buf.len > 0 and buf[0] != 0x00;
+}
+
+// ---------------------------------------------------------------------------
 // Decoder stream instructions (RFC 9204 §4.4)
 // Written by the decoder back to the encoder: Section Acks, ICIs, Cancellations.
 // ---------------------------------------------------------------------------
@@ -1349,6 +1363,37 @@ test "qpack decoder stream: Stream Cancellation" {
 }
 
 // --- Dynamic encode+decode round-trip with dynamic table ---
+
+test "qpack: headerBlockHasDynamicRefs" {
+    const testing = std.testing;
+    // RIC = 0: both prefix bytes are 0x00.
+    try testing.expect(!headerBlockHasDynamicRefs(&[_]u8{ 0x00, 0x00 }));
+    // Empty slice.
+    try testing.expect(!headerBlockHasDynamicRefs(&[_]u8{}));
+    // RIC > 0: first byte is encoded_ric = (ric % (2*maxEntries)) + 1 >= 1.
+    try testing.expect(headerBlockHasDynamicRefs(&[_]u8{ 0x02, 0x00 }));
+    try testing.expect(headerBlockHasDynamicRefs(&[_]u8{ 0x01, 0x00 }));
+}
+
+test "qpack: headerBlockHasDynamicRefs from encoded block" {
+    const testing = std.testing;
+    // A block with no dynamic refs (static-only encoding) must report false.
+    var buf: [64]u8 = undefined;
+    const written = try encodeHeaders(&[_]Header{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+    }, &buf, .{});
+    try testing.expect(!headerBlockHasDynamicRefs(buf[0..written]));
+
+    // A block encoded with a dynamic table reference must report true.
+    var tbl = DynamicTable{};
+    tbl.capacity = 4096;
+    try tbl.insert(":status", "200");
+    const w2 = try encodeHeaders(&[_]Header{
+        .{ .name = ":status", .value = "200" },
+    }, &buf, .{ .table = &tbl });
+    try testing.expect(headerBlockHasDynamicRefs(buf[0..w2]));
+}
 
 test "qpack: dynamic table encode/decode round-trip" {
     const testing = std.testing;

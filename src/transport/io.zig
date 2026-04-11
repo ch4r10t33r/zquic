@@ -735,6 +735,21 @@ pub const ConnState = struct {
     // Used by decodeHeaders when the peer sends dynamic-indexed HEADERS blocks.
     qpack_dec_tbl: h3_qpack.DynamicTable = .{},
 
+    // QPACK encoder-side dynamic table: entries we have told the peer to cache
+    // via Insert instructions on our encoder stream.  Passed to encodeHeaders so
+    // it can emit compact dynamic table references instead of literals.
+    qpack_enc_tbl: h3_qpack.DynamicTable = .{},
+
+    // Byte offset within our encoder unidirectional stream
+    // (server: stream 7; client: stream 6).  Tracks how many bytes we have sent
+    // so far, including the leading stream-type byte (0x02).
+    qpack_enc_stream_off: u64 = 0,
+
+    // Byte offset within our decoder unidirectional stream
+    // (server: stream 11; client: stream 10).  Tracks how many bytes we have
+    // sent, including the leading stream-type byte (0x03).
+    qpack_dec_stream_off: u64 = 0,
+
     // QLOG writer for this connection.  Null when qlog_dir is not configured.
     qlog: qlog_writer.Writer = .{},
 
@@ -2414,6 +2429,12 @@ pub const Server = struct {
                 .headers => |hf| {
                     var decoded = h3_qpack.DecodedHeaders{ .headers = undefined, .count = 0 };
                     h3_qpack.decodeHeaders(hf.data[0..hf.len], &conn.qpack_dec_tbl, &decoded) catch {};
+                    // RFC 9204 §4.4.1: send a Section Acknowledgement on our
+                    // QPACK decoder stream (stream 11) when the client's HEADERS
+                    // block contained dynamic table references (RIC > 0).
+                    if (h3_qpack.headerBlockHasDynamicRefs(hf.data[0..hf.len])) {
+                        self.sendQpackDecoderInstruction(conn, sf.stream_id, src);
+                    }
                     for (decoded.headers[0..decoded.count]) |fld| {
                         if (std.mem.eql(u8, fld.name, ":method")) {
                             const ml = @min(fld.value.len, method_buf.len);
@@ -2450,13 +2471,15 @@ pub const Server = struct {
         };
 
         // Build and send HEADERS frame immediately (offset=0 on this stream).
+        // Pass the encoder table so :status 200 is encoded as a 1-byte dynamic
+        // indexed field line (RIC=1) instead of the 2-byte static reference.
         var size_buf: [20]u8 = undefined;
         const size_str = std.fmt.bufPrint(&size_buf, "{}", .{file_end}) catch "0";
         var header_block: [512]u8 = undefined;
         const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
             .{ .name = ":status", .value = "200" },
             .{ .name = "content-length", .value = size_str },
-        }, &header_block, .{}) catch {
+        }, &header_block, .{ .table = &conn.qpack_enc_tbl }) catch {
             file.close();
             return;
         };
@@ -2571,13 +2594,19 @@ pub const Server = struct {
         self.send1Rtt(conn, frame_buf[0..frame_len], src);
 
         // QPACK encoder stream: stream_id=7 (next server-initiated unidirectional).
-        // Stream type byte 0x02 followed by a Set Dynamic Table Capacity instruction
-        // (RFC 9204 §3.2.3: 0b001xxxxx).  Tells the client our encoder's table capacity
-        // so it can configure its decoder table accordingly.
-        var enc_buf: [16]u8 = undefined;
+        // Stream type byte 0x02 + Set Dynamic Table Capacity + Insert :status 200
+        // so the client can cache the most common response status.
+        var enc_buf: [64]u8 = undefined;
         enc_buf[0] = 0x02; // stream type = QPACK encoder
         var enc_pos: usize = 1;
         enc_pos += h3_qpack.writeSetCapacity(enc_buf[enc_pos..], h3_qpack.DEFAULT_DYN_TABLE_CAPACITY) catch return;
+        // Insert :status: 200 (QPACK static index 25).
+        enc_pos += h3_qpack.writeInsertWithStaticNameRef(enc_buf[enc_pos..], 25, "200") catch return;
+        // Mirror the insertion into our encoder table so encodeHeaders can emit
+        // a 1-byte dynamic indexed field line instead of a 2-byte static reference.
+        conn.qpack_enc_tbl.setCapacity(h3_qpack.DEFAULT_DYN_TABLE_CAPACITY);
+        conn.qpack_enc_tbl.insert(":status", "200") catch {};
+        conn.qpack_enc_stream_off = enc_pos; // save offset for any future inserts
         const enc_sf = stream_frame_mod.StreamFrame{
             .stream_id = 7, // server QPACK encoder stream
             .offset = 0,
@@ -2585,18 +2614,48 @@ pub const Server = struct {
             .fin = false,
             .has_length = true,
         };
-        var enc_frame_buf: [64]u8 = undefined;
+        var enc_frame_buf: [128]u8 = undefined;
         const enc_frame_len = enc_sf.serialize(&enc_frame_buf) catch return;
         self.send1Rtt(conn, enc_frame_buf[0..enc_frame_len], src);
+    }
+
+    /// Send a Section Acknowledgement for `request_stream_id` on the server's
+    /// QPACK decoder stream (server-initiated unidirectional, stream_id = 11).
+    /// The first call also sends the stream type byte (0x03).
+    /// RFC 9204 §4.4.1.
+    fn sendQpackDecoderInstruction(self: *Server, conn: *ConnState, request_stream_id: u64, src: std.net.Address) void {
+        var buf: [16]u8 = undefined;
+        var pos: usize = 0;
+        if (conn.qpack_dec_stream_off == 0) {
+            buf[0] = 0x03; // QPACK decoder stream type
+            pos = 1;
+        }
+        const ack_len = h3_qpack.writeSectionAck(buf[pos..], request_stream_id) catch return;
+        pos += ack_len;
+
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = 11, // server QPACK decoder stream
+            .offset = conn.qpack_dec_stream_off,
+            .data = buf[0..pos],
+            .fin = false,
+            .has_length = true,
+        };
+        var frame_buf: [64]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..frame_len], src);
+        conn.qpack_dec_stream_off += pos;
+        std.debug.print("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
     }
 
     fn sendH3Response(self: *Server, conn: *ConnState, stream_id: u64, status: u16, _: []const u8, src: std.net.Address) void {
         var status_buf: [4]u8 = undefined;
         const status_str = std.fmt.bufPrint(&status_buf, "{}", .{status}) catch "500";
         var header_block: [256]u8 = undefined;
+        // Pass encoder table: if :status 200 is cached the encoder uses a
+        // 1-byte dynamic ref; for other statuses it falls back to static/literal.
         const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
             .{ .name = ":status", .value = status_str },
-        }, &header_block, .{}) catch return;
+        }, &header_block, .{ .table = &conn.qpack_enc_tbl }) catch return;
         var out: [300]u8 = undefined;
         const out_len = h3_frame.writeFrame(&out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch return;
         self.sendStreamData(conn, stream_id, out[0..out_len], true, src);
@@ -4034,9 +4093,15 @@ pub const Client = struct {
             };
             pos += pr.consumed;
             switch (pr.frame) {
-                .headers => {
+                .headers => |hf| {
                     s.h3_headers_received = true;
-                    std.debug.print("io: h3 stream_id={} HEADERS frame parsed, skipping\n", .{s.stream_id});
+                    // RFC 9204 §4.4.1: if the server's HEADERS block referenced
+                    // dynamic table entries (RIC > 0), acknowledge it on our
+                    // QPACK decoder stream (stream 10).
+                    if (h3_qpack.headerBlockHasDynamicRefs(hf.data[0..hf.len])) {
+                        self.sendQpackDecoderInstruction(s.stream_id);
+                    }
+                    std.debug.print("io: h3 stream_id={} HEADERS frame parsed\n", .{s.stream_id});
                 },
                 .data => |d| {
                     _ = s.file.write(d) catch {};
@@ -4145,11 +4210,30 @@ pub const Client = struct {
         std.debug.print("io: h3 client control stream sent\n", .{});
 
         // QPACK encoder stream (stream_id=6, next client-initiated unidirectional).
-        // Stream type byte 0x02 followed by a Set Dynamic Table Capacity instruction.
-        var enc_buf: [16]u8 = undefined;
+        // Stream type 0x02 + Set Capacity + Insert commonly-used request headers
+        // (:method GET, :scheme https, :authority <host>) so the server can cache
+        // them and subsequent HEADERS blocks can use 1-byte dynamic references.
+        var enc_buf: [128]u8 = undefined;
         enc_buf[0] = 0x02; // stream type = QPACK encoder
         var enc_pos: usize = 1;
         enc_pos += h3_qpack.writeSetCapacity(enc_buf[enc_pos..], h3_qpack.DEFAULT_DYN_TABLE_CAPACITY) catch return;
+        // Insert :method: GET (static index 17).
+        enc_pos += h3_qpack.writeInsertWithStaticNameRef(enc_buf[enc_pos..], 17, "GET") catch return;
+        // Insert :scheme: https (static index 23).
+        enc_pos += h3_qpack.writeInsertWithStaticNameRef(enc_buf[enc_pos..], 23, "https") catch return;
+        // Insert :authority: <host> (static index 0); skip if host is too long.
+        if (self.config.host.len <= h3_qpack.MAX_DYN_ENTRY_BYTES) {
+            enc_pos += h3_qpack.writeInsertWithStaticNameRef(enc_buf[enc_pos..], 0, self.config.host) catch return;
+        }
+        // Mirror insertions into our encoder table so encodeHeaders emits
+        // compact dynamic indexed field lines.
+        self.conn.qpack_enc_tbl.setCapacity(h3_qpack.DEFAULT_DYN_TABLE_CAPACITY);
+        self.conn.qpack_enc_tbl.insert(":method", "GET") catch {};
+        self.conn.qpack_enc_tbl.insert(":scheme", "https") catch {};
+        if (self.config.host.len <= h3_qpack.MAX_DYN_ENTRY_BYTES) {
+            self.conn.qpack_enc_tbl.insert(":authority", self.config.host) catch {};
+        }
+        self.conn.qpack_enc_stream_off = enc_pos; // save for any future inserts
         const enc_sf = stream_frame_mod.StreamFrame{
             .stream_id = 6, // client QPACK encoder stream
             .offset = 0,
@@ -4172,6 +4256,46 @@ pub const Client = struct {
         self.conn.app_pn += 1;
         _ = std.posix.sendto(self.sock, enc_send_buf[0..enc_pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
         std.debug.print("io: h3 client QPACK encoder stream sent\n", .{});
+    }
+
+    /// Send a Section Acknowledgement for `request_stream_id` on the client's
+    /// QPACK decoder stream (client-initiated unidirectional, stream_id = 10).
+    /// The first call also sends the stream type byte (0x03).
+    /// RFC 9204 §4.4.1.
+    fn sendQpackDecoderInstruction(self: *Client, request_stream_id: u64) void {
+        var buf: [16]u8 = undefined;
+        var pos: usize = 0;
+        if (self.conn.qpack_dec_stream_off == 0) {
+            buf[0] = 0x03; // QPACK decoder stream type
+            pos = 1;
+        }
+        const ack_len = h3_qpack.writeSectionAck(buf[pos..], request_stream_id) catch return;
+        pos += ack_len;
+
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = 10, // client QPACK decoder stream
+            .offset = self.conn.qpack_dec_stream_off,
+            .data = buf[0..pos],
+            .fin = false,
+            .has_length = true,
+        };
+        var frame_buf: [64]u8 = undefined;
+        const frame_len = sf.serialize(&frame_buf) catch return;
+        const server = self.conn.peer;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            frame_buf[0..frame_len],
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &server.any, server.getOsSockLen()) catch {};
+        self.conn.qpack_dec_stream_off += pos;
+        std.debug.print("io: sent QPACK Section Ack for stream {}\n", .{request_stream_id});
     }
 
     fn downloadUrls(self: *Client, server: std.net.Address) !void {
@@ -4257,13 +4381,15 @@ pub const Client = struct {
 
                 if (self.config.http3) {
                     // HTTP/3: send a HEADERS frame with :method GET and :path.
+                    // Pass encoder table so :method, :scheme, :authority are
+                    // encoded as 1-byte dynamic indexed field lines (RIC=3).
                     var header_block: [512]u8 = undefined;
                     const hb_len = h3_qpack.encodeHeaders(&[_]h3_qpack.Header{
                         .{ .name = ":method", .value = "GET" },
                         .{ .name = ":path", .value = path },
                         .{ .name = ":scheme", .value = "https" },
                         .{ .name = ":authority", .value = self.config.host },
-                    }, &header_block, .{}) catch continue;
+                    }, &header_block, .{ .table = &self.conn.qpack_enc_tbl }) catch continue;
                     var h3_out: [600]u8 = undefined;
                     const h3_len = h3_frame.writeFrame(&h3_out, @intFromEnum(h3_frame.FrameType.headers), header_block[0..hb_len]) catch continue;
                     const sf = stream_frame_mod.StreamFrame{
