@@ -30,6 +30,7 @@ const retry_mod = @import("../packet/retry.zig");
 const session_mod = @import("../crypto/session.zig");
 const h3_frame = @import("../http3/frame.zig");
 const h3_qpack = @import("../http3/qpack.zig");
+const qlog_writer = @import("../qlog/writer.zig");
 const transport_frames = @import("../frames/transport.zig");
 const version_neg_mod = @import("../packet/version_negotiation.zig");
 
@@ -734,6 +735,9 @@ pub const ConnState = struct {
     // Used by decodeHeaders when the peer sends dynamic-indexed HEADERS blocks.
     qpack_dec_tbl: h3_qpack.DynamicTable = .{},
 
+    // QLOG writer for this connection.  Null when qlog_dir is not configured.
+    qlog: qlog_writer.Writer = .{},
+
     /// HTTP/0.9 responses in progress (parallel downloads per connection).
     http09_slots: [2000]Http09OutSlot = [_]Http09OutSlot{.{}} ** 2000,
 
@@ -847,6 +851,7 @@ pub const ConnState = struct {
         self.app_server_km = .{ .key = app_server_qkm.key, .key32 = app_server_qkm.key32, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .hp32 = app_server_qkm.hp32, .secret = secrets.server_app };
 
         self.has_app_keys = true;
+        self.qlog.keyUpdated("1rtt", "tls");
     }
 };
 
@@ -870,6 +875,9 @@ pub const ServerConfig = struct {
     /// Also suppresses Version Negotiation for QUIC_V2 packets regardless of
     /// this flag, so the server auto-negotiates down to v1 if needed.
     v2: bool = false,
+    /// Directory to write qlog files into.  When non-null, one `<cid>.sqlog`
+    /// file is created per connection.  Set via --qlog-dir on the command line.
+    qlog_dir: ?[]const u8 = null,
 };
 
 // ── QUIC Server ───────────────────────────────────────────────────────────────
@@ -970,6 +978,13 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        // Close any open qlog files before freeing memory.
+        for (&self.conns) |*slot| {
+            if (slot.*) |*conn| {
+                conn.qlog.connectionClosed("server_shutdown");
+                conn.qlog.close();
+            }
+        }
         std.posix.close(self.sock);
         if (self.raw_sock) |rs| std.posix.close(rs);
         self.allocator.free(self.cert_der);
@@ -1205,6 +1220,13 @@ pub const Server = struct {
                 };
                 const conn = &(slot.*.?);
                 conn.deriveInitialKeys(dcid);
+                // Open qlog file named after the original destination CID (ODCID).
+                if (self.config.qlog_dir) |qd| {
+                    conn.qlog = qlog_writer.Writer.open(qd, dcid.slice(), "server");
+                    var peer_buf: [64]u8 = undefined;
+                    const peer_str = std.fmt.bufPrint(&peer_buf, "{any}", .{peer}) catch "?";
+                    conn.qlog.connectionStarted("0.0.0.0", self.config.port, peer_str, 0, conn.quicVersion());
+                }
                 return conn;
             }
         }
@@ -1960,6 +1982,7 @@ pub const Server = struct {
 
     fn processAppFrames(self: *Server, conn: *ConnState, frames: []const u8, src: std.net.Address) void {
         std.debug.print("io: processAppFrames called: {} bytes\n", .{frames.len});
+        conn.qlog.packetReceived(.one_rtt, conn.app_recv_pn orelse 0, frames.len);
         // Detect address change (connection migration / port rebinding, RFC 9000 §9).
         // When NS3 rebinds the client's source port (rebind-port test, every 5 s),
         // the server sees packets from a new src port.  We must:
@@ -2116,6 +2139,7 @@ pub const Server = struct {
             return;
         };
         conn.app_pn += 1;
+        conn.qlog.packetSent(.one_rtt, conn.app_pn - 1, pkt_len);
         if (has_fin) {
             std.debug.print("io: server SENDING FIN PACKET pkt_len={} payload_len={} pn={}\n", .{ pkt_len, effective_payload.len, conn.app_pn - 1 });
         }
@@ -2744,6 +2768,9 @@ pub const ClientConfig = struct {
     migrate: bool = false,
     /// Use QUIC v2 (RFC 9369) for this connection.
     v2: bool = false,
+    /// Directory to write qlog files into.  When non-null, one `<cid>.sqlog`
+    /// file is created for the connection.  Set via --qlog-dir on the command line.
+    qlog_dir: ?[]const u8 = null,
 };
 
 // ── Stream download tracker ───────────────────────────────────────────────────
@@ -2841,6 +2868,13 @@ pub const Client = struct {
             // a server Initial that uses QUIC v2 (compatible version negotiation).
             conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
         }
+        // Open qlog file for this client connection, named after the DCID.
+        if (config.qlog_dir) |qd| {
+            conn.qlog = qlog_writer.Writer.open(qd, dcid.slice(), "client");
+            var dst_buf: [64]u8 = undefined;
+            const dst_str = std.fmt.bufPrint(&dst_buf, "{s}:{}", .{ config.host, config.port }) catch "?";
+            conn.qlog.connectionStarted("0.0.0.0", 0, dst_str, config.port, 0x00000001);
+        }
 
         return .{
             .allocator = allocator,
@@ -2853,6 +2887,8 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        self.conn.qlog.connectionClosed("client_shutdown");
+        self.conn.qlog.close();
         std.posix.close(self.sock);
     }
 
@@ -3664,6 +3700,7 @@ pub const Client = struct {
                 std.debug.print("io: client 834-byte packet updated app_recv_pn to {}\n", .{decompressed_pn});
             }
         }
+        self.conn.qlog.packetReceived(.one_rtt, decompressed_pn, buf.len);
 
         // ECN: count this 1-RTT packet as ECT(0).
         self.conn.ecn_ect0_recv += 1;
