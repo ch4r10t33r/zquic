@@ -219,7 +219,9 @@ fn writeKeylog(path: []const u8, client_random: [32]u8, secrets: *const tls_hs.T
         const line = std.fmt.bufPrint(&line_buf, "{s} {s} {s}\n", .{
             label, rand_hex, secret_hex,
         }) catch continue;
-        file.writeAll(line) catch {};
+        file.writeAll(line) catch |err| {
+            dbg("io: keylog write failed: {}\n", .{err});
+        };
     }
 }
 
@@ -872,6 +874,15 @@ pub const ConnState = struct {
     peer_bidi_stream_count: u64 = 0,
     peer_uni_stream_count: u64 = 0,
 
+    // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
+    // Before the peer's address is validated (Retry token accepted or handshake
+    // completed), the server MUST NOT send more than 3× the bytes received.
+    // These counters track raw UDP payload bytes exchanged during the handshake.
+    // Once address_validated is set, the limit no longer applies.
+    anti_amp_bytes_recv: u64 = 0,
+    anti_amp_bytes_sent: u64 = 0,
+    address_validated: bool = false,
+
     // ── Connection-level flow control (RFC 9000 §4) ───────────────────────────
     // Both sides advertise initial_max_data = 64 MiB in transport parameters.
     // fc_send_max tracks how many cumulative bytes we may send (peer's window);
@@ -1442,6 +1453,11 @@ pub const Server = struct {
             conn.retry_odcid_len = olen;
         }
 
+        // Anti-amplification (RFC 9000 §8.1): track received bytes.
+        conn.anti_amp_bytes_recv += buf.len;
+        // If Retry was accepted, the address is already validated.
+        if (verified_odcid != null) conn.address_validated = true;
+
         if (conn.init_keys == null) conn.deriveInitialKeys(ip.dcid);
         const init_km = &conn.init_keys.?;
 
@@ -1823,7 +1839,15 @@ pub const Server = struct {
             &init_km.server,
             conn.quicVersion(),
         ) catch return;
+
+        // Anti-amplification (RFC 9000 §8.1): do not exceed 3× received bytes.
+        if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+            dbg("io: amplification limit reached, deferring Initial ServerHello\n", .{});
+            return;
+        }
+
         conn.init_pn += 1;
+        conn.anti_amp_bytes_sent += pkt_len;
 
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
             dbg("io: sendto Initial failed: {}\n", .{err});
@@ -1861,7 +1885,15 @@ pub const Server = struct {
                 &conn.hs_server_km,
                 conn.quicVersion(),
             ) catch return;
+
+            // Anti-amplification (RFC 9000 §8.1): do not exceed 3× received bytes.
+            if (!conn.address_validated and conn.anti_amp_bytes_sent + pkt_len > conn.anti_amp_bytes_recv * 3) {
+                dbg("io: amplification limit reached, deferring Handshake flight\n", .{});
+                return;
+            }
+
             conn.hs_pn += 1;
+            conn.anti_amp_bytes_sent += pkt_len;
 
             _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &src.any, src.getOsSockLen()) catch |err| {
                 dbg("io: sendto Handshake failed: {}\n", .{err});
@@ -1882,6 +1914,9 @@ pub const Server = struct {
         // Find connection by DCID
         const conn = self.findConn(lh.header.dcid) orelse return;
         if (!conn.has_hs_keys) return;
+
+        // Anti-amplification: track Handshake bytes received (RFC 9000 §8.1).
+        conn.anti_amp_bytes_recv += buf.len;
 
         // If already connected, the client may be retransmitting its Finished because
         // our HANDSHAKE_DONE was lost. Re-send it so the client can make progress.
@@ -1968,6 +2003,8 @@ pub const Server = struct {
 
         dbg("io: handshake complete for connection\n", .{});
         conn.phase = .connected;
+        // Handshake complete → peer address is validated (RFC 9000 §8.1).
+        conn.address_validated = true;
 
         const pending_n = conn.pending_1rtt_n;
         conn.pending_1rtt_n = 0;
@@ -2265,7 +2302,10 @@ pub const Server = struct {
                     // Active slot: rewind to re-send data that went to the dead port.
                     const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
                     if (rewind_to < slot.stream_offset) {
-                        slot.file.seekTo(rewind_to) catch {};
+                        slot.file.seekTo(rewind_to) catch |err| {
+                            dbg("io: path change: seekTo failed stream_id={}: {}\n", .{ slot.stream_id, err });
+                            continue;
+                        };
                         slot.stream_offset = rewind_to;
                         dbg("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
                     }
@@ -2388,8 +2428,11 @@ pub const Server = struct {
                             if (slot.active) {
                                 // Normal case: slot is still sending; rewind offset.
                                 if (lp.stream_offset < slot.stream_offset) {
+                                    slot.file.seekTo(lp.stream_offset) catch |err| {
+                                        dbg("io: retransmit seekTo failed stream_id={}: {}\n", .{ lp.stream_id, err });
+                                        break;
+                                    };
                                     slot.stream_offset = lp.stream_offset;
-                                    slot.file.seekTo(lp.stream_offset) catch {};
                                     dbg("io: retransmit h09 stream_id={} rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
                                 }
                             } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
@@ -2428,7 +2471,10 @@ pub const Server = struct {
                                 if (slot.active) {
                                     slot.stream_offset = lp.stream_offset;
                                     slot.file_offset = file_pos;
-                                    slot.file.seekTo(file_pos) catch {};
+                                    slot.file.seekTo(file_pos) catch |err| {
+                                        dbg("io: retransmit h3 seekTo failed stream_id={}: {}\n", .{ lp.stream_id, err });
+                                        break;
+                                    };
                                     dbg("io: retransmit h3 stream_id={} rewind quic_off={} file_pos={}\n", .{ lp.stream_id, lp.stream_offset, file_pos });
                                 } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
                                     const fp = slot.file_path[0..slot.file_path_len];
@@ -2772,7 +2818,9 @@ pub const Server = struct {
         if (!conn.cc.canSend(congestion.mss)) {
             // Rewind offset — we didn't actually send this chunk.
             slot.stream_offset -= @intCast(n);
-            slot.file.seekTo(slot.stream_offset) catch {};
+            slot.file.seekTo(slot.stream_offset) catch |err| {
+                dbg("io: http09 seekTo rewind failed stream_id={}: {}\n", .{ slot.stream_id, err });
+            };
             return;
         }
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
@@ -3536,7 +3584,9 @@ pub const Server = struct {
         // Mirror the insertion into our encoder table so encodeHeaders can emit
         // a 1-byte dynamic indexed field line instead of a 2-byte static reference.
         conn.qpack_enc_tbl.setCapacity(h3_qpack.DEFAULT_DYN_TABLE_CAPACITY);
-        conn.qpack_enc_tbl.insert(":status", "200") catch {};
+        conn.qpack_enc_tbl.insert(":status", "200") catch |err| {
+            dbg("io: QPACK insert ':status' failed: {}\n", .{err});
+        };
         conn.qpack_enc_stream_off = enc_pos; // save offset for any future inserts
         const enc_sf = stream_frame_mod.StreamFrame{
             .stream_id = 7, // server QPACK encoder stream
@@ -3603,7 +3653,7 @@ pub const Server = struct {
         var frame_buf: [300]u8 = undefined;
         const frame_len = sf.serialize(&frame_buf) catch return;
         self.send1Rtt(conn, frame_buf[0..frame_len], src);
-        conn.qpack_enc_tbl.insert(name, value) catch {};
+        conn.qpack_enc_tbl.insert(name, value) catch {}; // non-critical: dynamic table full
         conn.qpack_enc_stream_off += ins_len;
         dbg("io: QPACK encoder insert name={s} value={s}\n", .{ name, value });
     }
@@ -3754,7 +3804,9 @@ pub const Server = struct {
         };
         // Congestion control: only send if cwnd allows.  Rewind file position if blocked.
         if (!conn.cc.canSend(congestion.mss)) {
-            slot.file.seekTo(slot.file_offset) catch {};
+            slot.file.seekTo(slot.file_offset) catch |err| {
+                dbg("io: h3 seekTo rewind failed stream_id={}: {}\n", .{ slot.stream_id, err });
+            };
             return;
         }
         const old_stream_offset = slot.stream_offset;
@@ -5189,8 +5241,14 @@ pub const Client = struct {
                     // Write at the exact stream offset so retransmitted or
                     // out-of-order STREAM frames (possible after a NAT rebind
                     // triggers server-side retransmit) land at the right place.
-                    s.file.seekTo(sf.offset) catch {};
-                    s.file.writeAll(sf.data) catch {};
+                    s.file.seekTo(sf.offset) catch |err| {
+                        dbg("io: client seekTo failed stream_id={}: {}\n", .{ sf.stream_id, err });
+                        return;
+                    };
+                    s.file.writeAll(sf.data) catch |err| {
+                        dbg("io: client writeAll failed stream_id={}: {}\n", .{ sf.stream_id, err });
+                        return;
+                    };
                     if (sf.fin) {
                         s.file.close();
                         s.active = false;
@@ -5283,7 +5341,9 @@ pub const Client = struct {
                     s.h3_quic_offset += @intCast(pr.consumed);
                 },
                 .data => |d| {
-                    _ = s.file.write(d) catch {};
+                    _ = s.file.write(d) catch |err| {
+                        dbg("io: h3 stream_id={} write failed: {}\n", .{ s.stream_id, err });
+                    };
                     dbg("io: h3 stream_id={} DATA {} bytes written\n", .{ s.stream_id, d.len });
                     // Track consumed QUIC stream bytes so duplicate frames are rejected.
                     s.h3_quic_offset += @intCast(pr.consumed);
@@ -5414,10 +5474,10 @@ pub const Client = struct {
         // Mirror insertions into our encoder table so encodeHeaders emits
         // compact dynamic indexed field lines.
         self.conn.qpack_enc_tbl.setCapacity(h3_qpack.DEFAULT_DYN_TABLE_CAPACITY);
-        self.conn.qpack_enc_tbl.insert(":method", "GET") catch {};
-        self.conn.qpack_enc_tbl.insert(":scheme", "https") catch {};
+        self.conn.qpack_enc_tbl.insert(":method", "GET") catch {}; // non-critical: dynamic table full
+        self.conn.qpack_enc_tbl.insert(":scheme", "https") catch {}; // non-critical: dynamic table full
         if (self.config.host.len <= h3_qpack.MAX_DYN_ENTRY_BYTES) {
-            self.conn.qpack_enc_tbl.insert(":authority", self.config.host) catch {};
+            self.conn.qpack_enc_tbl.insert(":authority", self.config.host) catch {}; // non-critical: dynamic table full
         }
         self.conn.qpack_enc_stream_off = enc_pos; // save for any future inserts
         const enc_sf = stream_frame_mod.StreamFrame{
