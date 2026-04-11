@@ -177,15 +177,29 @@ pub const CryptoStream = struct {
     recv_buf: ByteBuffer = .{},
     /// Bytes ready to send
     send_buf: ByteBuffer = .{},
+    /// Reorder buffer for out-of-order CRYPTO fragments.
+    reorder: CryptoReorderBuf = .{},
 
     /// Feed received CRYPTO frame data into the stream.
+    /// Out-of-order fragments are buffered in `reorder` and drained
+    /// automatically once the gap is filled.
     pub fn feedRecv(self: *CryptoStream, offset: u64, data: []const u8) error{Full}!void {
-        // Simple in-order reassembly — accept only contiguous data
-        if (offset == self.recv_offset) {
-            try self.recv_buf.write(data);
-            self.recv_offset += data.len;
+        if (offset != self.recv_offset) {
+            // Out-of-order: buffer for later reassembly.
+            self.reorder.insert(offset, data);
+            return;
         }
-        // Out-of-order data is dropped for now (TODO: proper reorder buffer)
+        // In-order segment: commit to recv_buf and advance offset.
+        try self.recv_buf.write(data);
+        self.recv_offset += data.len;
+        // Drain any now-contiguous buffered segments.
+        var drain_buf: [REORDER_SLOT_SIZE]u8 = undefined;
+        while (true) {
+            const n = self.reorder.take(self.recv_offset, &drain_buf);
+            if (n == 0) break;
+            self.recv_buf.write(drain_buf[0..n]) catch break; // buffer full
+            self.recv_offset += n;
+        }
     }
 
     /// Enqueue bytes to send as CRYPTO frames.
@@ -368,4 +382,22 @@ test "crypto_reorder_buf: drain sequence" {
 
     try testing.expectEqual(@as(u64, 10), expected_offset);
     try testing.expectEqual(@as(usize, 0), rb.take(expected_offset, &out));
+}
+
+test "crypto_stream: out-of-order feedRecv with reorder" {
+    const testing = std.testing;
+    var cs = CryptoStream{};
+    // Feed segment at offset 3 first (out-of-order).
+    try cs.feedRecv(3, "def");
+    // recv_offset should NOT advance (gap at 0).
+    try testing.expectEqual(@as(u64, 0), cs.recv_offset);
+    try testing.expectEqual(@as(usize, 0), cs.recv_buf.len());
+    // Now feed the missing segment at offset 0.
+    try cs.feedRecv(0, "abc");
+    // Both segments should now be delivered contiguously.
+    try testing.expectEqual(@as(u64, 6), cs.recv_offset);
+    try testing.expectEqual(@as(usize, 6), cs.recv_buf.len());
+    var out: [16]u8 = undefined;
+    const n = cs.recv_buf.read(&out);
+    try testing.expectEqualSlices(u8, "abcdef", out[0..n]);
 }
