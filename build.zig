@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const verbose = b.option(bool, "verbose", "Enable verbose debug output") orelse false;
+
+    // Build-options module (verbose flag accessible as @import("build_options").verbose)
+    const opts = b.addOptions();
+    opts.addOption(bool, "verbose", verbose);
 
     // tls module (vendored)
     const tls_mod = b.createModule(.{
@@ -18,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zquic_mod.addImport("tls", tls_mod);
+    zquic_mod.addOptions("build_options", opts);
 
     const lib = b.addLibrary(.{
         .name = "zquic",
@@ -34,6 +40,7 @@ pub fn build(b: *std.Build) void {
     });
     server_mod.addImport("zquic", zquic_mod);
     server_mod.addImport("tls", tls_mod);
+    server_mod.addOptions("build_options", opts);
     const server = b.addExecutable(.{
         .name = "server",
         .root_module = server_mod,
@@ -48,6 +55,7 @@ pub fn build(b: *std.Build) void {
     });
     client_mod.addImport("zquic", zquic_mod);
     client_mod.addImport("tls", tls_mod);
+    client_mod.addOptions("build_options", opts);
     const client = b.addExecutable(.{
         .name = "client",
         .root_module = client_mod,
@@ -70,7 +78,6 @@ pub fn build(b: *std.Build) void {
         "examples/session_resumption.zig",
     };
     for (example_files) |src| {
-        // Derive binary name from filename without extension.
         const base = std.fs.path.stem(src);
         const ex_mod = b.createModule(.{
             .root_source_file = b.path(src),
