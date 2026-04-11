@@ -163,9 +163,17 @@ fn recvLinux(rb: *RecvBatch, sock: std.posix.socket_t, blocking_first: bool) usi
         };
     }
 
-    // First call: blocking (caller already knows data is ready via poll).
-    // Subsequent calls: non-blocking to drain the remainder of the kernel recv queue.
-    const flags0: u32 = if (blocking_first) 0 else linux.MSG.DONTWAIT;
+    // MSG_WAITFORONE: block until the FIRST message arrives, then switch to
+    // MSG_DONTWAIT for the remaining slots — returning with however many
+    // datagrams were already queued in the kernel buffer.  Without this flag,
+    // recvmmsg(flags=0) would block until ALL vlen (64) messages are received,
+    // which would deadlock the server event loop.
+    // When blocking_first=false (pre-poll data already known not to be available)
+    // add MSG_DONTWAIT so the call returns immediately if nothing is ready.
+    const flags0: u32 = if (blocking_first)
+        linux.MSG.WAITFORONE
+    else
+        linux.MSG.WAITFORONE | linux.MSG.DONTWAIT;
     const rc = linux.recvmmsg(@intCast(sock), msgs[0..].ptr, BATCH_SIZE, flags0, null);
     if (rc == 0 or @as(isize, @bitCast(rc)) < 0) return 0;
     const n: usize = @intCast(rc);
