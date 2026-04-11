@@ -12,7 +12,7 @@ A pure Zig implementation of the QUIC transport protocol (RFC 9000 / 9001 / 9002
 | [RFC 9001](https://www.rfc-editor.org/rfc/rfc9001) | Using TLS to Secure QUIC | complete (keys, AEAD, header protection, key update) |
 | [RFC 9002](https://www.rfc-editor.org/rfc/rfc9002) | QUIC Loss Detection and Congestion Control | RTT, PTO, New Reno |
 | [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114) | HTTP/3 | framing, QPACK, server + client I/O |
-| [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204) | QPACK: Header Compression for HTTP/3 | static table, literal encoding (no dynamic table) |
+| [RFC 9204](https://www.rfc-editor.org/rfc/rfc9204) | QPACK: Header Compression for HTTP/3 | static table, dynamic table (insertions, encoder/decoder streams, Section Acks) |
 | [RFC 9369](https://www.rfc-editor.org/rfc/rfc9369) | QUIC Version 2 | initial secrets, packet type bits, Retry tag |
 
 ## Requirements
@@ -206,8 +206,7 @@ full test suite. The Docker image is built on every merge to `master`.
 
 | Area | What's missing |
 |------|----------------|
-| **QPACK dynamic insertions** | Both sides advertise capacity 4096 and exchange Set Capacity instructions; actual dynamic table insertions in outgoing HEADERS and Section Acknowledgements are not yet implemented |
-| **qlog** | Structured QUIC event logging to `$QLOGDIR` is not written |
+| **QPACK blocked streams** | Streams blocked on dynamic table entries (SETTINGS_QPACK_BLOCKED_STREAMS > 0) are not buffered; `SETTINGS_QPACK_BLOCKED_STREAMS` is advertised as 0 |
 
 ## License
 
