@@ -136,6 +136,7 @@ pub fn main() !void {
         .chacha20 = cfg.chacha20,
         .migrate = cfg.migrate,
         .v2 = cfg.v2,
+        .qlog_dir = cfg.qlog_dir,
     };
 
     var client = io_mod.Client.init(allocator, client_config) catch |err| {

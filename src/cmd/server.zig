@@ -126,6 +126,7 @@ pub fn main() !void {
     if (cfg.migrate) std.debug.print("  migration: enabled\n", .{});
     if (cfg.chacha20) std.debug.print("  chacha20: enabled\n", .{});
     if (cfg.v2) std.debug.print("  QUIC v2: enabled\n", .{});
+    if (cfg.qlog_dir) |d| std.debug.print("  qlog-dir: {s}\n", .{d});
 
     const server_config = io_mod.ServerConfig{
         .port = cfg.port,
@@ -142,6 +143,7 @@ pub fn main() !void {
         .migrate = cfg.migrate,
         .chacha20 = cfg.chacha20,
         .v2 = cfg.v2,
+        .qlog_dir = cfg.qlog_dir,
     };
 
     const server = io_mod.Server.init(allocator, server_config) catch |err| {

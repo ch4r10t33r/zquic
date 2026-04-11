@@ -47,6 +47,9 @@ pub const http09 = struct {
     pub const server = @import("http09/server.zig");
     pub const client = @import("http09/client.zig");
 };
+pub const qlog = struct {
+    pub const writer = @import("qlog/writer.zig");
+};
 pub const frames = struct {
     pub const frame = @import("frames/frame.zig");
     pub const ack = @import("frames/ack.zig");
@@ -87,4 +90,5 @@ test {
     _ = @import("frames/crypto_frame.zig");
     _ = @import("frames/stream.zig");
     _ = @import("frames/transport.zig");
+    _ = @import("qlog/writer.zig");
 }
