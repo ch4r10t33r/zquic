@@ -73,13 +73,20 @@ inline fn quicLongFirstByte(pkt_type: header_mod.LongType, version: u32) u8 {
 /// Configure a UDP socket for ECN (RFC 9000 §13.4):
 ///   - Mark all outgoing packets with ECT(0) via IP_TOS so the peer can
 ///     echo back accurate ECN counts in ACK-ECN frames.
+///
+/// We bypass std.posix.setsockopt because that wrapper treats EINVAL as
+/// `unreachable` (a Zig 0.15 programmer-error assumption).  macOS returns
+/// EINVAL for IP_TOS on some UDP socket states, which would cause a panic
+/// even though ECN is a best-effort optimisation.  Calling the raw
+/// system.setsockopt lets us silently discard any failure.
 fn setupEcnSocket(sock: std.posix.fd_t) void {
-    std.posix.setsockopt(
+    _ = std.posix.system.setsockopt(
         sock,
         IPPROTO_IP_OPT,
-        IP_TOS_OPT,
-        std.mem.asBytes(&ECN_ECT0),
-    ) catch {};
+        @as(u32, @intCast(IP_TOS_OPT)),
+        &ECN_ECT0,
+        @sizeOf(u8),
+    );
 }
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
@@ -114,9 +121,13 @@ pub fn buildCryptoFrame(out: []u8, offset: u64, data: []const u8) !usize {
     return pos;
 }
 
-/// Build an ACK frame for the given packet number.
-pub fn buildAckFrame(out: []u8, largest_pn: u64) !usize {
-    if (out.len < 16) return error.BufferTooSmall;
+/// Build an ACK frame (type 0x02, RFC 9000 §19.3.1).
+/// `first_ack_range` is the number of contiguous packets before `largest_pn`
+/// that are also acknowledged (RFC 9000 §19.3.1): the acked range covers
+/// packet numbers [largest_pn - first_ack_range .. largest_pn].
+/// Pass 0 to acknowledge only `largest_pn`.
+pub fn buildAckFrame(out: []u8, largest_pn: u64, first_ack_range: u64) !usize {
+    if (out.len < 24) return error.BufferTooSmall;
     var pos: usize = 0;
     out[pos] = 0x02; // ACK frame type
     pos += 1;
@@ -124,17 +135,17 @@ pub fn buildAckFrame(out: []u8, largest_pn: u64) !usize {
     pos += pn_enc.len;
     out[pos] = 0x00; // ack_delay = 0
     pos += 1;
-    out[pos] = 0x00; // ack_range_count = 0 (just the largest PN range)
+    out[pos] = 0x00; // ack_range_count = 0 (just the single first range)
     pos += 1;
-    const range_enc = try varint.encode(out[pos..], 0); // first_ack_range = 0
+    const range_enc = try varint.encode(out[pos..], first_ack_range);
     pos += range_enc.len;
     return pos;
 }
 
-/// Build an ACK-ECN frame (type 0x03) with ECN counts (RFC 9000 §19.3.2).
-/// Includes ECT(0), ECT(1), and CE counts after the standard ACK ranges.
-pub fn buildAckEcnFrame(out: []u8, largest_pn: u64, ect0: u64, ect1: u64, ce: u64) !usize {
-    if (out.len < 40) return error.BufferTooSmall;
+/// Build an ACK-ECN frame (type 0x03, RFC 9000 §19.3.2).
+/// `first_ack_range` is as described for buildAckFrame above.
+pub fn buildAckEcnFrame(out: []u8, largest_pn: u64, first_ack_range: u64, ect0: u64, ect1: u64, ce: u64) !usize {
+    if (out.len < 48) return error.BufferTooSmall;
     var pos: usize = 0;
     out[pos] = 0x03; // ACK-ECN frame type
     pos += 1;
@@ -144,7 +155,7 @@ pub fn buildAckEcnFrame(out: []u8, largest_pn: u64, ect0: u64, ect1: u64, ce: u6
     pos += 1;
     out[pos] = 0x00; // ack_range_count = 0
     pos += 1;
-    const range_enc = try varint.encode(out[pos..], 0); // first_ack_range = 0
+    const range_enc = try varint.encode(out[pos..], first_ack_range);
     pos += range_enc.len;
     // ECN counts
     const ect0_enc = try varint.encode(out[pos..], ect0);
@@ -975,17 +986,10 @@ pub const Server = struct {
     conns: [MAX_CONNECTIONS]?ConnState = [_]?ConnState{null} ** MAX_CONNECTIONS,
     /// Random server token secret for Retry token HMAC-SHA256 verification.
     retry_secret: [32]u8 = [_]u8{0} ** 32,
-    /// Timestamp of the last HTTP/0.9 response flush (milliseconds).
-    /// Used to enforce a minimum flush interval so we don't flood the network
-    /// by flushing after every incoming ACK packet. Without pacing, the server
-    /// can send 6+ MB/s into a 10 Mbps (1.25 MB/s) simulated link, causing
-    /// the network simulator to drop 80%+ of packets and stalling transfers.
-    http09_last_flush_ms: i64 = 0,
+    /// (Removed: was a 50ms pacing gate. CC-based rate-limiting is now sufficient.)
     /// Pacing timestamp for http09RetransmitPendingFins: at most one burst per 50ms.
     http09_retransmit_last_ms: i64 = 0,
-    /// Same pacing timestamp for HTTP/3 DATA frame sends.
-    http3_last_flush_ms: i64 = 0,
-
+    /// (Removed: was a 50ms pacing gate for HTTP/3. CC-based rate-limiting is now sufficient.)
     /// Initialize server: load cert/key and create UDP socket.
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !*Server {
         // Heap-allocate the Server to avoid blowing the stack: the conns array
@@ -1706,7 +1710,7 @@ pub const Server = struct {
 
         // ACK the client's Initial (if we received a PN)
         if (conn.init_recv_pn) |pn| {
-            const ack_len = buildAckFrame(frames_buf[fp..], pn) catch return;
+            const ack_len = buildAckFrame(frames_buf[fp..], pn, 0) catch return;
             fp += ack_len;
         }
 
@@ -1888,7 +1892,7 @@ pub const Server = struct {
 
         var send_buf: [256]u8 = undefined;
         var frames_buf: [64]u8 = undefined;
-        const ack_len = buildAckFrame(&frames_buf, pn) catch return;
+        const ack_len = buildAckFrame(&frames_buf, pn, 0) catch return;
 
         const pkt_len = buildHandshakePacket(
             &send_buf,
@@ -1978,7 +1982,7 @@ pub const Server = struct {
         // in the server trace; the exact counts don't matter.
         if (fp + 40 <= frames_buf.len) {
             const ecn_pn = conn.app_recv_pn orelse 0;
-            const ack_ecn_len = buildAckEcnFrame(frames_buf[fp..], ecn_pn, conn.ecn_ect0_recv, 0, 0) catch 0;
+            const ack_ecn_len = buildAckEcnFrame(frames_buf[fp..], ecn_pn, 0, conn.ecn_ect0_recv, 0, 0) catch 0;
             fp += ack_ecn_len;
         }
 
@@ -2175,34 +2179,70 @@ pub const Server = struct {
             if (ft == 0x00) continue; // PADDING
             if (ft == 0x01) continue; // PING — no body
             if (ft == 0x02 or ft == 0x03) {
-                // ACK frame — extract largest_acknowledged to detect FIN ACKs,
-                // then skip all variable-length fields.
-                if (varint.decode(frames[pos..]) catch null) |lar| {
-                    const largest_ack = lar.value;
-                    for (&conn.http09_slots) |*slot| {
-                        if (slot.awaiting_fin_ack and slot.fin_pkt_pn <= largest_ack) {
-                            dbg("io: stream_id={} FIN ACKed (fin_pn={} <= largest_ack={})\n", .{ slot.stream_id, slot.fin_pkt_pn, largest_ack });
-                            slot.awaiting_fin_ack = false;
-                        }
+                // ACK frame (RFC 9000 §19.3).
+                // Parse Largest Acknowledged, ACK Delay, ACK Range Count, and
+                // First ACK Range so that the loss detector knows which packets
+                // were genuinely acknowledged vs. which are in a gap.
+                var ack_pos: usize = pos;
+                const lar_r = varint.decode(frames[ack_pos..]) catch {
+                    pos += skipAckBody(frames[pos..], ft == 0x03);
+                    continue;
+                };
+                ack_pos += lar_r.len;
+                const largest_ack = lar_r.value;
+
+                const del_r = varint.decode(frames[ack_pos..]) catch {
+                    pos += skipAckBody(frames[pos..], ft == 0x03);
+                    continue;
+                };
+                ack_pos += del_r.len;
+                const ack_delay = del_r.value;
+
+                const cnt_r = varint.decode(frames[ack_pos..]) catch {
+                    pos += skipAckBody(frames[pos..], ft == 0x03);
+                    continue;
+                };
+                ack_pos += cnt_r.len;
+
+                const fst_r = varint.decode(frames[ack_pos..]) catch {
+                    pos += skipAckBody(frames[pos..], ft == 0x03);
+                    continue;
+                };
+                const first_ack_range = fst_r.value;
+
+                for (&conn.http09_slots) |*slot| {
+                    if (slot.awaiting_fin_ack and slot.fin_pkt_pn <= largest_ack) {
+                        dbg("io: stream_id={} FIN ACKed (fin_pn={} <= largest_ack={})\n", .{ slot.stream_id, slot.fin_pkt_pn, largest_ack });
+                        slot.awaiting_fin_ack = false;
                     }
-                    // Loss detection + RTT estimation (RFC 9002).
-                    var lost_buf: [32]u64 = undefined;
-                    const ld_result = conn.ld.onAck(
-                        largest_ack,
-                        0,
-                        @intCast(std.time.milliTimestamp()),
-                        &conn.rtt,
-                        &lost_buf,
-                    );
-                    // Congestion control: ack delivered bytes.
-                    if (ld_result.rtt_updated) {
-                        conn.cc.onAck(congestion.mss);
-                    }
-                    // Signal losses to CC.
-                    var li: usize = 0;
-                    while (li < ld_result.lost_count) : (li += 1) {
-                        conn.cc.onLoss(lost_buf[li]);
-                    }
+                }
+                // Loss detection + RTT estimation (RFC 9002).
+                // Pass first_ack_range so the loss detector can correctly
+                // distinguish acked packets from those in gaps.
+                var lost_buf: [32]u64 = undefined;
+                const ld_result = conn.ld.onAck(
+                    largest_ack,
+                    first_ack_range,
+                    ack_delay,
+                    @intCast(std.time.milliTimestamp()),
+                    &conn.rtt,
+                    &lost_buf,
+                );
+                // Congestion control: credit the actual bytes delivered.
+                // bytes_acked is the sum of real packet sizes from the loss
+                // detector, keeping bytes_in_flight accurate.
+                if (ld_result.bytes_acked > 0) {
+                    conn.cc.onAck(ld_result.bytes_acked);
+                }
+                // Remove lost-packet bytes from bytes_in_flight (RFC 9002 §7.5:
+                // lost packets are no longer "in flight").
+                if (ld_result.lost_bytes > 0) {
+                    conn.cc.bytes_in_flight -|= ld_result.lost_bytes;
+                }
+                // Signal loss events to CC for cwnd reduction.
+                var li: usize = 0;
+                while (li < ld_result.lost_count) : (li += 1) {
+                    conn.cc.onLoss(lost_buf[li]);
                 }
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
@@ -2502,25 +2542,19 @@ pub const Server = struct {
         }
     }
 
-    /// Drain queued HTTP/0.9 bodies with pacing to avoid flooding the network.
+    /// Drain queued HTTP/0.9 bodies bounded by congestion control.
     ///
-    /// Without pacing, flushing after every incoming ACK (which arrives ~every 30ms
-    /// at 15ms RTT) drives the send rate to 6+ MB/s — 5× the 10 Mbps interop link.
-    /// The network simulator then drops 80%+ of packets, stalling the transfer.
+    /// The congestion controller (NewReno) is the sole rate limiter: each call to
+    /// http09SendNextChunk checks cc.canSend() and returns early if the cwnd is
+    /// exhausted.  A per-flush budget of 20 packets (24 KB) caps the burst size so
+    /// the NS3 simulator's 25-packet DropTail queue is never exceeded.
     ///
-    /// We enforce a minimum flush interval of 50ms. Combined with a budget of 20
-    /// chunks × 1200 bytes = 24 KB per flush, the effective rate is:
-    ///   24 KB / 50 ms = 480 KB/s ≈ 3.8 Mbps — well below 10 Mbps.
-    ///
-    /// Critically, 20 UDP packets per burst stays below the NS3 simulator's
-    /// 25-packet DropTail queue, so zero packets should be dropped by the
-    /// network simulator.  (Previous budget of 40 caused ~37% packet loss.)
+    /// The previous 50 ms time gate has been removed.  It was a workaround for a
+    /// CC accounting bug (bytes_acked was under-credited) that caused bytes_in_flight
+    /// to drift upward, blocking sends.  With accurate CC accounting the time gate is
+    /// not needed and only throttles throughput on real networks / loopback to
+    /// ~480 KB/s — far below what is achievable.
     fn flushPendingHttp09Responses(self: *Server) void {
-        // Enforce minimum 50ms between flushes to pace sends below 10 Mbps.
-        const now = std.time.milliTimestamp();
-        if (now - self.http09_last_flush_ms < 50) return;
-        self.http09_last_flush_ms = now;
-
         var budget: usize = 20; // 20 × 1200 bytes = 24 KB per flush — below the 25-pkt NS3 queue
         while (budget > 0) {
             var progressed = false;
@@ -3386,12 +3420,9 @@ pub const Server = struct {
         }
     }
 
-    /// Drain queued HTTP/3 DATA frames with the same 50ms/20-packet pacing as HTTP/0.9.
+    /// Drain queued HTTP/3 DATA frames bounded by congestion control.
+    /// The 50ms time gate has been removed; CC alone gates the send rate.
     fn flushPendingHttp3Responses(self: *Server) void {
-        const now = std.time.milliTimestamp();
-        if (now - self.http3_last_flush_ms < 50) return;
-        self.http3_last_flush_ms = now;
-
         var budget: usize = 20;
         while (budget > 0) {
             var progressed = false;
@@ -3503,6 +3534,12 @@ pub const Client = struct {
     /// the burst from (N ACKs + N GETs) to (1 ACK + N GETs), keeping the
     /// combined burst under the NS3 DropTail queue limit of 25 packets.
     deferred_ack_pn: ?u64 = null,
+    /// Minimum packet number seen since the last deferred ACK flush.
+    /// Together with deferred_ack_pn (the max), this lets flushDeferredAck
+    /// compute an accurate first_ack_range that covers all received packets,
+    /// preventing the server's k_packet_threshold loss detector from
+    /// mis-classifying contiguously-received packets as lost.
+    deferred_ack_min_pn: ?u64 = null,
 
     /// Active URL slice for the current connection.  Normally == config.urls;
     /// for the resumption second connection it is the remaining URLs.
@@ -4572,6 +4609,9 @@ pub const Client = struct {
         if (decompressed_pn > (self.deferred_ack_pn orelse 0)) {
             self.deferred_ack_pn = decompressed_pn;
         }
+        if (self.deferred_ack_min_pn == null or decompressed_pn < self.deferred_ack_min_pn.?) {
+            self.deferred_ack_min_pn = decompressed_pn;
+        }
     }
 
     /// Send a single cumulative ACK for the highest PN accumulated since the
@@ -4581,19 +4621,27 @@ pub const Client = struct {
     fn flushDeferredAck(self: *Client) void {
         const largest_pn = self.deferred_ack_pn orelse return;
         self.deferred_ack_pn = null;
-        var ack_buf: [40]u8 = undefined;
+        // Compute first_ack_range: covers [min_pn .. largest_pn] assuming all
+        // packets in that window arrived (no gaps).  This prevents the server's
+        // k_packet_threshold loss detector from mis-classifying received packets
+        // as lost due to a sparse ACK (first_ack_range=0).
+        const min_pn = self.deferred_ack_min_pn orelse largest_pn;
+        self.deferred_ack_min_pn = null;
+        const first_ack_range = largest_pn - min_pn;
+        var ack_buf: [56]u8 = undefined;
         const ack_len = if (self.conn.ecn_ect0_recv > 0 or
             self.conn.ecn_ect1_recv > 0 or
             self.conn.ecn_ce_recv > 0)
             buildAckEcnFrame(
                 &ack_buf,
                 largest_pn,
+                first_ack_range,
                 self.conn.ecn_ect0_recv,
                 self.conn.ecn_ect1_recv,
                 self.conn.ecn_ce_recv,
             ) catch return
         else
-            buildAckFrame(&ack_buf, largest_pn) catch return;
+            buildAckFrame(&ack_buf, largest_pn, first_ack_range) catch return;
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
         const pkt_len = build1RttPacketFull(
             &send_buf,

@@ -17,12 +17,53 @@
 
 const std = @import("std");
 const fs = std.fs;
-const net = std.net;
-const os = std.posix;
 
 const DEFAULT_SIZE_MB: usize = 50;
 const DEFAULT_PORT: u16 = 14433;
 const CHUNK: usize = 64 * 1024; // 64 KB read buffer
+
+// Temporary paths — all under /tmp so no repo pollution.
+const CERT_PATH = "/tmp/zquic_bench_cert.pem";
+const KEY_PATH = "/tmp/zquic_bench_key.pem";
+
+/// Generate a self-signed ECDSA cert + key into /tmp if not already present.
+/// Uses `openssl` which is available on macOS and most Linux distros.
+fn ensureCert() !void {
+    // Skip if both files already exist and are non-empty.
+    const cert_ok = blk: {
+        const f = fs.openFileAbsolute(CERT_PATH, .{}) catch break :blk false;
+        defer f.close();
+        const st = f.stat() catch break :blk false;
+        break :blk st.size > 0;
+    };
+    const key_ok = blk: {
+        const f = fs.openFileAbsolute(KEY_PATH, .{}) catch break :blk false;
+        defer f.close();
+        const st = f.stat() catch break :blk false;
+        break :blk st.size > 0;
+    };
+    if (cert_ok and key_ok) return;
+
+    std.debug.print("Generating self-signed cert for benchmark...\n", .{});
+    const argv = [_][]const u8{
+        "openssl",                 "req",
+        "-x509",                   "-newkey",
+        "ec",                      "-pkeyopt",
+        "ec_paramgen_curve:P-256", "-keyout",
+        KEY_PATH,                  "-out",
+        CERT_PATH,                 "-days",
+        "1",                       "-nodes",
+        "-subj",                   "/CN=localhost",
+    };
+    var proc = std.process.Child.init(&argv, std.heap.page_allocator);
+    proc.stdout_behavior = .Ignore;
+    proc.stderr_behavior = .Ignore;
+    const term = try proc.spawnAndWait();
+    if (term != .Exited or term.Exited != 0) {
+        std.debug.print("ERROR: openssl cert generation failed: {}\n", .{term});
+        return error.CertGenFailed;
+    }
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -56,7 +97,10 @@ pub fn main() !void {
     std.debug.print("    server    : {s}\n", .{server_bin});
     std.debug.print("    client    : {s}\n\n", .{client_bin});
 
-    // Create a temporary www directory with a test file.
+    // Ensure a TLS cert+key exist in /tmp.
+    try ensureCert();
+
+    // Create temporary www and download directories.
     const www_dir = "/tmp/zquic_bench_www";
     const dl_dir = "/tmp/zquic_bench_dl";
     fs.makeDirAbsolute(www_dir) catch |e| if (e != error.PathAlreadyExists) return e;
@@ -65,7 +109,7 @@ pub fn main() !void {
     const test_file = www_dir ++ "/bench.bin";
     const expected_bytes = size_mb * 1024 * 1024;
 
-    // Write test file (sequential bytes — compressible, but crypto makes it effectively random).
+    // Write test file with random bytes (crypto makes it effectively incompressible).
     {
         std.debug.print("Creating {d} MB test file... ", .{size_mb});
         const f = try fs.createFileAbsolute(test_file, .{});
@@ -82,19 +126,19 @@ pub fn main() !void {
         std.debug.print("done.\n", .{});
     }
 
-    // Launch server.
-    const cert_path = "interop/cert.pem";
-    const key_path = "interop/priv.key";
+    // Launch server with HTTP/0.9 file serving enabled.
+    const port_str = try std.fmt.allocPrint(alloc, "{}", .{port});
     const server_argv = [_][]const u8{
         server_bin,
         "--port",
-        try std.fmt.allocPrint(alloc, "{}", .{port}),
+        port_str,
         "--www",
         www_dir,
         "--cert",
-        cert_path,
+        CERT_PATH,
         "--key",
-        key_path,
+        KEY_PATH,
+        "--http09",
     };
     std.debug.print("Launching server on :{d}...\n", .{port});
     var server_proc = std.process.Child.init(&server_argv, alloc);
@@ -102,10 +146,11 @@ pub fn main() !void {
     server_proc.stderr_behavior = .Ignore;
     try server_proc.spawn();
 
-    // Give the server a moment to bind.
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    // Give the server a moment to bind its UDP socket.
+    std.Thread.sleep(300 * std.time.ns_per_ms);
 
     // Launch client and time the download.
+    // URL path is /bench.bin; client saves to {dl_dir}/bench.bin.
     const dl_file = try std.fmt.allocPrint(alloc, "{s}/bench.bin", .{dl_dir});
     const url = try std.fmt.allocPrint(alloc, "https://localhost:{d}/bench.bin", .{port});
     const client_argv = [_][]const u8{
@@ -113,12 +158,10 @@ pub fn main() !void {
         "--host",
         "localhost",
         "--port",
-        try std.fmt.allocPrint(alloc, "{}", .{port}),
-        "--urls",
-        url,
-        "--output",
-        dl_dir,
-        "--no-verify",
+        port_str,
+        "--url",    url, // singular --url, not --urls
+        "--output", dl_dir,
+        "--http09", // must match server mode
     };
     std.debug.print("Downloading {s}...\n", .{url});
 
@@ -137,7 +180,10 @@ pub fn main() !void {
     // Verify download size.
     const stat = fs.openFileAbsolute(dl_file, .{}) catch |e| {
         std.debug.print("ERROR: could not open downloaded file {s}: {}\n", .{ dl_file, e });
-        return;
+        std.debug.print("       client exit: {}\n", .{term});
+        // Cleanup best-effort then fail.
+        fs.deleteFileAbsolute(test_file) catch {};
+        return error.DownloadFileMissing;
     };
     defer stat.close();
     const info = try stat.stat();
@@ -149,12 +195,13 @@ pub fn main() !void {
     const throughput_mbs = mb_transferred / elapsed_s;
     const throughput_mbits = throughput_mbs * 8.0;
 
+    const complete = recv_bytes == expected_bytes;
     std.debug.print("\n--- Results ---\n", .{});
     std.debug.print("  exit code       : {}\n", .{term});
     std.debug.print("  bytes received  : {d} / {d}  ({s})\n", .{
         recv_bytes,
         expected_bytes,
-        if (recv_bytes == expected_bytes) "✓ complete" else "✗ incomplete",
+        if (complete) "✓ complete" else "✗ incomplete",
     });
     std.debug.print("  elapsed         : {d} ms\n", .{elapsed_ms});
     std.debug.print("  throughput      : {d:.1} MB/s  ({d:.1} Mbps)\n", .{ throughput_mbs, throughput_mbits });
@@ -162,4 +209,9 @@ pub fn main() !void {
     // Cleanup.
     fs.deleteFileAbsolute(test_file) catch {};
     fs.deleteFileAbsolute(dl_file) catch {};
+
+    if (!complete) {
+        std.debug.print("FAIL: transfer incomplete ({d} of {d} bytes)\n", .{ recv_bytes, expected_bytes });
+        return error.TransferIncomplete;
+    }
 }

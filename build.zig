@@ -95,6 +95,9 @@ pub fn build(b: *std.Build) void {
         const exe = b.addExecutable(.{ .name = "throughput_bench", .root_module = m });
         const run = b.addRunArtifact(exe);
         if (b.args) |a| run.addArgs(a);
+        // Ensure the server and client binaries are installed before the
+        // benchmark tries to launch them from ./zig-out/bin/.
+        bench_e2e_step.dependOn(b.getInstallStep());
         bench_e2e_step.dependOn(&run.step);
     }
 

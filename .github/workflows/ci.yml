@@ -27,6 +27,26 @@ jobs:
       - name: Run unit tests
         run: zig build test --summary all
 
+  bench-e2e:
+    name: End-to-End Throughput Benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.2"
+
+      - name: Install OpenSSL (for cert generation)
+        run: sudo apt-get install -y openssl
+
+      - name: Run end-to-end benchmark (5 MB transfer)
+        # Use --size-mb 5 to keep CI fast (~5s on loopback).
+        # The benchmark exits non-zero if the transfer is incomplete,
+        # so this step fails on any CC / loss-detection regression.
+        run: zig build bench-e2e -Doptimize=ReleaseFast -- --size-mb 5
+
   lint:
     name: Format Check
     runs-on: ubuntu-latest

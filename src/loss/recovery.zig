@@ -107,17 +107,21 @@ pub const LossDetector = struct {
     pub fn onAck(
         self: *LossDetector,
         largest_acked: u64,
+        /// First ACK range from the ACK frame (RFC 9000 §19.3.1).
+        /// The number of contiguous packets before `largest_acked` that are
+        /// also acknowledged in the same range.  The smallest packet number
+        /// confirmed acked by this range is `largest_acked - first_ack_range`.
+        first_ack_range: u64,
         ack_delay_ms: u64,
         now_ms: u64,
         rtt: *RttEstimator,
         lost_buf: []u64,
-    ) struct { lost_count: usize, rtt_updated: bool } {
+    ) struct { lost_count: usize, rtt_updated: bool, bytes_acked: u64, lost_bytes: u64 } {
         var rtt_updated = false;
 
-        // Update RTT if the newly acked packet was just sent
+        // Update RTT sample for the largest acknowledged packet.
         if (largest_acked > self.largest_acked) {
             self.largest_acked = largest_acked;
-            // Find the most recently sent packet with pn == largest_acked
             for (self.sent[0..self.sent_count]) |p| {
                 if (p.pn == largest_acked) {
                     const sample = now_ms -| p.send_time_ms;
@@ -128,42 +132,46 @@ pub const LossDetector = struct {
             }
         }
 
-        // Detect lost packets
+        // The first ACK range covers [smallest_acked .. largest_acked].
+        // Packets in this range are definitively acknowledged.
+        // Packets below smallest_acked may be in a gap (possibly lost).
+        const smallest_acked = largest_acked -| first_ack_range;
+
         var lost_count: usize = 0;
-        const loss_delay = @max(
-            k_packet_threshold,
-            (rtt.srtt_ms * @as(f64, @floatFromInt(k_time_threshold_num)) / @as(f64, @floatFromInt(k_time_threshold_den))),
-        );
-        _ = loss_delay;
+        var bytes_acked: u64 = 0;
+        var lost_bytes: u64 = 0;
 
         var i: usize = 0;
         while (i < self.sent_count) {
             const p = self.sent[i];
-            if (p.pn > largest_acked) {
-                i += 1;
+
+            // Packet is definitively acked: within [smallest_acked .. largest_acked].
+            if (p.pn >= smallest_acked and p.pn <= largest_acked) {
+                bytes_acked += p.size;
+                self.sent[i] = self.sent[self.sent_count - 1];
+                self.sent_count -= 1;
                 continue;
             }
-            // Packet-threshold loss: if >= k_packet_threshold packets acked after this
-            if (largest_acked >= p.pn + k_packet_threshold) {
+
+            // Packet is below the acked range — apply k_packet_threshold loss
+            // detection only for true gaps (p.pn < smallest_acked).
+            // A packet is considered lost when k_packet_threshold or more
+            // later packets have been acknowledged (RFC 9002 §6.1.1).
+            if (p.pn < smallest_acked and largest_acked >= p.pn + k_packet_threshold) {
+                lost_bytes += p.size;
                 if (lost_count < lost_buf.len) {
                     lost_buf[lost_count] = p.pn;
                     lost_count += 1;
                 }
-                // Remove from sent list
                 self.sent[i] = self.sent[self.sent_count - 1];
                 self.sent_count -= 1;
                 continue;
             }
-            // Acked: remove from sent list
-            if (p.pn <= largest_acked) {
-                self.sent[i] = self.sent[self.sent_count - 1];
-                self.sent_count -= 1;
-                continue;
-            }
+
             i += 1;
         }
 
-        return .{ .lost_count = lost_count, .rtt_updated = rtt_updated };
+        return .{ .lost_count = lost_count, .rtt_updated = rtt_updated, .bytes_acked = bytes_acked, .lost_bytes = lost_bytes };
     }
 };
 
@@ -211,8 +219,10 @@ test "loss: packet threshold detection" {
         });
     }
 
-    // ACK packet 5: packets 0 and 1 should be detected as lost (5 - 0 >= 3, 5 - 1 >= 3)
+    // ACK packet 5 only (first_ack_range=0 means only pn=5 is in the acked range).
+    // Packets 0, 1, 2 are in a gap and should be detected as lost via
+    // k_packet_threshold (5 >= 0+3, 1+3, 2+3).
     var lost_buf: [8]u64 = undefined;
-    const result = ld.onAck(5, 0, 200, &rtt, &lost_buf);
+    const result = ld.onAck(5, 0, 0, 200, &rtt, &lost_buf);
     try testing.expect(result.lost_count >= 2);
 }
