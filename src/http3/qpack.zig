@@ -136,6 +136,57 @@ pub const static_table = [_]StaticEntry{
 };
 
 // ---------------------------------------------------------------------------
+// Compile-time static table lookup maps (O(1) hash lookups)
+// ---------------------------------------------------------------------------
+
+/// Number of distinct header names in the static table (computed at comptime).
+const STATIC_UNIQUE_NAME_COUNT: usize = blk: {
+    @setEvalBranchQuota(200_000);
+    var names: [static_table.len][]const u8 = undefined;
+    var n: usize = 0;
+    outer: for (static_table) |e| {
+        for (names[0..n]) |s| {
+            if (std.mem.eql(u8, s, e.name)) continue :outer;
+        }
+        names[n] = e.name;
+        n += 1;
+    }
+    break :blk n;
+};
+
+/// Comptime KV array: unique name → first static table index with that name.
+const static_name_kvs: [STATIC_UNIQUE_NAME_COUNT]struct { []const u8, usize } = blk: {
+    @setEvalBranchQuota(200_000);
+    var kvs: [STATIC_UNIQUE_NAME_COUNT]struct { []const u8, usize } = undefined;
+    var n: usize = 0;
+    outer: for (static_table, 0..) |e, i| {
+        for (kvs[0..n]) |kv| {
+            if (std.mem.eql(u8, kv[0], e.name)) continue :outer;
+        }
+        kvs[n] = .{ e.name, i };
+        n += 1;
+    }
+    break :blk kvs;
+};
+
+/// O(1) compile-time hash map: name → first static table index.
+const static_name_map = std.StaticStringMap(usize).initComptime(static_name_kvs);
+
+/// Comptime KV array: "name\x00value" → static table index (all 100 entries).
+/// The \x00 separator is safe because HTTP header names/values cannot contain NUL.
+const static_entry_kvs: [static_table.len]struct { []const u8, usize } = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var kvs: [static_table.len]struct { []const u8, usize } = undefined;
+    for (static_table, 0..) |e, i| {
+        kvs[i] = .{ std.fmt.comptimePrint("{s}\x00{s}", .{ e.name, e.value }), i };
+    }
+    break :blk kvs;
+};
+
+/// O(1) compile-time hash map: "name\x00value" → static table index.
+const static_entry_map = std.StaticStringMap(usize).initComptime(static_entry_kvs);
+
+// ---------------------------------------------------------------------------
 // Header field representation
 // ---------------------------------------------------------------------------
 
@@ -215,22 +266,27 @@ fn decodeInteger(
 
 /// Find an exact name+value match in the static table.  Returns the index
 /// (0-based) or null if not found.
+///
+/// O(1) via a compile-time perfect-hash map keyed on "name\x00value".
+/// A 512-byte stack buffer is used to construct the lookup key without
+/// heap allocation; all real HTTP header name+value pairs are well under
+/// this limit.
 fn findStaticEntry(name: []const u8, value: []const u8) ?usize {
-    for (static_table, 0..) |e, i| {
-        if (std.mem.eql(u8, e.name, name) and std.mem.eql(u8, e.value, value)) {
-            return i;
-        }
-    }
-    return null;
+    var key_buf: [512]u8 = undefined;
+    const total = name.len + 1 + value.len;
+    if (total > key_buf.len) return null;
+    @memcpy(key_buf[0..name.len], name);
+    key_buf[name.len] = 0; // NUL separator
+    @memcpy(key_buf[name.len + 1 ..][0..value.len], value);
+    return static_entry_map.get(key_buf[0..total]);
 }
 
 /// Find the first static table entry whose name matches `name`.
 /// Returns the index or null if not found.
+///
+/// O(1) via a compile-time perfect-hash map.
 fn findStaticName(name: []const u8) ?usize {
-    for (static_table, 0..) |e, i| {
-        if (std.mem.eql(u8, e.name, name)) return i;
-    }
-    return null;
+    return static_name_map.get(name);
 }
 
 // ---------------------------------------------------------------------------

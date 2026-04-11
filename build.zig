@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
     // ── Benchmarks ───────────────────────────────────────────────────────────
     // zig build bench        — crypto path microbenchmark (runs immediately)
     // zig build bench-e2e    — end-to-end loopback transfer (needs server+client)
+    // zig build bench-qpack  — QPACK static table lookup benchmark
     {
         const bench_step = b.step("bench", "Run crypto path microbenchmark");
         const m = b.createModule(.{
@@ -101,6 +102,19 @@ pub fn build(b: *std.Build) void {
         // → run rather than allowing them to execute in parallel.
         run.step.dependOn(b.getInstallStep());
         bench_e2e_step.dependOn(&run.step);
+    }
+    {
+        const bench_qpack_step = b.step("bench-qpack", "Run QPACK static table lookup benchmark");
+        const m = b.createModule(.{
+            .root_source_file = b.path("benchmarks/qpack_bench.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        m.addImport("zquic", zquic_mod);
+        const exe = b.addExecutable(.{ .name = "qpack_bench", .root_module = m });
+        const run = b.addRunArtifact(exe);
+        if (b.args) |a| run.addArgs(a);
+        bench_qpack_step.dependOn(&run.step);
     }
 
     // Examples

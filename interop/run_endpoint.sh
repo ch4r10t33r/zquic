@@ -98,16 +98,16 @@ case "${TESTCASE}" in
         EXTRA_FLAGS=(--http3)
         ;;
     connectionmigration)
-        EXTRA_FLAGS=(--migrate)
+        EXTRA_FLAGS=(--migrate --http09)
         ;;
     rebind)
-        EXTRA_FLAGS=(--rebind)
+        EXTRA_FLAGS=(--rebind --http09)
         ;;
     keyupdate)
-        EXTRA_FLAGS=(--key-update)
+        EXTRA_FLAGS=(--key-update --http09)
         ;;
     chacha20)
-        EXTRA_FLAGS=(--chacha20)
+        EXTRA_FLAGS=(--chacha20 --http09)
         ;;
     v2)
         EXTRA_FLAGS=(--v2)

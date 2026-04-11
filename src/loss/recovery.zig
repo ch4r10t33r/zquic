@@ -82,6 +82,13 @@ pub const SentPacket = struct {
     size: usize,
     ack_eliciting: bool,
     in_flight: bool,
+    /// Stream metadata for application-layer retransmission.
+    /// When `has_stream_data` is true the packet carried a STREAM frame for
+    /// the given stream starting at `stream_offset`.  The loss detector
+    /// surfaces this in `lost_buf` so the sender can rewind and re-send.
+    has_stream_data: bool = false,
+    stream_id: u64 = 0,
+    stream_offset: u64 = 0,
 };
 
 /// Loss detection state for one packet number space.
@@ -115,7 +122,11 @@ pub const LossDetector = struct {
         ack_delay_ms: u64,
         now_ms: u64,
         rtt: *RttEstimator,
-        lost_buf: []u64,
+        /// Caller-provided buffer.  On return the first `lost_count` entries
+        /// hold the full SentPacket descriptors for packets declared lost.
+        /// Callers that stored stream metadata in `has_stream_data` can use
+        /// this to rewind and retransmit the affected data.
+        lost_buf: []SentPacket,
     ) struct { lost_count: usize, rtt_updated: bool, bytes_acked: u64, lost_bytes: u64 } {
         var rtt_updated = false;
 
@@ -160,7 +171,7 @@ pub const LossDetector = struct {
             if (p.pn < smallest_acked and largest_acked >= p.pn + k_packet_threshold) {
                 lost_bytes += p.size;
                 if (lost_count < lost_buf.len) {
-                    lost_buf[lost_count] = p.pn;
+                    lost_buf[lost_count] = p; // full descriptor for retransmission
                     lost_count += 1;
                 }
                 self.sent[i] = self.sent[self.sent_count - 1];
@@ -222,7 +233,7 @@ test "loss: packet threshold detection" {
     // ACK packet 5 only (first_ack_range=0 means only pn=5 is in the acked range).
     // Packets 0, 1, 2 are in a gap and should be detected as lost via
     // k_packet_threshold (5 >= 0+3, 1+3, 2+3).
-    var lost_buf: [8]u64 = undefined;
+    var lost_buf: [8]SentPacket = undefined;
     const result = ld.onAck(5, 0, 0, 200, &rtt, &lost_buf);
     try testing.expect(result.lost_count >= 2);
 }

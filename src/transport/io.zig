@@ -601,6 +601,11 @@ const Http09OutSlot = struct {
     file: std.fs.File = undefined,
     stream_offset: u64 = 0,
     file_end: u64 = 0,
+    /// Absolute filesystem path, stored so we can reopen the file for
+    /// retransmission after it has been closed when transitioning to the
+    /// awaiting_fin_ack state.
+    file_path: [512]u8 = [_]u8{0} ** 512,
+    file_path_len: usize = 0,
 
     /// FIN retransmission state.
     /// After sending the final STREAM frame (FIN=true), the slot transitions
@@ -635,6 +640,18 @@ const Http3OutSlot = struct {
     /// Byte offset in the QUIC stream (includes the HEADERS frame already sent).
     stream_offset: u64 = 0,
     file_end: u64 = 0,
+    /// Raw file position in bytes (separate from stream_offset which includes
+    /// HEADERS frame and DATA frame header overhead).  Used for retransmission:
+    /// when a packet is declared lost, we seek the file to file_offset and
+    /// rewind stream_offset to the corresponding QUIC stream position.
+    file_offset: u64 = 0,
+    /// Initial QUIC stream offset when file data starts (= HEADERS frame length).
+    /// Used to convert between QUIC stream offset and raw file position.
+    stream_offset_base: u64 = 0,
+    /// Absolute path for reopening the file after it has been closed in the
+    /// awaiting_fin_ack state (same pattern as Http09OutSlot).
+    file_path: [512]u8 = [_]u8{0} ** 512,
+    file_path_len: usize = 0,
 
     /// HTTP/3 trailers (RFC 9114 §4.1.2): a second HEADERS frame sent after
     /// all DATA frames, before the stream FIN.  When send_trailers = true the
@@ -857,6 +874,13 @@ pub const ConnState = struct {
     draining_deadline_ms: i64 = 0,
     // Wall-clock time of the last successfully decrypted packet (ms). Used for idle timeout.
     last_recv_ms: i64 = 0,
+    // PTO (Probe Timeout) state (RFC 9002 §6.2).
+    // last_ack_ms: wall-clock time of the most recent ACK frame we processed.
+    // pto_count:   exponential-backoff multiplier (doubles each consecutive probe).
+    // last_pto_ms: wall-clock time we last sent a PTO probe packet.
+    last_ack_ms: i64 = 0,
+    pto_count: u32 = 0,
+    last_pto_ms: i64 = 0,
     goaway_sent: bool = false,
 
     // ── Stateless Reset (RFC 9000 §10.3) ─────────────────────────────────────
@@ -1156,6 +1180,9 @@ pub const Server = struct {
                     idle_secs += 2;
                     dbg("io: server waiting ({}s idle, sock={})\n", .{ idle_secs, self.sock });
                 }
+                // PTO: probe before flushing so that if a probe is sent the
+                // subsequent flushPendingHttp09Responses call can resume sends.
+                self.checkPto();
                 self.flushPendingHttp09Responses();
                 self.http09RetransmitPendingFins();
                 self.flushPendingHttp3Responses();
@@ -2032,7 +2059,7 @@ pub const Server = struct {
                         srv_decrypted_pn = r.pn;
                         break :decrypt r.pt_len;
                     } else |_| {}
-                    if (incoming_phase != conn.peer_key_phase and !conn.key_update_pending) {
+                    if (incoming_phase != conn.peer_key_phase) {
                         var nk = if (conn.use_v2) conn.app_client_km.nextGenV2() else conn.app_client_km.nextGen();
                         if (unprotect1RttPacketWithPnTracking(
                             &plaintext,
@@ -2043,11 +2070,17 @@ pub const Server = struct {
                             conn.app_recv_pn,
                         )) |r| {
                             conn.app_client_km = nk;
-                            // Peer initiated a key update — also rotate our send keys so
-                            // the server's outgoing packets carry the new key phase bit
-                            // (RFC 9001 §6.1: both endpoints must send with the new phase).
-                            conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
-                            conn.key_phase_bit = !conn.key_phase_bit;
+                            if (!conn.key_update_pending) {
+                                // Peer (client) initiated a key update — also rotate our send
+                                // keys so the server's outgoing packets carry the new phase bit
+                                // (RFC 9001 §6.1: both endpoints must use the new phase).
+                                conn.app_server_km = if (conn.use_v2) conn.app_server_km.nextGenV2() else conn.app_server_km.nextGen();
+                                conn.key_phase_bit = !conn.key_phase_bit;
+                            }
+                            // Either path: server-initiated or peer-initiated, the client
+                            // receive key has been advanced to match the new phase.
+                            // Clear the pending flag — the update is now confirmed.
+                            conn.key_update_pending = false;
                             srv_decrypted_pn = r.pn;
                             break :decrypt r.pt_len;
                         } else |_| {}
@@ -2152,12 +2185,35 @@ pub const Server = struct {
             // are idempotent (seekTo + writeAll overwrites the same bytes).
             const REWIND_BYTES: u64 = 200 * 1200;
             for (&conn.http09_slots) |*slot| {
-                if (!slot.active) continue;
-                const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
-                if (rewind_to < slot.stream_offset) {
-                    slot.file.seekTo(rewind_to) catch {};
-                    slot.stream_offset = rewind_to;
-                    dbg("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
+                if (slot.active) {
+                    // Active slot: rewind to re-send data that went to the dead port.
+                    const rewind_to: u64 = if (slot.stream_offset > REWIND_BYTES) slot.stream_offset - REWIND_BYTES else 0;
+                    if (rewind_to < slot.stream_offset) {
+                        slot.file.seekTo(rewind_to) catch {};
+                        slot.stream_offset = rewind_to;
+                        dbg("io: path change: rewound stream_id={} to offset={}\n", .{ slot.stream_id, rewind_to });
+                    }
+                } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
+                    // The FIN was already sent (file closed) but data may not have
+                    // reached the client on the old path.  Reopen the file and
+                    // re-activate so flushPendingHttp09Responses re-sends everything.
+                    const fp = slot.file_path[0..slot.file_path_len];
+                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / 1200)
+                        (slot.fin_pkt_pn - REWIND_BYTES / 1200) * 1200
+                    else
+                        0;
+                    if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                        f.seekTo(rewind_to) catch {
+                            f.close();
+                            continue;
+                        };
+                        slot.file = f;
+                        slot.stream_offset = rewind_to;
+                        slot.active = true;
+                        slot.awaiting_fin_ack = false;
+                        conn.http09_active_count += 1;
+                        dbg("io: path change: reopened FIN slot stream_id={} rewind to {}\n", .{ slot.stream_id, rewind_to });
+                    } else |_| {}
                 }
             }
             // RFC 9002 §9.4: reset congestion controller and RTT estimator on
@@ -2221,7 +2277,7 @@ pub const Server = struct {
                 // Loss detection + RTT estimation (RFC 9002).
                 // Pass first_ack_range so the loss detector can correctly
                 // distinguish acked packets from those in gaps.
-                var lost_buf: [32]u64 = undefined;
+                var lost_buf: [32]recovery.SentPacket = undefined;
                 const ld_result = conn.ld.onAck(
                     largest_ack,
                     first_ack_range,
@@ -2241,11 +2297,88 @@ pub const Server = struct {
                 if (ld_result.lost_bytes > 0) {
                     conn.cc.bytes_in_flight -|= ld_result.lost_bytes;
                 }
-                // Signal loss events to CC for cwnd reduction.
+                // Signal loss events to CC and rewind any affected HTTP/0.9
+                // stream slots so lost data is retransmitted (RFC 9000 §3.3).
                 var li: usize = 0;
                 while (li < ld_result.lost_count) : (li += 1) {
-                    conn.cc.onLoss(lost_buf[li]);
+                    const lp = lost_buf[li];
+                    conn.cc.onLoss(lp.pn);
+                    // Retransmit: if the lost packet carried stream data, rewind
+                    // the corresponding slot so the data is re-sent.
+                    if (lp.has_stream_data) {
+                        // HTTP/0.9 slots: stream_offset == file offset directly.
+                        for (&conn.http09_slots) |*slot| {
+                            if (slot.stream_id != lp.stream_id) continue;
+                            if (slot.active) {
+                                // Normal case: slot is still sending; rewind offset.
+                                if (lp.stream_offset < slot.stream_offset) {
+                                    slot.stream_offset = lp.stream_offset;
+                                    slot.file.seekTo(lp.stream_offset) catch {};
+                                    dbg("io: retransmit h09 stream_id={} rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
+                                }
+                            } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
+                                // The FIN was already sent and the file closed, but a
+                                // pre-FIN packet was lost.  Reopen the file and re-
+                                // activate the slot so flushPendingHttp09Responses
+                                // will retransmit the missing data.
+                                const fp = slot.file_path[0..slot.file_path_len];
+                                if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                                    f.seekTo(lp.stream_offset) catch {
+                                        f.close();
+                                        break;
+                                    };
+                                    slot.file = f;
+                                    slot.stream_offset = lp.stream_offset;
+                                    slot.active = true;
+                                    slot.awaiting_fin_ack = false;
+                                    conn.http09_active_count += 1;
+                                    dbg("io: retransmit h09 stream_id={} reopened file, rewind to offset={}\n", .{ lp.stream_id, lp.stream_offset });
+                                } else |_| {}
+                            }
+                            break;
+                        }
+                        // HTTP/3 slots: stream_offset is the QUIC stream offset.
+                        // Derive file offset from QUIC stream offset and DATA frame
+                        // overhead: each 900-byte chunk is wrapped in a 3-byte DATA
+                        // frame header (type 0x00 + 2-byte varint length for len=900).
+                        for (&conn.http3_slots) |*slot| {
+                            if (slot.stream_id != lp.stream_id) continue;
+                            if (lp.stream_offset < slot.stream_offset) {
+                                const data_bytes = lp.stream_offset -| slot.stream_offset_base;
+                                // Each full 900-byte chunk contributes 903 QUIC bytes (3 H3 overhead).
+                                const full_chunks = data_bytes / 903;
+                                const partial_quic = data_bytes % 903;
+                                const file_pos = full_chunks * 900 + if (partial_quic > 3) partial_quic - 3 else 0;
+                                if (slot.active) {
+                                    slot.stream_offset = lp.stream_offset;
+                                    slot.file_offset = file_pos;
+                                    slot.file.seekTo(file_pos) catch {};
+                                    dbg("io: retransmit h3 stream_id={} rewind quic_off={} file_pos={}\n", .{ lp.stream_id, lp.stream_offset, file_pos });
+                                } else if (slot.awaiting_fin_ack and slot.file_path_len > 0) {
+                                    const fp = slot.file_path[0..slot.file_path_len];
+                                    if (std.fs.openFileAbsolute(fp, .{})) |f| {
+                                        f.seekTo(file_pos) catch {
+                                            f.close();
+                                            break;
+                                        };
+                                        slot.file = f;
+                                        slot.stream_offset = lp.stream_offset;
+                                        slot.file_offset = file_pos;
+                                        slot.active = true;
+                                        slot.awaiting_fin_ack = false;
+                                        conn.http3_active_count += 1;
+                                        dbg("io: retransmit h3 stream_id={} reopened, rewind to file_pos={}\n", .{ lp.stream_id, file_pos });
+                                    } else |_| {}
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
+                // ACK received — reset PTO backoff counter and record timestamp
+                // (RFC 9002 §6.2.1: PTO resets when an ACK is received).
+                conn.last_ack_ms = std.time.milliTimestamp();
+                conn.pto_count = 0;
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
             }
@@ -2522,6 +2655,14 @@ pub const Server = struct {
             return;
         }
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
+        // Patch stream metadata into the last recorded SentPacket so that the
+        // loss detector can surface it for retransmission if this packet is lost.
+        if (conn.ld.sent_count > 0) {
+            const last = &conn.ld.sent[conn.ld.sent_count - 1];
+            last.has_stream_data = true;
+            last.stream_id = slot.stream_id;
+            last.stream_offset = old_offset;
+        }
         if (fin) {
             // Save FIN frame for retransmission in case the packet is dropped
             // by the NS3 network simulator.  We keep the slot alive in the
@@ -2569,6 +2710,10 @@ pub const Server = struct {
                     for (&conn.http09_slots) |*slot| {
                         if (!slot.active) continue;
                         if (budget == 0) return;
+                        // Pre-check CC: if the window is exhausted, skip all
+                        // remaining slots for this connection — there is nothing
+                        // to send and we must not burn the budget on null sends.
+                        if (!conn.cc.canSend(congestion.mss)) break;
                         self.http09SendNextChunk(conn, slot);
                         progressed = true;
                         budget -= 1;
@@ -2576,6 +2721,47 @@ pub const Server = struct {
                 }
             }
             if (!progressed) break;
+        }
+    }
+
+    /// Probe Timeout (PTO) handler (RFC 9002 §6.2).
+    ///
+    /// When the sender has packets in flight but receives no acknowledgement for
+    /// longer than the PTO interval, it sends 1–2 PING probe packets.  The probe
+    /// is *not* gated by the congestion window — its purpose is to elicit an ACK
+    /// from the peer so that:
+    ///
+    ///   1. "Tail" packets that cannot be declared lost via k_packet_threshold
+    ///      (because no higher-numbered packet has been sent or acknowledged) get
+    ///      detected once the probe ACK carries a new largest_acknowledged.
+    ///   2. bytes_in_flight is corrected, unblocking subsequent data sends.
+    ///
+    /// The pto_count field provides exponential back-off (PTO doubles each probe).
+    fn checkPto(self: *Server) void {
+        const now_ms = std.time.milliTimestamp();
+        for (&self.conns) |*cslot| {
+            const conn = if (cslot.*) |*c| c else continue;
+            if (!conn.has_app_keys) continue;
+            if (conn.draining) continue;
+            // Only probe when there are packets in flight (otherwise there is
+            // nothing to recover and no need to elicit an ACK).
+            if (conn.cc.bytes_in_flight == 0) continue;
+            // Require at least one ACK to have been received so we have a
+            // meaningful RTT estimate; before that, last_ack_ms == 0.
+            if (conn.last_ack_ms == 0) continue;
+            const pto_delay: i64 = @intCast(conn.rtt.pto_ms(25, conn.pto_count));
+            const elapsed_since_ack: i64 = now_ms - conn.last_ack_ms;
+            const elapsed_since_last_probe: i64 = now_ms - conn.last_pto_ms;
+            if (elapsed_since_ack > pto_delay and elapsed_since_last_probe > pto_delay) {
+                // Send a PING probe bypassing the congestion window.
+                const ping_frame = [_]u8{0x01};
+                self.send1Rtt(conn, &ping_frame, conn.peer);
+                conn.last_pto_ms = now_ms;
+                conn.pto_count +|= 1;
+                dbg("io: PTO probe sent pn={} pto_count={} pto_delay={}ms bif={}\n", .{
+                    conn.app_pn - 1, conn.pto_count, pto_delay, conn.cc.bytes_in_flight,
+                });
+            }
         }
     }
 
@@ -2825,6 +3011,11 @@ pub const Server = struct {
                 .stream_offset = 0,
                 .file_end = file_end,
             };
+            // Store the file path so we can reopen it for retransmission if a
+            // pre-FIN packet is lost after the file has been closed.
+            const path_len = @min(fs_path.len, slot.file_path.len);
+            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
+            slot.file_path_len = path_len;
             conn.http09_active_count += 1;
             dbg("io: http09 stream_id={} opened (size={})\n", .{ sf.stream_id, file_end });
             return;
@@ -2958,7 +3149,13 @@ pub const Server = struct {
                 .file = file,
                 .stream_offset = headers_frame_len,
                 .file_end = file_end,
+                .file_offset = 0,
+                .stream_offset_base = headers_frame_len,
             };
+            // Store the file path for re-opening on retransmission.
+            const path_len = @min(fs_path.len, slot.file_path.len);
+            @memcpy(slot.file_path[0..path_len], fs_path[0..path_len]);
+            slot.file_path_len = path_len;
             conn.http3_active_count += 1;
             dbg("io: http3 slot registered stream_id={} size={} data_offset={}\n", .{ sf.stream_id, file_end, headers_frame_len });
             return;
@@ -3149,7 +3346,15 @@ pub const Server = struct {
                     .file = file,
                     .stream_offset = headers_frame_len,
                     .file_end = file_end,
+                    .file_offset = 0,
+                    .stream_offset_base = headers_frame_len,
                 };
+                // Store the file path for re-opening on retransmission.
+                const path_len = @min(fs_path.len, http3_slot.file_path.len);
+                @memcpy(http3_slot.file_path[0..path_len], fs_path[0..path_len]);
+                http3_slot.file_path_len = path_len;
+                conn.http3_active_count += 1;
+                dbg("io: http3 unblocked slot registered stream_id={} size={} data_offset={}\n", .{ stream_id, file_end, headers_frame_len });
                 break;
             } else {
                 file.close();
@@ -3414,8 +3619,24 @@ pub const Server = struct {
             slot.close();
             return;
         };
+        // Congestion control: only send if cwnd allows.  Rewind file position if blocked.
+        if (!conn.cc.canSend(congestion.mss)) {
+            slot.file.seekTo(slot.file_offset) catch {};
+            return;
+        }
+        const old_stream_offset = slot.stream_offset;
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
         slot.stream_offset += @intCast(data_frame_len);
+        slot.file_offset += @intCast(n);
+        // Patch stream metadata into the last SentPacket for retransmission on loss.
+        // Store the QUIC stream offset so the retransmit handler can rewind both
+        // stream_offset and file_offset (file_offset is derived from stream_offset_base).
+        if (conn.ld.sent_count > 0) {
+            const last = &conn.ld.sent[conn.ld.sent_count - 1];
+            last.has_stream_data = true;
+            last.stream_id = slot.stream_id;
+            last.stream_offset = old_stream_offset; // QUIC stream offset before this chunk
+        }
 
         if (slot.stream_offset % 10000 < CHUNK + 10) {
             dbg("io: http3 stream_id={} chunk offset={} n={} file_end={}\n", .{ slot.stream_id, slot.stream_offset, n, slot.file_end });
@@ -3433,6 +3654,8 @@ pub const Server = struct {
                     for (&conn.http3_slots) |*slot| {
                         if (!slot.active) continue;
                         if (budget == 0) return;
+                        // Pre-check CC: skip if cwnd is exhausted to avoid null sends.
+                        if (!conn.cc.canSend(congestion.mss)) break;
                         self.http3SendNextChunk(conn, slot);
                         progressed = true;
                         budget -= 1;
@@ -3504,6 +3727,10 @@ const StreamDownload = struct {
     /// Small buffer for incomplete HTTP/3 frame headers that span two STREAM frames.
     h3_leftover: [256]u8 = [_]u8{0} ** 256,
     h3_leftover_len: usize = 0,
+    /// HTTP/3 only: the QUIC stream offset we have consumed up to.
+    /// Used to detect and discard duplicate/retransmitted STREAM frames so that
+    /// the leftover-buffer state machine is not corrupted by re-delivered data.
+    h3_quic_offset: u64 = 0,
 };
 
 // ── QUIC Client ───────────────────────────────────────────────────────────────
@@ -4385,9 +4612,11 @@ pub const Client = struct {
         if (incoming_phase != self.conn.peer_key_phase) {
             // Server's key phase changed — rotate our receive keys to match.
             // This covers two cases:
-            //   1. Server-initiated key update (key_update_pending=false): rotate.
+            //   1. Server-initiated key update (key_update_pending=false): rotate
+            //      receive keys AND our own send keys so outgoing packets use the
+            //      new phase (RFC 9001 §6.1: "MUST respond with the same Key Phase").
             //   2. Server confirming our client-initiated key update
-            //      (key_update_pending=true): also rotate and clear the flag.
+            //      (key_update_pending=true): rotate receive keys and clear the flag.
             if (buf.len == 834) {
                 dbg("io: client 834-byte packet rotating to next key generation\n", .{});
             }
@@ -4396,8 +4625,16 @@ pub const Client = struct {
             else
                 self.conn.app_server_km.nextGen();
             if (self.conn.key_update_pending) {
-                // Server has confirmed our key update.
+                // Server has confirmed our client-initiated key update.
                 self.conn.key_update_pending = false;
+            } else {
+                // Server-initiated key update: rotate our own send keys so we
+                // respond with the new key phase (RFC 9001 §6.1).
+                self.conn.app_client_km = if (self.conn.use_v2)
+                    self.conn.app_client_km.nextGenV2()
+                else
+                    self.conn.app_client_km.nextGen();
+                self.conn.key_phase_bit = !self.conn.key_phase_bit;
             }
         }
         const decrypt_result = unprotect1RttPacketWithPnTracking(
@@ -4839,14 +5076,49 @@ pub const Client = struct {
     /// The server sends:  HEADERS frame (offset=0)  then  DATA frame(s).
     /// We skip the HEADERS frame and write DATA payloads straight to the file.
     fn handleH3StreamData(self: *Client, s: *StreamDownload, sf: *const stream_frame_mod.StreamFrame) void {
+        // Detect duplicate/retransmitted STREAM frames: skip any data the parser
+        // has already consumed (sf.offset < s.h3_quic_offset).  Without this guard
+        // a retransmitted frame would be fed into the leftover-buffer state machine
+        // a second time, corrupting the H3 frame parser.
+        if (sf.offset + sf.data.len <= s.h3_quic_offset) {
+            dbg("io: h3 stream_id={} duplicate STREAM frame offset={} (already at {}), skipping\n", .{ sf.stream_id, sf.offset, s.h3_quic_offset });
+            if (sf.fin) {
+                s.file.close();
+                s.active = false;
+                self.streams_done += 1;
+            }
+            return;
+        }
+        // Gap: sf.offset > h3_quic_offset — out-of-order delivery (e.g. a preceding
+        // QUIC packet was dropped by the NS3 queue).  We cannot correctly parse the
+        // H3 byte stream starting mid-frame.  Drop the frame here; the server's loss
+        // detector (k_packet_threshold / PTO) will retransmit the lost packet and
+        // then re-send all subsequent data from that rewind point, so these bytes
+        // will arrive again in the correct order.
+        if (sf.offset > s.h3_quic_offset) {
+            dbg("io: h3 stream_id={} out-of-order STREAM frame offset={} (at {}), dropping\n", .{ sf.stream_id, sf.offset, s.h3_quic_offset });
+            return;
+        }
+        // Partial overlap: trim away the already-consumed prefix before processing.
+        // This happens when a retransmit covers data we partly have.
+        var trimmed_data: []const u8 = sf.data;
+        if (sf.offset < s.h3_quic_offset) {
+            const skip = @as(usize, @intCast(s.h3_quic_offset - sf.offset));
+            if (skip < sf.data.len) {
+                trimmed_data = sf.data[skip..];
+            } else {
+                trimmed_data = &.{};
+            }
+        }
+
         // Combine any leftover bytes from the previous STREAM frame with the new data.
         var combined: [256 + MAX_DATAGRAM_SIZE]u8 = undefined;
-        var data: []const u8 = sf.data;
+        var data: []const u8 = trimmed_data;
         if (s.h3_leftover_len > 0) {
-            const total = s.h3_leftover_len + sf.data.len;
+            const total = s.h3_leftover_len + trimmed_data.len;
             if (total <= combined.len) {
                 @memcpy(combined[0..s.h3_leftover_len], s.h3_leftover[0..s.h3_leftover_len]);
-                @memcpy(combined[s.h3_leftover_len..total], sf.data);
+                @memcpy(combined[s.h3_leftover_len..total], trimmed_data);
                 data = combined[0..total];
             }
             s.h3_leftover_len = 0;
@@ -4875,12 +5147,20 @@ pub const Client = struct {
                         self.sendQpackDecoderInstruction(s.stream_id);
                     }
                     dbg("io: h3 stream_id={} HEADERS frame parsed\n", .{s.stream_id});
+                    s.h3_quic_offset += @intCast(pr.consumed);
                 },
                 .data => |d| {
                     _ = s.file.write(d) catch {};
                     dbg("io: h3 stream_id={} DATA {} bytes written\n", .{ s.stream_id, d.len });
+                    // Track consumed QUIC stream bytes so duplicate frames are rejected.
+                    s.h3_quic_offset += @intCast(pr.consumed);
                 },
-                else => {},
+                else => {
+                    // Unknown/extension frame: skip its bytes in the stream so
+                    // h3_quic_offset stays in sync with pos and duplicate detection
+                    // continues to work correctly for subsequent frames.
+                    s.h3_quic_offset += @intCast(pr.consumed);
+                },
             }
         }
 
