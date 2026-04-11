@@ -33,6 +33,8 @@ const h3_qpack = @import("../http3/qpack.zig");
 const qlog_writer = @import("../qlog/writer.zig");
 const transport_frames = @import("../frames/transport.zig");
 const version_neg_mod = @import("../packet/version_negotiation.zig");
+const congestion = @import("../loss/congestion.zig");
+const recovery = @import("../loss/recovery.zig");
 
 const ConnectionId = types.ConnectionId;
 const KeyMaterial = keys_mod.KeyMaterial;
@@ -876,6 +878,14 @@ pub const ConnState = struct {
     ecn_ect0_recv: u64 = 0,
     ecn_ect1_recv: u64 = 0,
     ecn_ce_recv: u64 = 0,
+
+    // ── Congestion control + loss detection (RFC 9002) ────────────────────────
+    // New Reno CC: cwnd, ssthresh, bytes_in_flight.
+    cc: congestion.NewReno = congestion.NewReno.init(),
+    // RTT estimator: smoothed RTT, RTT variance, min RTT.
+    rtt: recovery.RttEstimator = .{},
+    // Loss detector: tracks in-flight packets by PN, detects loss via packet threshold.
+    ld: recovery.LossDetector = .{},
 
     // Pre-derived QUIC v2 initial secrets for compatible version negotiation.
     // Set on the client when config.v2 = true so we can decrypt a v2 Initial
@@ -2142,6 +2152,24 @@ pub const Server = struct {
                             slot.awaiting_fin_ack = false;
                         }
                     }
+                    // Loss detection + RTT estimation (RFC 9002).
+                    var lost_buf: [32]u64 = undefined;
+                    const ld_result = conn.ld.onAck(
+                        largest_ack,
+                        0,
+                        @intCast(std.time.milliTimestamp()),
+                        &conn.rtt,
+                        &lost_buf,
+                    );
+                    // Congestion control: ack delivered bytes.
+                    if (ld_result.rtt_updated) {
+                        conn.cc.onAck(congestion.mss);
+                    }
+                    // Signal losses to CC.
+                    var li: usize = 0;
+                    while (li < ld_result.lost_count) : (li += 1) {
+                        conn.cc.onLoss(lost_buf[li]);
+                    }
                 }
                 pos += skipAckBody(frames[pos..], ft == 0x03);
                 continue;
@@ -2186,6 +2214,33 @@ pub const Server = struct {
                 const r = transport_frames.MaxStreamData.parse(frames[pos..]) catch return;
                 pos += r.consumed;
                 self.sendMaxStreamData(conn, r.frame.stream_id, src);
+                continue;
+            }
+            if (ft == 0x04) {
+                // RESET_STREAM — peer cancelled a stream (RFC 9000 §19.4).
+                const r = transport_frames.ResetStream.parse(frames[pos..]) catch return;
+                pos += r.consumed;
+                std.debug.print("io: RESET_STREAM stream_id={} code={} final_size={}\n", .{
+                    r.frame.stream_id, r.frame.application_protocol_error_code, r.frame.final_size,
+                });
+                // Cancel any pending response for this stream.
+                for (&conn.http09_slots) |*slot| {
+                    if (slot.active and slot.stream_id == r.frame.stream_id) slot.close();
+                }
+                for (&conn.http3_slots) |*slot| {
+                    if (slot.active and slot.stream_id == r.frame.stream_id) slot.active = false;
+                }
+                continue;
+            }
+            if (ft == 0x05) {
+                // STOP_SENDING — peer asked us to stop sending on a stream (RFC 9000 §19.5).
+                const r = transport_frames.StopSending.parse(frames[pos..]) catch return;
+                pos += r.consumed;
+                std.debug.print("io: STOP_SENDING stream_id={} code={}\n", .{
+                    r.frame.stream_id, r.frame.application_protocol_error_code,
+                });
+                // Respond by resetting the stream.
+                self.sendResetStream(conn, r.frame.stream_id, r.frame.application_protocol_error_code, src);
                 continue;
             }
             if (ft == 0x1c or ft == 0x1d) {
@@ -2243,6 +2298,19 @@ pub const Server = struct {
         }
     }
 
+    /// Send a RESET_STREAM frame to cancel a stream (RFC 9000 §19.4).
+    fn sendResetStream(self: *Server, conn: *ConnState, stream_id: u64, error_code: u64, dst: std.net.Address) void {
+        const frame = transport_frames.ResetStream{
+            .stream_id = stream_id,
+            .application_protocol_error_code = error_code,
+            .final_size = 0,
+        };
+        var frame_buf: [32]u8 = undefined;
+        // serialize() writes the type byte (0x04) + fields.
+        const frame_len = frame.serialize(&frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..frame_len], dst);
+    }
+
     /// Encrypt and send a 1-RTT packet, selecting AES or ChaCha20 per conn.
     fn send1Rtt(self: *Server, conn: *ConnState, payload: []const u8, dst: std.net.Address) void {
         var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -2287,6 +2355,16 @@ pub const Server = struct {
             std.debug.print("io: sendto error pkt_len={}: {}\n", .{ pkt_len, err });
             return;
         };
+        // Congestion control: update bytes in flight.
+        conn.cc.onPacketSent(@intCast(pkt_len));
+        // Loss detection: record this packet.
+        conn.ld.onPacketSent(.{
+            .pn = conn.app_pn - 1,
+            .send_time_ms = @intCast(std.time.milliTimestamp()),
+            .size = pkt_len,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
         if (has_fin) {
             std.debug.print("io: server FIN PACKET sent {} bytes\n", .{send_result});
         }
@@ -2328,6 +2406,13 @@ pub const Server = struct {
             return;
         };
         std.debug.print("io: http09 stream_id={} chunk: bytes={} offset={} fin={} frame_len={}\n", .{ slot.stream_id, n, old_offset, fin, frame_len });
+        // Congestion control: only send if cwnd allows.
+        if (!conn.cc.canSend(congestion.mss)) {
+            // Rewind offset — we didn't actually send this chunk.
+            slot.stream_offset -= @intCast(n);
+            slot.file.seekTo(slot.stream_offset) catch {};
+            return;
+        }
         self.send1Rtt(conn, frame_buf[0..frame_len], conn.peer);
         if (fin) {
             // Save FIN frame for retransmission in case the packet is dropped
@@ -4264,6 +4349,24 @@ pub const Client = struct {
                     const v2 = varint.decode(plaintext[pos..pt_len]) catch return;
                     pos += v2.len;
                 }
+                continue;
+            }
+            if (ft == 0x04) {
+                // RESET_STREAM — server cancelled a stream.
+                const r = transport_frames.ResetStream.parse(plaintext[pos..pt_len]) catch return;
+                pos += r.consumed;
+                std.debug.print("io: client RESET_STREAM stream_id={} code={}\n", .{
+                    r.frame.stream_id, r.frame.application_protocol_error_code,
+                });
+                continue;
+            }
+            if (ft == 0x05) {
+                // STOP_SENDING — server asked us to stop sending on a stream.
+                const r = transport_frames.StopSending.parse(plaintext[pos..pt_len]) catch return;
+                pos += r.consumed;
+                std.debug.print("io: client STOP_SENDING stream_id={} code={}\n", .{
+                    r.frame.stream_id, r.frame.application_protocol_error_code,
+                });
                 continue;
             }
             if (ft == 0x1c or ft == 0x1d) {
