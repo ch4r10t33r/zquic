@@ -1,0 +1,42 @@
+# ngtcp2 benchmark image
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git pkg-config autoconf automake libtool \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build OpenSSL with QUIC support (quictls fork)
+RUN git clone --depth 1 https://github.com/quictls/openssl.git /tmp/openssl \
+    && cd /tmp/openssl \
+    && ./config --prefix=/usr/local/ssl --openssldir=/usr/local/ssl \
+    && make -j$(nproc) \
+    && make install_sw
+
+# Build nghttp3
+RUN git clone --depth 1 https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3 \
+    && cd /tmp/nghttp3 \
+    && autoreconf -fi \
+    && ./configure --prefix=/usr/local --enable-lib-only \
+        PKG_CONFIG_PATH=/usr/local/ssl/lib64/pkgconfig \
+    && make -j$(nproc) && make install
+
+# Build ngtcp2
+RUN git clone --depth 1 https://github.com/ngtcp2/ngtcp2.git /tmp/ngtcp2 \
+    && cd /tmp/ngtcp2 \
+    && autoreconf -fi \
+    && ./configure --prefix=/usr/local \
+        PKG_CONFIG_PATH=/usr/local/ssl/lib64/pkgconfig:/usr/local/lib/pkgconfig \
+        --with-openssl \
+    && make -j$(nproc) && make install
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/server /usr/local/bin/ngtcp2-server
+COPY --from=builder /usr/local/bin/client /usr/local/bin/ngtcp2-client
+COPY --from=builder /usr/local/ssl/lib64/*.so* /usr/local/lib/
+COPY --from=builder /usr/local/lib/*.so* /usr/local/lib/
+RUN ldconfig

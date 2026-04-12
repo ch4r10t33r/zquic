@@ -1,0 +1,22 @@
+# msquic (Microsoft) benchmark image
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ca-certificates \
+        liblttng-ust-dev lttng-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --recursive https://github.com/microsoft/msquic.git /build
+WORKDIR /build
+RUN mkdir build && cd build \
+    && cmake -DCMAKE_BUILD_TYPE=Release -DQUIC_BUILD_PERF=ON .. \
+    && cmake --build . --config Release --parallel $(nproc)
+
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/build/bin/Release/quicperf /usr/local/bin/
+COPY --from=builder /build/build/bin/Release/*.so* /usr/local/lib/
+RUN ldconfig
