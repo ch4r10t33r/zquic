@@ -95,12 +95,13 @@ pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
 
 /// Maximum file-data bytes in a single HTTP/0.9 STREAM frame.
-/// 1450 data + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag = ~1487, fits in 1500.
-const H09_CHUNK: usize = 1450;
+/// The UDP payload must fit within 1472 bytes (1500 MTU − 20 IP − 8 UDP).
+/// 1350 data + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag ≈ 1387, well within 1472.
+const H09_CHUNK: usize = 1350;
 
 /// Maximum file-data bytes in a single HTTP/3 DATA frame.
-/// 1400 data + 3 H3 overhead + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag = ~1440, fits in 1500.
-const H3_CHUNK: usize = 1400;
+/// 1350 data + 3 H3 overhead + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag ≈ 1390, within 1472.
+const H3_CHUNK: usize = 1350;
 
 /// H3 DATA frame overhead: 1 byte type (0x00) + 2 byte varint length.
 const H3_DATA_OVERHEAD: usize = 3;
