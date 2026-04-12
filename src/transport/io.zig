@@ -695,6 +695,21 @@ const Http3OutSlot = struct {
     }
 };
 
+/// Receive buffer for one QUIC stream when `ServerConfig.raw_application_streams` /
+/// `ClientConfig.raw_application_streams` is enabled (opaque bytes, no HTTP parsing).
+pub const RawAppStreamSlot = struct {
+    active: bool = false,
+    stream_id: u64 = 0,
+    /// Next contiguous byte offset expected; bytes [0..next_offset) are in `buf`.
+    next_offset: u64 = 0,
+    buf: std.ArrayListUnmanaged(u8) = .{},
+
+    pub fn deinit(self: *RawAppStreamSlot, allocator: std.mem.Allocator) void {
+        self.buf.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 /// Maximum number of HTTP/3 request streams that can be blocked waiting for
 /// QPACK dynamic table insertions (RFC 9204 §2.1.2).  We advertise this value
 /// in SETTINGS_QPACK_BLOCKED_STREAMS.  Must be ≥ 1 to be non-trivial; 16 is
@@ -836,6 +851,9 @@ pub const ConnState = struct {
     http09_active_count: u32 = 0,
     /// Number of currently active HTTP/3 response slots.
     http3_active_count: u32 = 0,
+
+    /// Opaque application STREAM receive buffers (server: peer → us).
+    raw_app_streams: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
 
     /// 1-RTT frames received while waiting for client Finished (reordering).
     pending_1rtt: [pending_1rtt_cap]Pending1RttPayload = [_]Pending1RttPayload{.{}} ** pending_1rtt_cap,
@@ -1043,7 +1061,21 @@ pub const ServerConfig = struct {
     /// Directory to write qlog files into.  When non-null, one `<cid>.sqlog`
     /// file is created per connection.  Set via --qlog-dir on the command line.
     qlog_dir: ?[]const u8 = null,
+    /// When non-null, use this exact ALPN identifier in the TLS handshake instead
+    /// of choosing from `http3` / `http09`.
+    alpn: ?[]const u8 = null,
+    /// Deliver incoming STREAM frames to `RawAppStreamSlot` buffers instead of
+    /// parsing HTTP/0.9 or HTTP/3. Typically combined with `alpn`.
+    raw_application_streams: bool = false,
 };
+
+/// TLS ALPN value for `ServerConfig` (custom string wins over HTTP flags).
+pub fn serverTlsAlpn(cfg: *const ServerConfig) ?[]const u8 {
+    if (cfg.alpn) |a| return a;
+    if (cfg.http3) return tls_hs.ALPN_H3;
+    if (cfg.http09) return tls_hs.ALPN_H09;
+    return null;
+}
 
 // ── QUIC Server ───────────────────────────────────────────────────────────────
 
@@ -1145,6 +1177,7 @@ pub const Server = struct {
         // Close any open qlog files before freeing memory.
         for (&self.conns) |*slot| {
             if (slot.*) |*conn| {
+                freeConnStateRawAppBuffers(conn, self.allocator);
                 conn.qlog.connectionClosed("server_shutdown");
                 conn.qlog.close();
             }
@@ -1164,6 +1197,7 @@ pub const Server = struct {
                 // Draining period expired.
                 if (conn.draining and conn.draining_deadline_ms > 0 and now >= conn.draining_deadline_ms) {
                     dbg("io: reaping drained connection (deadline passed)\n", .{});
+                    freeConnStateRawAppBuffers(conn, self.allocator);
                     slot.* = null;
                     continue;
                 }
@@ -1172,6 +1206,7 @@ pub const Server = struct {
                     now - conn.last_recv_ms > idle_timeout_ms)
                 {
                     dbg("io: idle timeout — closing connection\n", .{});
+                    freeConnStateRawAppBuffers(conn, self.allocator);
                     slot.* = null;
                 }
             }
@@ -1813,7 +1848,7 @@ pub const Server = struct {
         }
         const quic_tp = tp_buf[0..tp_len];
 
-        const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
+        const alpn = serverTlsAlpn(&self.config);
         const flight_len = conn.tls.buildServerFlight(
             self.cert_der,
             &self.private_key,
@@ -3259,11 +3294,62 @@ pub const Server = struct {
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+        if (self.config.raw_application_streams) {
+            self.handleRawApplicationStreamServer(conn, sf, src);
+            return;
+        }
         if (self.config.http3) {
             self.handleHttp3Stream(conn, sf, src);
         } else {
             self.handleHttp09Stream(conn, sf, src);
         }
+    }
+
+    fn handleRawApplicationStreamServer(
+        self: *Server,
+        conn: *ConnState,
+        sf: *const stream_frame_mod.StreamFrame,
+        src: std.net.Address,
+    ) void {
+        _ = src;
+        var slot_ptr: ?*RawAppStreamSlot = null;
+        for (&conn.raw_app_streams) |*slot| {
+            if (slot.active and slot.stream_id == sf.stream_id) {
+                slot_ptr = slot;
+                break;
+            }
+        }
+        if (slot_ptr == null) {
+            for (&conn.raw_app_streams) |*slot| {
+                if (!slot.active) {
+                    slot.* = .{
+                        .active = true,
+                        .stream_id = sf.stream_id,
+                        .next_offset = 0,
+                        .buf = .{},
+                    };
+                    slot_ptr = slot;
+                    break;
+                }
+            }
+        }
+        const slot = slot_ptr orelse {
+            dbg("io: raw app server recv slots full (stream_id={})\n", .{sf.stream_id});
+            return;
+        };
+
+        const o = sf.offset;
+        const d = sf.data;
+        const frame_end = o + @as(u64, @intCast(d.len));
+        if (frame_end <= slot.next_offset) return;
+        if (o > slot.next_offset) {
+            dbg("io: raw app server gap stream_id={} off={} need={}\n", .{ sf.stream_id, o, slot.next_offset });
+            return;
+        }
+        const start = @as(usize, @intCast(slot.next_offset - o));
+        const to_copy = d[start..];
+        slot.buf.appendSlice(self.allocator, to_copy) catch return;
+        slot.next_offset = frame_end;
     }
 
     fn handleHttp09Stream(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
@@ -4023,7 +4109,25 @@ pub const ClientConfig = struct {
     /// Directory to write qlog files into.  When non-null, one `<cid>.sqlog`
     /// file is created for the connection.  Set via --qlog-dir on the command line.
     qlog_dir: ?[]const u8 = null,
+    /// Custom TLS ALPN (same semantics as `ServerConfig.alpn`).
+    alpn: ?[]const u8 = null,
+    /// Buffer server→client STREAM data as opaque bytes (no HTTP parsing).
+    raw_application_streams: bool = false,
 };
+
+/// TLS ALPN value for `ClientConfig`.
+pub fn clientTlsAlpn(cfg: *const ClientConfig) ?[]const u8 {
+    if (cfg.alpn) |a| return a;
+    if (cfg.http3) return tls_hs.ALPN_H3;
+    if (cfg.http09) return tls_hs.ALPN_H09;
+    return null;
+}
+
+fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) void {
+    for (&conn.raw_app_streams) |*slot| {
+        slot.deinit(allocator);
+    }
+}
 
 // ── Stream download tracker ───────────────────────────────────────────────────
 
@@ -4068,6 +4172,9 @@ pub const Client = struct {
     early_km: ?KeyMaterial = null,
     /// Packet number space for 0-RTT packets (separate from 1-RTT PN space).
     zerortt_pn: u64 = 0,
+
+    /// Opaque STREAM receive buffers when `raw_application_streams` is set.
+    raw_app_recv: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
 
     /// Deferred ACK: instead of sending one ACK per received server packet,
     /// we accumulate the highest received PN here and flush a single cumulative
@@ -4152,6 +4259,10 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        for (&self.raw_app_recv) |*slot| {
+            slot.deinit(self.allocator);
+        }
+        freeConnStateRawAppBuffers(&self.conn, self.allocator);
         self.conn.qlog.connectionClosed("client_shutdown");
         self.conn.qlog.close();
         std.posix.close(self.sock);
@@ -4230,6 +4341,11 @@ pub const Client = struct {
         var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
         const dcid = ConnectionId.random(prng.random(), 8);
         const scid = ConnectionId.random(prng.random(), 8);
+
+        for (&self.raw_app_recv) |*slot| {
+            slot.deinit(self.allocator);
+        }
+        freeConnStateRawAppBuffers(&self.conn, self.allocator);
 
         // Reset connection state (new CIDs, new Initial secrets).
         self.conn = ConnState{
@@ -4433,7 +4549,7 @@ pub const Client = struct {
             break :blk self.client_hello_len;
         } else blk: {
             // First send: build the ClientHello and save it for any future rebuild.
-            const alpn: ?[]const u8 = if (self.config.http3) tls_hs.ALPN_H3 else if (self.config.http09) tls_hs.ALPN_H09 else null;
+            const alpn = clientTlsAlpn(&self.config);
             var quic_tp_buf: [128]u8 = undefined;
             const quic_tp = buildClientTransportParams(&quic_tp_buf);
 
@@ -5346,8 +5462,54 @@ pub const Client = struct {
         _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
     }
 
+    fn handleRawApplicationStreamClient(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
+        var slot_ptr: ?*RawAppStreamSlot = null;
+        for (&self.raw_app_recv) |*slot| {
+            if (slot.active and slot.stream_id == sf.stream_id) {
+                slot_ptr = slot;
+                break;
+            }
+        }
+        if (slot_ptr == null) {
+            for (&self.raw_app_recv) |*slot| {
+                if (!slot.active) {
+                    slot.* = .{
+                        .active = true,
+                        .stream_id = sf.stream_id,
+                        .next_offset = 0,
+                        .buf = .{},
+                    };
+                    slot_ptr = slot;
+                    break;
+                }
+            }
+        }
+        const slot = slot_ptr orelse {
+            dbg("io: raw app client recv slots full (stream_id={})\n", .{sf.stream_id});
+            return;
+        };
+
+        const o = sf.offset;
+        const d = sf.data;
+        const frame_end = o + @as(u64, @intCast(d.len));
+        if (frame_end <= slot.next_offset) return;
+        if (o > slot.next_offset) {
+            dbg("io: raw app client gap stream_id={} off={} need={}\n", .{ sf.stream_id, o, slot.next_offset });
+            return;
+        }
+        const start = @as(usize, @intCast(slot.next_offset - o));
+        const to_copy = d[start..];
+        slot.buf.appendSlice(self.allocator, to_copy) catch return;
+        slot.next_offset = frame_end;
+    }
+
     fn handleStreamResponse(self: *Client, sf: *const stream_frame_mod.StreamFrame) void {
         dbg("io: client handleStreamResponse stream_id={} data_len={} fin={}\n", .{ sf.stream_id, sf.data.len, sf.fin });
+
+        if (self.config.raw_application_streams) {
+            self.handleRawApplicationStreamClient(sf);
+            return;
+        }
 
         // Server-initiated unidirectional streams (stream_id % 4 == 3):
         //   id=3  → server control stream (SETTINGS, GOAWAY, …)
