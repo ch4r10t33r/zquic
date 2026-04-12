@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.2.1] - 2026-04-12
+
+### Added
+
+- **`Client.startHandshake`**: send the Initial (ClientHello) when using an external UDP
+  recv loop (`feedPacket` / `processPendingWork`) instead of `Client.run()`.
+
+---
+
 ## [v1.2.0] - 2026-04-12
 
 ### Added

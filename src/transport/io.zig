@@ -4515,6 +4515,13 @@ pub const Client = struct {
         return null;
     }
 
+    /// Send the Initial (ClientHello) and begin the handshake. Use with an external UDP
+    /// recv loop: `feedPacket`, `processPendingWork`, and polling the peer endpoint.
+    pub fn startHandshake(self: *Client, server_addr: std.net.Address) !void {
+        self.conn.peer = server_addr;
+        try self.sendClientHello(server_addr);
+    }
+
     /// Connect to the server and download all configured URLs.
     ///
     /// When `config.resumption` is true the client makes two separate QUIC
