@@ -94,6 +94,21 @@ fn setupEcnSocket(sock: std.posix.fd_t) void {
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
 
+/// Maximum file-data bytes in a single HTTP/0.9 STREAM frame.
+/// The UDP payload must fit within 1472 bytes (1500 MTU − 20 IP − 8 UDP).
+/// 1350 data + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag ≈ 1387, well within 1472.
+const H09_CHUNK: usize = 1350;
+
+/// Maximum file-data bytes in a single HTTP/3 DATA frame.
+/// 1350 data + 3 H3 overhead + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag ≈ 1390, within 1472.
+const H3_CHUNK: usize = 1350;
+
+/// H3 DATA frame overhead: 1 byte type (0x00) + 2 byte varint length.
+const H3_DATA_OVERHEAD: usize = 3;
+
+/// Total QUIC stream bytes per H3 DATA frame (payload + framing overhead).
+const H3_CHUNK_WIRE: usize = H3_CHUNK + H3_DATA_OVERHEAD;
+
 /// MSG_DONTWAIT flag for non-blocking recvfrom().
 /// std.posix.MSG is void on some platforms (macOS/Zig 0.14), so use raw values.
 const MSG_DONTWAIT: u32 = if (@hasDecl(std.posix, "MSG") and @typeInfo(@TypeOf(std.posix.MSG)) == .@"struct")
@@ -486,7 +501,7 @@ fn unprotect1RttPacketWithPnTracking(
     if (chacha20) {
         try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
     } else {
-        try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+        try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
     }
     return .{ .pt_len = plaintext_len, .pn = pn };
 }
@@ -520,8 +535,7 @@ fn computeHpMask(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chach
         std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
         @memcpy(&mask, full_mask[0..16]);
     } else {
-        const aes_ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
-        aes_ctx.encrypt(&mask, &sample);
+        mask = km.hp_ctx.hpMask(sample);
     }
     return mask;
 }
@@ -981,7 +995,9 @@ pub const ConnState = struct {
         const hs_server_qkm = tls_hs.deriveQuicKeys(secrets.server_handshake);
 
         self.hs_client_km = .{ .key = hs_client_qkm.key, .key32 = hs_client_qkm.key32, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .hp32 = hs_client_qkm.hp32, .secret = secrets.client_handshake };
+        self.hs_client_km.initCachedContexts();
         self.hs_server_km = .{ .key = hs_server_qkm.key, .key32 = hs_server_qkm.key32, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .hp32 = hs_server_qkm.hp32, .secret = secrets.server_handshake };
+        self.hs_server_km.initCachedContexts();
 
         self.has_hs_keys = true;
     }
@@ -993,7 +1009,9 @@ pub const ConnState = struct {
         const app_server_qkm = tls_hs.deriveQuicKeys(secrets.server_app);
 
         self.app_client_km = .{ .key = app_client_qkm.key, .key32 = app_client_qkm.key32, .iv = app_client_qkm.iv, .hp = app_client_qkm.hp, .hp32 = app_client_qkm.hp32, .secret = secrets.client_app };
+        self.app_client_km.initCachedContexts();
         self.app_server_km = .{ .key = app_server_qkm.key, .key32 = app_server_qkm.key32, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .hp32 = app_server_qkm.hp32, .secret = secrets.server_app };
+        self.app_server_km.initCachedContexts();
 
         self.has_app_keys = true;
         self.qlog.keyUpdated("1rtt", "tls");
@@ -1753,6 +1771,7 @@ pub const Server = struct {
                     .hp = early_keys.hp,
                     .hp32 = .{0} ** 32,
                 };
+                conn.early_km.initCachedContexts();
                 conn.has_early_keys = true;
                 dbg("io: server derived 0-RTT early keys\n", .{});
             }
@@ -2398,12 +2417,11 @@ pub const Server = struct {
             // Rewind active HTTP/0.9 streams to retransmit data that may have
             // been sent to the old (dead) port before we learned of the rebind.
             // Dead-port window: PING interval (200ms) + network RTT/2 (15ms) +
-            // server poll latency (50ms) ≈ 265ms.  At 480 KB/s that is
-            // ~127 200 bytes sent to the dead port.  We use 200 × 1200 = 240 000
-            // bytes (≈500ms buffer) so the rewind always starts before the gap.
+            // server poll latency (50ms) ≈ 265ms.  We rewind 200 packets' worth
+            // of data so the retransmission always starts before the gap.
             // The client writes at explicit sf.offset so duplicate retransmits
             // are idempotent (seekTo + writeAll overwrites the same bytes).
-            const REWIND_BYTES: u64 = 200 * 1200;
+            const REWIND_BYTES: u64 = 200 * H09_CHUNK;
             for (&conn.http09_slots) |*slot| {
                 if (slot.active) {
                     // Active slot: rewind to re-send data that went to the dead port.
@@ -2421,8 +2439,8 @@ pub const Server = struct {
                     // reached the client on the old path.  Reopen the file and
                     // re-activate so flushPendingHttp09Responses re-sends everything.
                     const fp = slot.file_path[0..slot.file_path_len];
-                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / 1200)
-                        (slot.fin_pkt_pn - REWIND_BYTES / 1200) * 1200
+                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / H09_CHUNK)
+                        (slot.fin_pkt_pn - REWIND_BYTES / H09_CHUNK) * H09_CHUNK
                     else
                         0;
                     if (std.fs.openFileAbsolute(fp, .{})) |f| {
@@ -2568,16 +2586,16 @@ pub const Server = struct {
                         }
                         // HTTP/3 slots: stream_offset is the QUIC stream offset.
                         // Derive file offset from QUIC stream offset and DATA frame
-                        // overhead: each 900-byte chunk is wrapped in a 3-byte DATA
-                        // frame header (type 0x00 + 2-byte varint length for len=900).
+                        // overhead: each H3_CHUNK-byte chunk is wrapped in a 3-byte
+                        // DATA frame header (type 0x00 + 2-byte varint length).
                         for (&conn.http3_slots) |*slot| {
                             if (slot.stream_id != lp.stream_id) continue;
                             if (lp.stream_offset < slot.stream_offset) {
                                 const data_bytes = lp.stream_offset -| slot.stream_offset_base;
-                                // Each full 900-byte chunk contributes 903 QUIC bytes (3 H3 overhead).
-                                const full_chunks = data_bytes / 903;
-                                const partial_quic = data_bytes % 903;
-                                const file_pos = full_chunks * 900 + if (partial_quic > 3) partial_quic - 3 else 0;
+                                // Each full chunk contributes H3_CHUNK_WIRE QUIC stream bytes.
+                                const full_chunks = data_bytes / H3_CHUNK_WIRE;
+                                const partial_quic = data_bytes % H3_CHUNK_WIRE;
+                                const file_pos = full_chunks * H3_CHUNK + if (partial_quic > H3_DATA_OVERHEAD) partial_quic - H3_DATA_OVERHEAD else 0;
                                 if (slot.active) {
                                     slot.stream_offset = lp.stream_offset;
                                     slot.file_offset = file_pos;
@@ -2887,7 +2905,7 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
-        var file_buf: [1200]u8 = undefined;
+        var file_buf: [H09_CHUNK]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
             dbg("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
@@ -2968,16 +2986,14 @@ pub const Server = struct {
     ///
     /// The congestion controller (NewReno) is the sole rate limiter: each call to
     /// http09SendNextChunk checks cc.canSend() and returns early if the cwnd is
-    /// exhausted.  A per-flush budget of 20 packets (24 KB) caps the burst size so
-    /// the NS3 simulator's 25-packet DropTail queue is never exceeded.
+    /// Drain queued HTTP/0.9 bodies bounded by congestion control.
     ///
-    /// The previous 50 ms time gate has been removed.  It was a workaround for a
-    /// CC accounting bug (bytes_acked was under-credited) that caused bytes_in_flight
-    /// to drift upward, blocking sends.  With accurate CC accounting the time gate is
-    /// not needed and only throttles throughput on real networks / loopback to
-    /// ~480 KB/s — far below what is achievable.
+    /// The congestion controller is the primary rate limiter.  The per-flush
+    /// budget caps the burst per event-loop iteration to stay within the
+    /// NS3 simulator's 25-packet DropTail queue.  On real networks and
+    /// loopback the CC window is the effective bottleneck, not this budget.
     fn flushPendingHttp09Responses(self: *Server) void {
-        var budget: usize = 20; // 20 × 1200 bytes = 24 KB per flush — below the 25-pkt NS3 queue
+        var budget: usize = 20;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -3820,10 +3836,10 @@ pub const Server = struct {
 
     /// Send the next HTTP/3 DATA-frame chunk for one queued response slot.
     fn http3SendNextChunk(self: *Server, conn: *ConnState, slot: *Http3OutSlot) void {
-        // Wrap up to 900 bytes of file content in an HTTP/3 DATA frame.
-        // DATA frame overhead is 2 bytes (type=0x00 + 1-byte varint length),
-        // so the total STREAM payload is at most 902 bytes — well within one UDP packet.
-        const CHUNK: usize = 900;
+        // Wrap up to H3_CHUNK bytes of file content in an HTTP/3 DATA frame.
+        // DATA frame overhead is 2-3 bytes (type=0x00 + varint length),
+        // so the total STREAM payload fits well within one 1500-byte UDP datagram.
+        const CHUNK = H3_CHUNK;
         var file_buf: [CHUNK]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
             dbg("io: http3 stream_id={} read error: {}\n", .{ slot.stream_id, err });
@@ -3889,7 +3905,7 @@ pub const Server = struct {
         }
 
         // Wrap the chunk in an HTTP/3 DATA frame.
-        var data_out: [CHUNK + 10]u8 = undefined;
+        var data_out: [CHUNK + 16]u8 = undefined;
         const data_frame_len = h3_frame.writeFrame(&data_out, @intFromEnum(h3_frame.FrameType.data), file_buf[0..n]) catch {
             if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.close();
@@ -3939,7 +3955,6 @@ pub const Server = struct {
     }
 
     /// Drain queued HTTP/3 DATA frames bounded by congestion control.
-    /// The 50ms time gate has been removed; CC alone gates the send rate.
     fn flushPendingHttp3Responses(self: *Server) void {
         var budget: usize = 20;
         while (budget > 0) {
@@ -4447,7 +4462,7 @@ pub const Client = struct {
                     var cets: [32]u8 = undefined;
                     keys_mod.hkdfExpandLabel(&cets, &result.early_secret, "c e traffic", &ch_hash);
                     const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
-                    self.early_km = KeyMaterial{
+                    var ekm = KeyMaterial{
                         .secret = cets,
                         .key = early_keys.key,
                         .key32 = .{0} ** 32,
@@ -4455,6 +4470,8 @@ pub const Client = struct {
                         .hp = early_keys.hp,
                         .hp32 = .{0} ** 32,
                     };
+                    ekm.initCachedContexts();
+                    self.early_km = ekm;
                     dbg("io: client derived 0-RTT early keys\n", .{});
                     break :ed_blk result.n;
                 } else {
@@ -5699,8 +5716,7 @@ pub const Client = struct {
         // Process downloads in batches to stay within NS3 network simulator limits.
         // The NS3 DropTail queue is 25 packets; sending more than ~20 packets at
         // once causes queue overflow and packet drops.  Using BATCH_SIZE=20 keeps
-        // each GET request burst at or below the queue limit, matching the server's
-        // own 20-packet-per-flush budget (see flushPendingHttp09Responses).
+        // each GET request burst at or below the queue limit.
         const BATCH_SIZE: usize = 20;
         var batch_start: usize = 0;
         while (batch_start < self.active_urls.len) {
@@ -5819,7 +5835,6 @@ pub const Client = struct {
             // Wait for all downloads in this batch to complete.
             const batch_target = batch_end;
             dbg("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
-            var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
             const dl_deadline = std.time.milliTimestamp() + 60_000;
             var dl_iter: u32 = 0;
             while (true) {
@@ -5879,19 +5894,14 @@ pub const Client = struct {
                 if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
                 dbg("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
-                var drained: usize = 0;
-                while (true) {
-                    var src_addr: std.posix.sockaddr.storage = undefined;
-                    var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-                    const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
-                    const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
-                        if (drained > 0 and err == error.WouldBlock) break;
-                        dbg("io: downloadUrls recvfrom error: {}\n", .{err});
-                        break;
-                    };
-                    drained += 1;
-                    dbg("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
-                    self.processPacket(recv_buf[0..n]);
+                // Batch receive: on Linux uses recvmmsg for up to 64 datagrams
+                // per syscall; on macOS falls back to a recvfrom drain loop with
+                // per-entry buffers (avoiding buffer reuse between packets).
+                var rb = batch_io.RecvBatch{};
+                const n_recv = rb.recv(self.sock, true);
+                for (rb.entries[0..n_recv]) |*e| {
+                    dbg("io: downloadUrls recv {} bytes streams_done={}\n", .{ e.len, self.streams_done });
+                    self.processPacket(e.buf[0..e.len]);
                 }
                 // Send one cumulative ACK after draining all pending packets.
                 // This replaces N individual ACKs with a single packet, reducing

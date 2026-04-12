@@ -10,6 +10,8 @@ const crypto = std.crypto;
 const Aes128 = crypto.core.aes.Aes128;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
+const Ghash = crypto.onetimeauth.Ghash;
+const modes = crypto.core.modes;
 
 pub const AeadError = error{
     AuthenticationFailed,
@@ -40,7 +42,6 @@ pub fn encryptAes128Gcm(
 ) AeadError!void {
     if (dst.len < plaintext.len + Aes128Gcm.tag_length) return error.BufferTooSmall;
     var tag: [Aes128Gcm.tag_length]u8 = undefined;
-    @memcpy(dst[0..plaintext.len], plaintext);
     Aes128Gcm.encrypt(dst[0..plaintext.len], &tag, plaintext, aad, nonce, key);
     @memcpy(dst[plaintext.len..][0..Aes128Gcm.tag_length], &tag);
 }
@@ -72,7 +73,6 @@ pub fn encryptChaCha20Poly1305(
 ) AeadError!void {
     if (dst.len < plaintext.len + ChaCha20Poly1305.tag_length) return error.BufferTooSmall;
     var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
-    @memcpy(dst[0..plaintext.len], plaintext);
     ChaCha20Poly1305.encrypt(dst[0..plaintext.len], &tag, plaintext, aad, nonce, key);
     @memcpy(dst[plaintext.len..][0..ChaCha20Poly1305.tag_length], &tag);
 }
@@ -146,6 +146,179 @@ pub const HeaderProtection = struct {
         }
     }
 };
+
+/// Pre-expanded AES-128 context for AEAD and header protection.
+///
+/// Caches the AES key schedule so that `initEnc()` (10-round key expansion)
+/// is performed once at key derivation time rather than on every packet.
+/// On ARM this saves ~40 AES operations per encrypt/decrypt call.
+pub const CachedAes128Context = struct {
+    const AesEncCtx = @TypeOf(Aes128.initEnc([_]u8{0} ** 16));
+    const tag_length = 16;
+    const nonce_length = 12;
+    const zeros = [_]u8{0} ** 16;
+
+    aes: AesEncCtx,
+
+    pub fn init(key: [16]u8) CachedAes128Context {
+        return .{ .aes = Aes128.initEnc(key) };
+    }
+
+    /// Encrypt plaintext using AES-128-GCM with the pre-expanded key schedule.
+    /// `dst` must have capacity for `plaintext.len + 16` bytes.
+    pub fn encrypt(
+        self: *const CachedAes128Context,
+        dst: []u8,
+        plaintext: []const u8,
+        aad: []const u8,
+        nonce: [nonce_length]u8,
+    ) AeadError!void {
+        if (dst.len < plaintext.len + tag_length) return error.BufferTooSmall;
+        const aes = self.aes;
+
+        var h: [16]u8 = undefined;
+        aes.encrypt(&h, &zeros);
+
+        var t: [16]u8 = undefined;
+        var j: [16]u8 = undefined;
+        j[0..nonce_length].* = nonce;
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
+        aes.encrypt(&t, &j);
+
+        const ct = dst[0..plaintext.len];
+        const block_count = (std.math.divCeil(usize, aad.len, Ghash.block_length) catch unreachable) +
+            (std.math.divCeil(usize, ct.len, Ghash.block_length) catch unreachable) + 1;
+        var mac = Ghash.initForBlockCount(&h, block_count);
+        mac.update(aad);
+        mac.pad();
+
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
+        modes.ctr(@TypeOf(aes), aes, ct, plaintext, j, .big);
+        mac.update(ct);
+        mac.pad();
+
+        var final_block = h;
+        std.mem.writeInt(u64, final_block[0..8], @as(u64, aad.len) * 8, .big);
+        std.mem.writeInt(u64, final_block[8..16], @as(u64, plaintext.len) * 8, .big);
+        mac.update(&final_block);
+        var tag: [tag_length]u8 = undefined;
+        mac.final(&tag);
+        for (t, 0..) |x, i| {
+            tag[i] ^= x;
+        }
+        @memcpy(dst[plaintext.len..][0..tag_length], &tag);
+    }
+
+    /// Decrypt and authenticate ciphertext using AES-128-GCM with the pre-expanded key.
+    /// `ciphertext` includes the 16-byte authentication tag at the end.
+    pub fn decrypt(
+        self: *const CachedAes128Context,
+        dst: []u8,
+        ciphertext: []const u8,
+        aad: []const u8,
+        nonce: [nonce_length]u8,
+    ) AeadError!void {
+        if (ciphertext.len < tag_length) return error.AuthenticationFailed;
+        const ct = ciphertext[0 .. ciphertext.len - tag_length];
+        const tag = ciphertext[ciphertext.len - tag_length ..][0..tag_length];
+        if (dst.len < ct.len) return error.BufferTooSmall;
+        const aes = self.aes;
+
+        var h: [16]u8 = undefined;
+        aes.encrypt(&h, &zeros);
+
+        var t: [16]u8 = undefined;
+        var j: [16]u8 = undefined;
+        j[0..nonce_length].* = nonce;
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
+        aes.encrypt(&t, &j);
+
+        const block_count = (std.math.divCeil(usize, aad.len, Ghash.block_length) catch unreachable) +
+            (std.math.divCeil(usize, ct.len, Ghash.block_length) catch unreachable) + 1;
+        var mac = Ghash.initForBlockCount(&h, block_count);
+        mac.update(aad);
+        mac.pad();
+
+        mac.update(ct);
+        mac.pad();
+
+        var final_block = h;
+        std.mem.writeInt(u64, final_block[0..8], @as(u64, aad.len) * 8, .big);
+        std.mem.writeInt(u64, final_block[8..16], @as(u64, ct.len) * 8, .big);
+        mac.update(&final_block);
+        var computed_tag: [Ghash.mac_length]u8 = undefined;
+        mac.final(&computed_tag);
+        for (t, 0..) |x, i| {
+            computed_tag[i] ^= x;
+        }
+
+        if (!crypto.timing_safe.eql([tag_length]u8, computed_tag, tag.*)) {
+            crypto.secureZero(u8, &computed_tag);
+            @memset(dst[0..ct.len], undefined);
+            return error.AuthenticationFailed;
+        }
+
+        const m = dst[0..ct.len];
+        std.mem.writeInt(u32, j[nonce_length..][0..4], 2, .big);
+        modes.ctr(@TypeOf(aes), aes, m, ct, j, .big);
+    }
+
+    /// Compute the 16-byte header protection mask using the pre-expanded key.
+    pub fn hpMask(self: *const CachedAes128Context, sample: [16]u8) [16]u8 {
+        var mask: [16]u8 = undefined;
+        self.aes.encrypt(&mask, &sample);
+        return mask;
+    }
+};
+
+test "aead: CachedAes128Context matches stdlib AES-128-GCM" {
+    const testing = std.testing;
+    const key: [16]u8 = .{0x01} ** 16;
+    const nonce: [12]u8 = .{0x02} ** 12;
+    const plaintext = "Hello, QUIC! Cached context test.";
+    const aad = "header bytes";
+
+    // Stdlib path
+    var std_ct: [plaintext.len + 16]u8 = undefined;
+    try encryptAes128Gcm(&std_ct, plaintext, aad, key, nonce);
+
+    // Cached path
+    const ctx = CachedAes128Context.init(key);
+    var cached_ct: [plaintext.len + 16]u8 = undefined;
+    try ctx.encrypt(&cached_ct, plaintext, aad, nonce);
+
+    // Must produce identical ciphertext + tag
+    try testing.expectEqualSlices(u8, &std_ct, &cached_ct);
+
+    // Cached decrypt must recover plaintext
+    var recovered: [plaintext.len]u8 = undefined;
+    try ctx.decrypt(&recovered, &cached_ct, aad, nonce);
+    try testing.expectEqualSlices(u8, plaintext, &recovered);
+}
+
+test "aead: CachedAes128Context HP mask matches HeaderProtection" {
+    const testing = std.testing;
+    const hp_key: [16]u8 = .{0xAB} ** 16;
+    const sample: [16]u8 = .{0xCD} ** 16;
+
+    // Stdlib HP path
+    var first_std: u8 = 0xc3;
+    var pn_std = [_]u8{ 0x01, 0x02 };
+    HeaderProtection.applyAes128(hp_key, sample, &first_std, &pn_std, 0x0f);
+
+    // Cached HP path
+    const ctx = CachedAes128Context.init(hp_key);
+    const mask = ctx.hpMask(sample);
+    var first_cached: u8 = 0xc3;
+    var pn_cached = [_]u8{ 0x01, 0x02 };
+    first_cached ^= mask[0] & 0x0f;
+    for (&pn_cached, 0..) |*b, i| {
+        b.* ^= mask[1 + i];
+    }
+
+    try testing.expectEqual(first_std, first_cached);
+    try testing.expectEqualSlices(u8, &pn_std, &pn_cached);
+}
 
 test "aead: AES-128-GCM encrypt/decrypt round-trip" {
     const testing = std.testing;

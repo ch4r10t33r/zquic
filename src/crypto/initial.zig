@@ -94,10 +94,10 @@ pub fn protectInitialPacket(
     const nonce = aead.buildNonce(km.iv, pn);
 
     // Encrypt payload
-    try aead.encryptAes128Gcm(dst[pos .. pos + ct_and_tag_len], plaintext, aad, km.key, nonce);
+    try km.aes_ctx.encrypt(dst[pos .. pos + ct_and_tag_len], plaintext, aad, nonce);
     pos += ct_and_tag_len;
 
-    // Apply header protection
+    // Apply header protection using cached HP context
     // Sample starts at pn_start + 4 (RFC 9001 §5.4.2)
     const pn_start = header.len;
     const sample_start = pn_start + hp_sample_offset;
@@ -108,7 +108,11 @@ pub fn protectInitialPacket(
     const pn_bytes_slice = dst[pn_start .. pn_start + actual_pn_len];
     // RFC 9001 §5.4.1: long headers mask bits 3-0 (0x0f), short headers mask bits 5-0 (0x1f).
     const first_byte_mask: u8 = if (header[0] & 0x80 != 0) 0x0f else 0x1f;
-    aead.HeaderProtection.applyAes128(km.hp, sample, &dst[0], pn_bytes_slice, first_byte_mask);
+    const mask = km.hp_ctx.hpMask(sample);
+    dst[0] ^= mask[0] & first_byte_mask;
+    for (pn_bytes_slice, 0..) |*b, mi| {
+        b.* ^= mask[1 + mi];
+    }
 
     return pos;
 }
@@ -134,38 +138,32 @@ pub fn unprotectInitialPacket(
     var sample: [hp_sample_len]u8 = undefined;
     @memcpy(&sample, buf[sample_start .. sample_start + hp_sample_len]);
 
-    // Work on a mutable copy to unmask
-    var header_copy: [1600]u8 = undefined;
-    if (buf.len > header_copy.len) return error.BufferTooShort;
-    @memcpy(header_copy[0..buf.len], buf);
+    // Compute HP mask and unmask first byte to discover PN length.
+    const first_byte_mask: u8 = if (buf[0] & 0x80 != 0) 0x0f else 0x1f;
+    const mask = km.hp_ctx.hpMask(sample);
+    const unmasked_first = buf[0] ^ (mask[0] & first_byte_mask);
+    const actual_pn_len: usize = (unmasked_first & 0x03) + 1;
 
-    // Unmask first byte to discover actual PN length
-    const first_byte_mask: u8 = if (header_copy[0] & 0x80 != 0) 0x0f else 0x1f;
-    // Temporarily unmask first byte alone to read PN length
-    var temp_first = header_copy[0];
-    const ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
-    var mask: [16]u8 = undefined;
-    ctx.encrypt(&mask, &sample);
-    temp_first ^= mask[0] & first_byte_mask;
+    // Copy only the header bytes needed for AAD (replaces the 1600-byte full-packet copy).
+    // 128 bytes covers the worst case: 1 + 4 + 1+20 + 1+20 + 8(token_len) + 53(token) + 8 + 4 = ~120.
+    const aad_end = pn_start + actual_pn_len;
+    var aad_buf: [128]u8 = undefined;
+    if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
+    @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
 
-    const actual_pn_len: usize = (temp_first & 0x03) + 1;
-
-    // Now unmask PN bytes
-    const pn_bytes = header_copy[pn_start .. pn_start + actual_pn_len];
-    for (pn_bytes, 0..) |*b, i| {
-        b.* ^= mask[1 + i];
+    // Unmask first byte and PN bytes in the AAD copy.
+    aad_buf[0] ^= mask[0] & first_byte_mask;
+    for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
+        b.* ^= mask[mi];
     }
-    header_copy[0] ^= mask[0] & first_byte_mask;
 
     // Reconstruct packet number (simple truncated decode)
     var pn: u64 = 0;
-    for (pn_bytes) |b| {
+    for (aad_buf[pn_start..aad_end]) |b| {
         pn = (pn << 8) | b;
     }
 
-    // AAD = everything up to and including PN
-    const aad_end = pn_start + actual_pn_len;
-    const aad = header_copy[0..aad_end];
+    const aad = aad_buf[0..aad_end];
     const nonce = aead.buildNonce(km.iv, pn);
     const ciphertext = buf[aad_end..payload_end];
 
@@ -173,7 +171,7 @@ pub fn unprotectInitialPacket(
     const plaintext_len = ciphertext.len - 16;
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
-    try aead.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+    try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
     return plaintext_len;
 }
 
@@ -236,11 +234,7 @@ pub fn unprotectPacketChaCha20(
     var sample: [hp_sample_len]u8 = undefined;
     @memcpy(&sample, buf[sample_start .. sample_start + hp_sample_len]);
 
-    var header_copy: [1600]u8 = undefined;
-    if (buf.len > header_copy.len) return error.BufferTooShort;
-    @memcpy(header_copy[0..buf.len], buf);
-
-    const first_byte_mask: u8 = if (header_copy[0] & 0x80 != 0) 0x0f else 0x1f;
+    const first_byte_mask: u8 = if (buf[0] & 0x80 != 0) 0x0f else 0x1f;
 
     // Derive ChaCha20 mask: counter = sample[0..4], nonce = sample[4..16]
     const counter = std.mem.readInt(u32, sample[0..4], .little);
@@ -248,21 +242,27 @@ pub fn unprotectPacketChaCha20(
     var full_mask: [64]u8 = undefined;
     std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
 
-    header_copy[0] ^= full_mask[0] & first_byte_mask;
-    const actual_pn_len: usize = (header_copy[0] & 0x03) + 1;
+    const unmasked_first = buf[0] ^ (full_mask[0] & first_byte_mask);
+    const actual_pn_len: usize = (unmasked_first & 0x03) + 1;
 
-    const pn_bytes = header_copy[pn_start .. pn_start + actual_pn_len];
-    for (pn_bytes, 0..) |*b, i| {
-        b.* ^= full_mask[1 + i];
+    // Copy only the header bytes needed for AAD (replaces the 1600-byte full-packet copy).
+    const aad_end = pn_start + actual_pn_len;
+    var aad_buf: [128]u8 = undefined;
+    if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
+    @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
+
+    // Unmask first byte and PN bytes in the AAD copy.
+    aad_buf[0] ^= full_mask[0] & first_byte_mask;
+    for (aad_buf[pn_start..aad_end], 1..) |*b, mi| {
+        b.* ^= full_mask[mi];
     }
 
     var pn: u64 = 0;
-    for (pn_bytes) |b| {
+    for (aad_buf[pn_start..aad_end]) |b| {
         pn = (pn << 8) | b;
     }
 
-    const aad_end = pn_start + actual_pn_len;
-    const aad_slice = header_copy[0..aad_end];
+    const aad_slice = aad_buf[0..aad_end];
     const nonce = aead.buildNonce(km.iv, pn);
     const ciphertext = buf[aad_end..payload_end];
 
