@@ -61,28 +61,32 @@ All 13/13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-run
 ## Performance
 
 Loopback throughput benchmark on Apple Silicon (M-series Mac), comparing zquic
-against [quiche](https://github.com/cloudflare/quiche) (Cloudflare, Rust/BoringSSL).
-Both built with release optimizations. 5 runs per data point.
+against [quiche](https://github.com/cloudflare/quiche) (Cloudflare, Rust/BoringSSL) and
+[ngtcp2](https://github.com/ngtcp2/ngtcp2) (C/quictls). All built with release
+optimizations; steady-state runs (excluding cold start), 5 runs per data point.
 
-| Transfer | zquic | quiche | Notes |
-|----------|------:|-------:|-------|
-| 1 MB | **237 Mbps** | 235 Mbps | Handshake-dominated; zquic matches quiche |
-| 10 MB | 890 Mbps | **986 Mbps** | ~10% gap as crypto throughput matters more |
-| 50 MB | 1,361 Mbps | **1,799 Mbps** | BoringSSL's hand-tuned AES-NI/ARM assembly widens the lead |
-| 100 MB | 1,511 Mbps | **2,066 Mbps** | zquic sustains 1.5 Gbps; quiche reaches 2 Gbps |
+| Transfer | zquic | quiche | ngtcp2 | Notes |
+|----------|------:|-------:|-------:|-------|
+| 1 MB | 257 Mbps | **274 Mbps** | 59 Mbps | Handshake-dominated; ngtcp2 penalized by idle timeout overhead |
+| 10 MB | 1,007 Mbps | **1,181 Mbps** | 513 Mbps | zquic within 15% of quiche |
+| 50 MB | 1,459 Mbps | **1,927 Mbps** | 1,534 Mbps | ngtcp2 matches zquic; BoringSSL leads |
+| 100 MB | 1,583 Mbps | 1,937 Mbps | **2,180 Mbps** | ngtcp2 overtakes all at bulk transfers |
 
-**Key takeaway:** zquic is competitive with a production Rust/C stack on small-to-medium
-transfers (typical web workloads).  The gap on bulk transfers is primarily the crypto
-path — BoringSSL's hand-optimized assembly vs Zig's standard library AES-GCM.
+**Key takeaways:**
+- zquic is competitive with production Rust/C stacks on small-to-medium transfers (typical web workloads).
+- The gap on bulk transfers is primarily the crypto path — BoringSSL/quictls hand-optimized AES assembly vs Zig's standard library AES-GCM.
+- ngtcp2's quictls backend excels at sustained bulk throughput, overtaking quiche at 100 MB.
 
 Reproduce with:
 ```sh
 # Quick self-benchmark
 zig build bench-e2e -Doptimize=ReleaseFast -- --size-mb 50
 
-# Comparative benchmark (requires Rust toolchain for quiche)
+# Two-way comparative benchmark (requires Rust toolchain for quiche)
 bash bench/local_compare.sh zquic quiche
-SIZE_MB=100 RUNS=5 bash bench/local_compare.sh zquic quiche
+
+# Three-way benchmark (also requires cmake + libev for ngtcp2)
+SIZE_MB=100 RUNS=5 bash bench/local_compare.sh zquic quiche ngtcp2
 ```
 
 ## Requirements

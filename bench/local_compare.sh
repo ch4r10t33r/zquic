@@ -103,7 +103,7 @@ build_ngtcp2() {
 
     # Build nghttp3
     if [ ! -d "${BUILD}/nghttp3" ]; then
-        git clone --depth 1 https://github.com/ngtcp2/nghttp3.git "${BUILD}/nghttp3" 2>/dev/null
+        git clone --recursive --depth 1 https://github.com/ngtcp2/nghttp3.git "${BUILD}/nghttp3" 2>/dev/null
         (cd "${BUILD}/nghttp3" && autoreconf -fi && \
             ./configure --prefix="${BUILD}/local" --enable-lib-only \
                 PKG_CONFIG_PATH="${BUILD}/local/lib64/pkgconfig:${BUILD}/local/lib/pkgconfig" && \
@@ -112,20 +112,26 @@ build_ngtcp2() {
         }
     fi
 
-    # Build ngtcp2
+    # Build ngtcp2 (cmake to get example binaries)
     if [ ! -d "${BUILD}/ngtcp2" ]; then
-        git clone --depth 1 https://github.com/ngtcp2/ngtcp2.git "${BUILD}/ngtcp2" 2>/dev/null
-        (cd "${BUILD}/ngtcp2" && autoreconf -fi && \
-            ./configure --prefix="${BUILD}/local" \
-                PKG_CONFIG_PATH="${BUILD}/local/lib64/pkgconfig:${BUILD}/local/lib/pkgconfig" \
-                --with-openssl && \
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" && make install) 2>&1 || {
+        git clone --recursive --depth 1 https://github.com/ngtcp2/ngtcp2.git "${BUILD}/ngtcp2" 2>/dev/null
+    fi
+    if [ ! -f "${BUILD}/ngtcp2/build/examples/qtlsserver" ]; then
+        local LIBEV_PREFIX="/opt/homebrew"
+        [ -d "/usr/local/include/ev.h" ] && LIBEV_PREFIX="/usr/local"
+        (cd "${BUILD}/ngtcp2" && mkdir -p build && cd build && \
+            cmake -DCMAKE_INSTALL_PREFIX="${BUILD}/local" \
+                -DCMAKE_PREFIX_PATH="${BUILD}/local;${LIBEV_PREFIX}" \
+                -DENABLE_OPENSSL=ON \
+                -DENABLE_EXAMPLES=ON \
+                .. && \
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)") 2>&1 || {
             echo "  ⚠ ngtcp2 build failed"; return 1
         }
     fi
 
-    cp "${BUILD}/local/bin/server" "${BINS_DIR}/ngtcp2-server" 2>/dev/null || true
-    cp "${BUILD}/local/bin/client" "${BINS_DIR}/ngtcp2-client" 2>/dev/null || true
+    cp "${BUILD}/ngtcp2/build/examples/qtlsserver" "${BINS_DIR}/ngtcp2-server" 2>/dev/null || true
+    cp "${BUILD}/ngtcp2/build/examples/qtlsclient" "${BINS_DIR}/ngtcp2-client" 2>/dev/null || true
 }
 
 echo ""
@@ -149,9 +155,10 @@ start_server() {
                 --no-retry &
             ;;
         ngtcp2)
+            DYLD_LIBRARY_PATH="${TMP}/ngtcp2_build/local/lib:${DYLD_LIBRARY_PATH:-}" \
             LD_LIBRARY_PATH="${TMP}/ngtcp2_build/local/lib64:${TMP}/ngtcp2_build/local/lib:${LD_LIBRARY_PATH:-}" \
-                "${BINS_DIR}/ngtcp2-server" 0.0.0.0 "${PORT}" \
-                "${KEY}" "${CERT}" -d "${WWW}" &
+                "${BINS_DIR}/ngtcp2-server" '*' "${PORT}" \
+                "${KEY}" "${CERT}" -d "${WWW}" -q &
             ;;
         *)
             echo "Unknown impl: ${impl}"; return 1
@@ -186,10 +193,11 @@ run_client() {
                 "https://127.0.0.1:${PORT}/bench.bin"
             ;;
         ngtcp2)
+            DYLD_LIBRARY_PATH="${TMP}/ngtcp2_build/local/lib:${DYLD_LIBRARY_PATH:-}" \
             LD_LIBRARY_PATH="${TMP}/ngtcp2_build/local/lib64:${TMP}/ngtcp2_build/local/lib:${LD_LIBRARY_PATH:-}" \
                 "${BINS_DIR}/ngtcp2-client" localhost "${PORT}" \
                 "https://localhost:${PORT}/bench.bin" \
-                -d "${DL}"
+                --download "${DL}" --timeout=100ms -q
             ;;
     esac
 }
