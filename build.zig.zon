@@ -1,7 +1,7 @@
 .{
     .name = .zquic,
     .fingerprint = 0x947d823dd45c34db,
-    .version = "0.1.0",
+    .version = "1.2.0",
     .minimum_zig_version = "0.15.0",
     .dependencies = .{},
     .paths = .{
@@ -9,6 +9,5 @@
         "build.zig.zon",
         "src",
         "vendor",
-        "docs",
     },
 }

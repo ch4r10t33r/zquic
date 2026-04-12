@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.2.0] - 2026-04-12
+
+### Added
+
+- **Custom ALPN**: `ServerConfig.alpn` / `ClientConfig.alpn` and helpers
+  `serverTlsAlpn` / `clientTlsAlpn` for non-HTTP TLS handshakes
+- **Raw application streams**: when `raw_application_streams` is enabled on both
+  sides, inbound STREAM data is stored in `RawAppStreamSlot` buffers without
+  HTTP/0.9 or HTTP/3 parsing
+- **Embedder I/O**: `feedPacket` / `processPendingWork`, `initFromSocket` with
+  optional socket ownership, local stream ID allocation, `sendRawStreamData` for
+  1-RTT STREAM frames, and receive buffer views for raw streams
+- **README**: Embedder guide section (consolidated from the former `docs/EMBEDDER.md`)
+
+---
+
 ## [v1.1.0] - 2026-04-12
 
 ### Performance
@@ -92,6 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.2.0...HEAD
+[v1.2.0]: https://github.com/ch4r10t33r/zquic/compare/v1.1.0...v1.2.0
 [v1.1.0]: https://github.com/ch4r10t33r/zquic/compare/v0.1.0...v1.1.0
 [v0.1.0]: https://github.com/ch4r10t33r/zquic/releases/tag/v0.1.0
