@@ -63,19 +63,19 @@ All 13/13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-run
 Loopback throughput benchmark on Apple Silicon (M-series Mac), comparing zquic
 against [quiche](https://github.com/cloudflare/quiche) (Cloudflare, Rust/BoringSSL) and
 [ngtcp2](https://github.com/ngtcp2/ngtcp2) (C/quictls). All built with release
-optimizations; steady-state runs (excluding cold start), 5 runs per data point.
+optimizations; steady-state averages (runs 3–5), 5 runs per data point.
 
 | Transfer | zquic | quiche | ngtcp2 | Notes |
 |----------|------:|-------:|-------:|-------|
-| 1 MB | 257 Mbps | **274 Mbps** | 59 Mbps | Handshake-dominated; ngtcp2 penalized by idle timeout overhead |
-| 10 MB | 1,007 Mbps | **1,181 Mbps** | 513 Mbps | zquic within 15% of quiche |
-| 50 MB | 1,459 Mbps | **1,927 Mbps** | 1,534 Mbps | ngtcp2 matches zquic; BoringSSL leads |
-| 100 MB | 1,583 Mbps | 1,937 Mbps | **2,180 Mbps** | ngtcp2 overtakes all at bulk transfers |
+| 1 MB | **297 Mbps** | 285 Mbps | 255 Mbps | Handshake-dominated; all three are comparable |
+| 10 MB | 1,003 Mbps | 1,186 Mbps | **1,312 Mbps** | zquic within 15% of quiche |
+| 50 MB | 1,427 Mbps | 1,635 Mbps | **2,248 Mbps** | ngtcp2 pulls ahead; quictls AES assembly shines |
+| 100 MB | 1,598 Mbps | 2,129 Mbps | **2,924 Mbps** | ngtcp2 reaches ~3 Gbps; quiche ~2.1 Gbps; zquic ~1.6 Gbps |
 
 **Key takeaways:**
-- zquic is competitive with production Rust/C stacks on small-to-medium transfers (typical web workloads).
+- zquic **wins at small transfers** (1 MB) where handshake and protocol efficiency dominate over raw crypto speed.
 - The gap on bulk transfers is primarily the crypto path — BoringSSL/quictls hand-optimized AES assembly vs Zig's standard library AES-GCM.
-- ngtcp2's quictls backend excels at sustained bulk throughput, overtaking quiche at 100 MB.
+- ngtcp2's quictls backend excels at sustained bulk throughput, reaching nearly 3 Gbps at 100 MB.
 
 Reproduce with:
 ```sh

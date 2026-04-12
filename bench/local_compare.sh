@@ -197,7 +197,7 @@ run_client() {
             LD_LIBRARY_PATH="${TMP}/ngtcp2_build/local/lib64:${TMP}/ngtcp2_build/local/lib:${LD_LIBRARY_PATH:-}" \
                 "${BINS_DIR}/ngtcp2-client" localhost "${PORT}" \
                 "https://localhost:${PORT}/bench.bin" \
-                --download "${DL}" --timeout=100ms -q
+                --download "${DL}" --exit-on-first-stream-close -q
             ;;
     esac
 }
