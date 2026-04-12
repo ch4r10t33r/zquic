@@ -58,6 +58,33 @@ All 13/13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-run
 | `ecn` | ✅ |
 | `rebind-port` | ✅ |
 
+## Performance
+
+Loopback throughput benchmark on Apple Silicon (M-series Mac), comparing zquic
+against [quiche](https://github.com/cloudflare/quiche) (Cloudflare, Rust/BoringSSL).
+Both built with release optimizations. 5 runs per data point.
+
+| Transfer | zquic | quiche | Notes |
+|----------|------:|-------:|-------|
+| 1 MB | **237 Mbps** | 235 Mbps | Handshake-dominated; zquic matches quiche |
+| 10 MB | 890 Mbps | **986 Mbps** | ~10% gap as crypto throughput matters more |
+| 50 MB | 1,361 Mbps | **1,799 Mbps** | BoringSSL's hand-tuned AES-NI/ARM assembly widens the lead |
+| 100 MB | 1,511 Mbps | **2,066 Mbps** | zquic sustains 1.5 Gbps; quiche reaches 2 Gbps |
+
+**Key takeaway:** zquic is competitive with a production Rust/C stack on small-to-medium
+transfers (typical web workloads).  The gap on bulk transfers is primarily the crypto
+path — BoringSSL's hand-optimized assembly vs Zig's standard library AES-GCM.
+
+Reproduce with:
+```sh
+# Quick self-benchmark
+zig build bench-e2e -Doptimize=ReleaseFast -- --size-mb 50
+
+# Comparative benchmark (requires Rust toolchain for quiche)
+bash bench/local_compare.sh zquic quiche
+SIZE_MB=100 RUNS=5 bash bench/local_compare.sh zquic quiche
+```
+
 ## Requirements
 
 - Zig **0.15.x**
