@@ -500,7 +500,7 @@ fn unprotect1RttPacketWithPnTracking(
     if (chacha20) {
         try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
     } else {
-        try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+        try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
     }
     return .{ .pt_len = plaintext_len, .pn = pn };
 }
@@ -994,7 +994,9 @@ pub const ConnState = struct {
         const hs_server_qkm = tls_hs.deriveQuicKeys(secrets.server_handshake);
 
         self.hs_client_km = .{ .key = hs_client_qkm.key, .key32 = hs_client_qkm.key32, .iv = hs_client_qkm.iv, .hp = hs_client_qkm.hp, .hp32 = hs_client_qkm.hp32, .secret = secrets.client_handshake };
+        self.hs_client_km.initCachedContexts();
         self.hs_server_km = .{ .key = hs_server_qkm.key, .key32 = hs_server_qkm.key32, .iv = hs_server_qkm.iv, .hp = hs_server_qkm.hp, .hp32 = hs_server_qkm.hp32, .secret = secrets.server_handshake };
+        self.hs_server_km.initCachedContexts();
 
         self.has_hs_keys = true;
     }
@@ -1006,7 +1008,9 @@ pub const ConnState = struct {
         const app_server_qkm = tls_hs.deriveQuicKeys(secrets.server_app);
 
         self.app_client_km = .{ .key = app_client_qkm.key, .key32 = app_client_qkm.key32, .iv = app_client_qkm.iv, .hp = app_client_qkm.hp, .hp32 = app_client_qkm.hp32, .secret = secrets.client_app };
+        self.app_client_km.initCachedContexts();
         self.app_server_km = .{ .key = app_server_qkm.key, .key32 = app_server_qkm.key32, .iv = app_server_qkm.iv, .hp = app_server_qkm.hp, .hp32 = app_server_qkm.hp32, .secret = secrets.server_app };
+        self.app_server_km.initCachedContexts();
 
         self.has_app_keys = true;
         self.qlog.keyUpdated("1rtt", "tls");
@@ -1766,6 +1770,7 @@ pub const Server = struct {
                     .hp = early_keys.hp,
                     .hp32 = .{0} ** 32,
                 };
+                conn.early_km.initCachedContexts();
                 conn.has_early_keys = true;
                 dbg("io: server derived 0-RTT early keys\n", .{});
             }
@@ -4456,7 +4461,7 @@ pub const Client = struct {
                     var cets: [32]u8 = undefined;
                     keys_mod.hkdfExpandLabel(&cets, &result.early_secret, "c e traffic", &ch_hash);
                     const early_keys = session_mod.deriveEarlyKeysFromSecret(cets);
-                    self.early_km = KeyMaterial{
+                    var ekm = KeyMaterial{
                         .secret = cets,
                         .key = early_keys.key,
                         .key32 = .{0} ** 32,
@@ -4464,6 +4469,8 @@ pub const Client = struct {
                         .hp = early_keys.hp,
                         .hp32 = .{0} ** 32,
                     };
+                    ekm.initCachedContexts();
+                    self.early_km = ekm;
                     dbg("io: client derived 0-RTT early keys\n", .{});
                     break :ed_blk result.n;
                 } else {

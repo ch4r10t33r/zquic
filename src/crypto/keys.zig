@@ -114,7 +114,7 @@ pub const KeyMaterial = struct {
     hp_ctx: CachedAes128Context = undefined,
 
     /// Initialize the cached AES contexts from the current key and hp fields.
-    fn initCachedContexts(self: *KeyMaterial) void {
+    pub fn initCachedContexts(self: *KeyMaterial) void {
         self.aes_ctx = CachedAes128Context.init(self.key);
         self.hp_ctx = CachedAes128Context.init(self.hp);
     }
