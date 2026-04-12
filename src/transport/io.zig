@@ -2970,10 +2970,11 @@ pub const Server = struct {
     /// Drain queued HTTP/0.9 bodies bounded by congestion control.
     ///
     /// The congestion controller is the primary rate limiter.  The per-flush
-    /// budget of 256 packets (~300 KB at 1200-byte payloads) limits the
-    /// burst per event-loop iteration while still allowing high throughput.
+    /// budget caps the burst per event-loop iteration to stay within the
+    /// NS3 simulator's 25-packet DropTail queue.  On real networks and
+    /// loopback the CC window is the effective bottleneck, not this budget.
     fn flushPendingHttp09Responses(self: *Server) void {
-        var budget: usize = 256;
+        var budget: usize = 20;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -3936,7 +3937,7 @@ pub const Server = struct {
 
     /// Drain queued HTTP/3 DATA frames bounded by congestion control.
     fn flushPendingHttp3Responses(self: *Server) void {
-        var budget: usize = 256;
+        var budget: usize = 20;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -5694,8 +5695,7 @@ pub const Client = struct {
         // Process downloads in batches to stay within NS3 network simulator limits.
         // The NS3 DropTail queue is 25 packets; sending more than ~20 packets at
         // once causes queue overflow and packet drops.  Using BATCH_SIZE=20 keeps
-        // each GET request burst at or below the queue limit, matching the server's
-        // own 20-packet-per-flush budget (see flushPendingHttp09Responses).
+        // each GET request burst at or below the queue limit.
         const BATCH_SIZE: usize = 20;
         var batch_start: usize = 0;
         while (batch_start < self.active_urls.len) {

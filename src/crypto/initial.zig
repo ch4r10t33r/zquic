@@ -145,8 +145,9 @@ pub fn unprotectInitialPacket(
     const actual_pn_len: usize = (unmasked_first & 0x03) + 1;
 
     // Copy only the header bytes needed for AAD (replaces the 1600-byte full-packet copy).
+    // 128 bytes covers the worst case: 1 + 4 + 1+20 + 1+20 + 8(token_len) + 53(token) + 8 + 4 = ~120.
     const aad_end = pn_start + actual_pn_len;
-    var aad_buf: [64]u8 = undefined;
+    var aad_buf: [128]u8 = undefined;
     if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
     @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
 
@@ -246,7 +247,7 @@ pub fn unprotectPacketChaCha20(
 
     // Copy only the header bytes needed for AAD (replaces the 1600-byte full-packet copy).
     const aad_end = pn_start + actual_pn_len;
-    var aad_buf: [64]u8 = undefined;
+    var aad_buf: [128]u8 = undefined;
     if (aad_end > aad_buf.len or aad_end > buf.len) return error.BufferTooShort;
     @memcpy(aad_buf[0..aad_end], buf[0..aad_end]);
 
