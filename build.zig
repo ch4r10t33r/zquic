@@ -16,8 +16,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Main library module
-    const zquic_mod = b.createModule(.{
+    // Main library module (exposed as `zquic` for `build.zig.zon` dependents).
+    const zquic_mod = b.addModule("zquic", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
