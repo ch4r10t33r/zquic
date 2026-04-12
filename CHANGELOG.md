@@ -11,6 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.1.0] - 2026-04-12
+
+### Performance
+
+- **Cached AES-128 key schedules**: pre-expand AES round keys in `KeyMaterial`,
+  eliminating per-packet key schedule computation for both AEAD and header
+  protection — ~36% throughput improvement on small transfers
+- **Batch UDP receive**: use `recvmmsg` on Linux to receive up to 64 packets per
+  syscall, reducing kernel transitions
+- **Eliminated buffer copies**: build 1-RTT packets directly in the send buffer
+  instead of copying through an intermediate buffer
+- **Tuned congestion MSS**: raise maximum segment size from 1200 to 1350 bytes,
+  increasing payload efficiency while staying within the 1500-byte Ethernet MTU
+
+### Fixed
+
+- **Uninitialized AES contexts**: cached AES contexts are now properly initialized
+  in all key derivation paths (handshake, application, key update, session
+  resumption, 0-RTT) — fixes resumption, http3, zerortt, connectionmigration,
+  and multiplexing interop tests
+- **IP fragmentation on NS3 links**: reduce H09/H3 chunk sizes to 1350 bytes so
+  total IP packets (UDP payload + 28-byte IP/UDP headers) stay within the
+  1500-byte MTU — fixes ecn and rebind-port interop tests
+- **Hard-coded chunk sizes in retransmit paths**: H3 retransmit and path migration
+  code now uses the module-level chunk constants instead of stale literals
+
+### Interop
+
+- All 13/13 quic-interop-runner test cases passing
+
+---
+
 ## [v0.1.0] - 2026-04-11
 
 ### Added
@@ -60,5 +92,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.1.0...HEAD
+[v1.1.0]: https://github.com/ch4r10t33r/zquic/compare/v0.1.0...v1.1.0
 [v0.1.0]: https://github.com/ch4r10t33r/zquic/releases/tag/v0.1.0
