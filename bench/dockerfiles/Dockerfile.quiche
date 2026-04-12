@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/cloudflare/quiche.git /build
+RUN git clone --recursive --depth 1 https://github.com/cloudflare/quiche.git /build
 WORKDIR /build
 RUN cargo build --release --package quiche_apps
 

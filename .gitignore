@@ -8,3 +8,8 @@ quic-interop-runner/
 *.key
 *.a
 .venv/
+
+# Benchmark artifacts
+bench/results/
+*.csv
+*.sqlog

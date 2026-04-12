@@ -76,9 +76,9 @@ build_zquic() {
 
 build_quiche() {
     echo "  Building quiche (this may take a few minutes)..."
-    local QUICHE_DIR="${TMP}/quiche"
+    local QUICHE_DIR="${QUICHE_SRC:-${TMP}/quiche}"
     if [ ! -d "${QUICHE_DIR}" ]; then
-        git clone --depth 1 https://github.com/cloudflare/quiche.git "${QUICHE_DIR}" 2>/dev/null
+        git clone --recursive --depth 1 https://github.com/cloudflare/quiche.git "${QUICHE_DIR}" 2>/dev/null
     fi
     (cd "${QUICHE_DIR}" && cargo build --release --package quiche_apps 2>&1) || {
         echo "  ⚠ quiche build failed"; return 1
@@ -144,7 +144,7 @@ start_server() {
                 --key "${KEY}" --www "${WWW}" --http09 &
             ;;
         quiche)
-            "${BINS_DIR}/quiche-server" --listen "0.0.0.0:${PORT}" \
+            "${BINS_DIR}/quiche-server" --listen "127.0.0.1:${PORT}" \
                 --cert "${CERT}" --key "${KEY}" --root "${WWW}" \
                 --no-retry &
             ;;
@@ -166,10 +166,10 @@ stop_server() {
     local pidfile="${TMP}/${impl}_server.pid"
     if [ -f "${pidfile}" ]; then
         kill "$(cat "${pidfile}")" 2>/dev/null || true
-        wait "$(cat "${pidfile}")" 2>/dev/null || true
+        wait "$(cat "${pidfile}")" 2>/dev/null 3>/dev/null || true
         rm -f "${pidfile}"
     fi
-}
+} 2>/dev/null
 
 run_client() {
     local impl="$1"
@@ -182,8 +182,8 @@ run_client() {
             ;;
         quiche)
             "${BINS_DIR}/quiche-client" --no-verify \
-                "https://localhost:${PORT}/bench.bin" \
-                --dump-response-body "${DL}/bench.bin"
+                --dump-responses "${DL}" \
+                "https://127.0.0.1:${PORT}/bench.bin"
             ;;
         ngtcp2)
             LD_LIBRARY_PATH="${TMP}/ngtcp2_build/local/lib64:${TMP}/ngtcp2_build/local/lib:${LD_LIBRARY_PATH:-}" \
