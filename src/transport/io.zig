@@ -94,6 +94,20 @@ fn setupEcnSocket(sock: std.posix.fd_t) void {
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
 
+/// Maximum file-data bytes in a single HTTP/0.9 STREAM frame.
+/// 1450 data + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag = ~1487, fits in 1500.
+const H09_CHUNK: usize = 1450;
+
+/// Maximum file-data bytes in a single HTTP/3 DATA frame.
+/// 1400 data + 3 H3 overhead + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag = ~1440, fits in 1500.
+const H3_CHUNK: usize = 1400;
+
+/// H3 DATA frame overhead: 1 byte type (0x00) + 2 byte varint length.
+const H3_DATA_OVERHEAD: usize = 3;
+
+/// Total QUIC stream bytes per H3 DATA frame (payload + framing overhead).
+const H3_CHUNK_WIRE: usize = H3_CHUNK + H3_DATA_OVERHEAD;
+
 /// MSG_DONTWAIT flag for non-blocking recvfrom().
 /// std.posix.MSG is void on some platforms (macOS/Zig 0.14), so use raw values.
 const MSG_DONTWAIT: u32 = if (@hasDecl(std.posix, "MSG") and @typeInfo(@TypeOf(std.posix.MSG)) == .@"struct")
@@ -486,7 +500,7 @@ fn unprotect1RttPacketWithPnTracking(
     if (chacha20) {
         try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
     } else {
-        try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
+        try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
     }
     return .{ .pt_len = plaintext_len, .pn = pn };
 }
@@ -2397,12 +2411,11 @@ pub const Server = struct {
             // Rewind active HTTP/0.9 streams to retransmit data that may have
             // been sent to the old (dead) port before we learned of the rebind.
             // Dead-port window: PING interval (200ms) + network RTT/2 (15ms) +
-            // server poll latency (50ms) ≈ 265ms.  At 480 KB/s that is
-            // ~127 200 bytes sent to the dead port.  We use 200 × 1200 = 240 000
-            // bytes (≈500ms buffer) so the rewind always starts before the gap.
+            // server poll latency (50ms) ≈ 265ms.  We rewind 200 packets' worth
+            // of data so the retransmission always starts before the gap.
             // The client writes at explicit sf.offset so duplicate retransmits
             // are idempotent (seekTo + writeAll overwrites the same bytes).
-            const REWIND_BYTES: u64 = 200 * 1200;
+            const REWIND_BYTES: u64 = 200 * H09_CHUNK;
             for (&conn.http09_slots) |*slot| {
                 if (slot.active) {
                     // Active slot: rewind to re-send data that went to the dead port.
@@ -2420,8 +2433,8 @@ pub const Server = struct {
                     // reached the client on the old path.  Reopen the file and
                     // re-activate so flushPendingHttp09Responses re-sends everything.
                     const fp = slot.file_path[0..slot.file_path_len];
-                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / 1200)
-                        (slot.fin_pkt_pn - REWIND_BYTES / 1200) * 1200
+                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / H09_CHUNK)
+                        (slot.fin_pkt_pn - REWIND_BYTES / H09_CHUNK) * H09_CHUNK
                     else
                         0;
                     if (std.fs.openFileAbsolute(fp, .{})) |f| {
@@ -2567,16 +2580,16 @@ pub const Server = struct {
                         }
                         // HTTP/3 slots: stream_offset is the QUIC stream offset.
                         // Derive file offset from QUIC stream offset and DATA frame
-                        // overhead: each 900-byte chunk is wrapped in a 3-byte DATA
-                        // frame header (type 0x00 + 2-byte varint length for len=900).
+                        // overhead: each H3_CHUNK-byte chunk is wrapped in a 3-byte
+                        // DATA frame header (type 0x00 + 2-byte varint length).
                         for (&conn.http3_slots) |*slot| {
                             if (slot.stream_id != lp.stream_id) continue;
                             if (lp.stream_offset < slot.stream_offset) {
                                 const data_bytes = lp.stream_offset -| slot.stream_offset_base;
-                                // Each full 900-byte chunk contributes 903 QUIC bytes (3 H3 overhead).
-                                const full_chunks = data_bytes / 903;
-                                const partial_quic = data_bytes % 903;
-                                const file_pos = full_chunks * 900 + if (partial_quic > 3) partial_quic - 3 else 0;
+                                // Each full chunk contributes H3_CHUNK_WIRE QUIC stream bytes.
+                                const full_chunks = data_bytes / H3_CHUNK_WIRE;
+                                const partial_quic = data_bytes % H3_CHUNK_WIRE;
+                                const file_pos = full_chunks * H3_CHUNK + if (partial_quic > H3_DATA_OVERHEAD) partial_quic - H3_DATA_OVERHEAD else 0;
                                 if (slot.active) {
                                     slot.stream_offset = lp.stream_offset;
                                     slot.file_offset = file_pos;
@@ -2886,7 +2899,7 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
-        var file_buf: [1450]u8 = undefined;
+        var file_buf: [H09_CHUNK]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
             dbg("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
@@ -3817,10 +3830,10 @@ pub const Server = struct {
 
     /// Send the next HTTP/3 DATA-frame chunk for one queued response slot.
     fn http3SendNextChunk(self: *Server, conn: *ConnState, slot: *Http3OutSlot) void {
-        // Wrap up to 1400 bytes of file content in an HTTP/3 DATA frame.
+        // Wrap up to H3_CHUNK bytes of file content in an HTTP/3 DATA frame.
         // DATA frame overhead is 2-3 bytes (type=0x00 + varint length),
         // so the total STREAM payload fits well within one 1500-byte UDP datagram.
-        const CHUNK: usize = 1400;
+        const CHUNK = H3_CHUNK;
         var file_buf: [CHUNK]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
             dbg("io: http3 stream_id={} read error: {}\n", .{ slot.stream_id, err });

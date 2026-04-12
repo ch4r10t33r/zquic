@@ -93,8 +93,8 @@ pub fn protectInitialPacket(
     const aad = dst[0..pos];
     const nonce = aead.buildNonce(km.iv, pn);
 
-    // Encrypt payload
-    try km.aes_ctx.encrypt(dst[pos .. pos + ct_and_tag_len], plaintext, aad, nonce);
+    // Encrypt payload (use stdlib AES-128-GCM for correctness)
+    try aead.encryptAes128Gcm(dst[pos .. pos + ct_and_tag_len], plaintext, aad, km.key, nonce);
     pos += ct_and_tag_len;
 
     // Apply header protection using cached HP context
@@ -171,7 +171,7 @@ pub fn unprotectInitialPacket(
     const plaintext_len = ciphertext.len - 16;
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
-    try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
+    try aead.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
     return plaintext_len;
 }
 
