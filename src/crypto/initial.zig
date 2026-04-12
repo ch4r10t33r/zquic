@@ -94,10 +94,10 @@ pub fn protectInitialPacket(
     const nonce = aead.buildNonce(km.iv, pn);
 
     // Encrypt payload
-    try aead.encryptAes128Gcm(dst[pos .. pos + ct_and_tag_len], plaintext, aad, km.key, nonce);
+    try km.aes_ctx.encrypt(dst[pos .. pos + ct_and_tag_len], plaintext, aad, nonce);
     pos += ct_and_tag_len;
 
-    // Apply header protection
+    // Apply header protection using cached HP context
     // Sample starts at pn_start + 4 (RFC 9001 §5.4.2)
     const pn_start = header.len;
     const sample_start = pn_start + hp_sample_offset;
@@ -108,7 +108,11 @@ pub fn protectInitialPacket(
     const pn_bytes_slice = dst[pn_start .. pn_start + actual_pn_len];
     // RFC 9001 §5.4.1: long headers mask bits 3-0 (0x0f), short headers mask bits 5-0 (0x1f).
     const first_byte_mask: u8 = if (header[0] & 0x80 != 0) 0x0f else 0x1f;
-    aead.HeaderProtection.applyAes128(km.hp, sample, &dst[0], pn_bytes_slice, first_byte_mask);
+    const mask = km.hp_ctx.hpMask(sample);
+    dst[0] ^= mask[0] & first_byte_mask;
+    for (pn_bytes_slice, 0..) |*b, mi| {
+        b.* ^= mask[1 + mi];
+    }
 
     return pos;
 }
@@ -143,9 +147,7 @@ pub fn unprotectInitialPacket(
     const first_byte_mask: u8 = if (header_copy[0] & 0x80 != 0) 0x0f else 0x1f;
     // Temporarily unmask first byte alone to read PN length
     var temp_first = header_copy[0];
-    const ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
-    var mask: [16]u8 = undefined;
-    ctx.encrypt(&mask, &sample);
+    const mask = km.hp_ctx.hpMask(sample);
     temp_first ^= mask[0] & first_byte_mask;
 
     const actual_pn_len: usize = (temp_first & 0x03) + 1;
@@ -173,7 +175,7 @@ pub fn unprotectInitialPacket(
     const plaintext_len = ciphertext.len - 16;
     if (dst.len < plaintext_len) return error.BufferTooSmall;
 
-    try aead.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+    try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
     return plaintext_len;
 }
 

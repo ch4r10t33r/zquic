@@ -486,7 +486,7 @@ fn unprotect1RttPacketWithPnTracking(
     if (chacha20) {
         try aead_mod.decryptChaCha20Poly1305(dst[0..plaintext_len], ciphertext, aad, km.key32, nonce);
     } else {
-        try aead_mod.decryptAes128Gcm(dst[0..plaintext_len], ciphertext, aad, km.key, nonce);
+        try km.aes_ctx.decrypt(dst[0..plaintext_len], ciphertext, aad, nonce);
     }
     return .{ .pt_len = plaintext_len, .pn = pn };
 }
@@ -520,8 +520,7 @@ fn computeHpMask(buf: []const u8, pn_start: usize, km: *const KeyMaterial, chach
         std.crypto.stream.chacha.ChaCha20IETF.xor(&full_mask, &(.{0} ** 64), counter, km.hp32, cc_nonce);
         @memcpy(&mask, full_mask[0..16]);
     } else {
-        const aes_ctx = std.crypto.core.aes.Aes128.initEnc(km.hp);
-        aes_ctx.encrypt(&mask, &sample);
+        mask = km.hp_ctx.hpMask(sample);
     }
     return mask;
 }
@@ -2968,16 +2967,13 @@ pub const Server = struct {
     ///
     /// The congestion controller (NewReno) is the sole rate limiter: each call to
     /// http09SendNextChunk checks cc.canSend() and returns early if the cwnd is
-    /// exhausted.  A per-flush budget of 20 packets (24 KB) caps the burst size so
-    /// the NS3 simulator's 25-packet DropTail queue is never exceeded.
+    /// Drain queued HTTP/0.9 bodies bounded by congestion control.
     ///
-    /// The previous 50 ms time gate has been removed.  It was a workaround for a
-    /// CC accounting bug (bytes_acked was under-credited) that caused bytes_in_flight
-    /// to drift upward, blocking sends.  With accurate CC accounting the time gate is
-    /// not needed and only throttles throughput on real networks / loopback to
-    /// ~480 KB/s — far below what is achievable.
+    /// The congestion controller is the primary rate limiter.  The per-flush
+    /// budget of 256 packets (~300 KB at 1200-byte payloads) limits the
+    /// burst per event-loop iteration while still allowing high throughput.
     fn flushPendingHttp09Responses(self: *Server) void {
-        var budget: usize = 20; // 20 × 1200 bytes = 24 KB per flush — below the 25-pkt NS3 queue
+        var budget: usize = 256;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {
@@ -3939,9 +3935,8 @@ pub const Server = struct {
     }
 
     /// Drain queued HTTP/3 DATA frames bounded by congestion control.
-    /// The 50ms time gate has been removed; CC alone gates the send rate.
     fn flushPendingHttp3Responses(self: *Server) void {
-        var budget: usize = 20;
+        var budget: usize = 256;
         while (budget > 0) {
             var progressed = false;
             for (&self.conns) |*cslot| {

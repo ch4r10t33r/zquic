@@ -12,6 +12,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
+const CachedAes128Context = @import("aead.zig").CachedAes128Context;
 
 /// Perform HKDF-Expand-Label (TLS 1.3 / RFC 8446 §7.1).
 /// `out` receives exactly `out.len` bytes of key material.
@@ -107,6 +108,17 @@ pub const KeyMaterial = struct {
     hp: [16]u8 = undefined,
     hp32: [32]u8 = undefined,
 
+    /// Pre-expanded AES-128 context for AEAD encrypt/decrypt (avoids per-packet key schedule).
+    aes_ctx: CachedAes128Context = undefined,
+    /// Pre-expanded AES-128 context for header protection (avoids per-packet key schedule).
+    hp_ctx: CachedAes128Context = undefined,
+
+    /// Initialize the cached AES contexts from the current key and hp fields.
+    fn initCachedContexts(self: *KeyMaterial) void {
+        self.aes_ctx = CachedAes128Context.init(self.key);
+        self.hp_ctx = CachedAes128Context.init(self.hp);
+    }
+
     /// Derive key, IV, and HP from the secret using QUIC v1 labels (RFC 9001 §5.1).
     pub fn expand(self: *KeyMaterial) void {
         hkdfExpandLabel(&self.key, &self.secret, "quic key", "");
@@ -114,6 +126,7 @@ pub const KeyMaterial = struct {
         hkdfExpandLabel(&self.iv, &self.secret, "quic iv", "");
         hkdfExpandLabel(&self.hp, &self.secret, "quic hp", "");
         hkdfExpandLabel(&self.hp32, &self.secret, "quic hp", "");
+        self.initCachedContexts();
     }
 
     /// Derive key, IV, and HP from the secret using QUIC v2 labels (RFC 9369 §7.1).
@@ -123,6 +136,7 @@ pub const KeyMaterial = struct {
         hkdfExpandLabel(&self.iv, &self.secret, "quicv2 iv", "");
         hkdfExpandLabel(&self.hp, &self.secret, "quicv2 hp", "");
         hkdfExpandLabel(&self.hp32, &self.secret, "quicv2 hp", "");
+        self.initCachedContexts();
     }
 
     /// Derive the next-generation key material for QUIC v1 key updates (RFC 9001 §6).
@@ -139,6 +153,8 @@ pub const KeyMaterial = struct {
         hkdfExpandLabel(&next.iv, &next.secret, "quic iv", "");
         next.hp = self.hp;
         next.hp32 = self.hp32;
+        next.aes_ctx = CachedAes128Context.init(next.key);
+        next.hp_ctx = self.hp_ctx; // HP key unchanged during key update
         return next;
     }
 
@@ -151,6 +167,8 @@ pub const KeyMaterial = struct {
         hkdfExpandLabel(&next.iv, &next.secret, "quicv2 iv", "");
         next.hp = self.hp;
         next.hp32 = self.hp32;
+        next.aes_ctx = CachedAes128Context.init(next.key);
+        next.hp_ctx = self.hp_ctx; // HP key unchanged during key update
         return next;
     }
 };
