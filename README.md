@@ -242,6 +242,49 @@ examples/
   session_resumption.zig  Session tickets and 0-RTT
 ```
 
+## Embedder guide
+
+The `transport.io` server and client are oriented around the quic-interop-runner HTTP/0.9 and
+HTTP/3 paths. The APIs below let other protocols reuse the same TLS 1.3 + QUIC stack (custom
+ALPN, opaque stream bytes, external UDP loops).
+
+### Custom ALPN
+
+- `ServerConfig.alpn` and `ClientConfig.alpn` — when set, that exact string is sent in the TLS
+  handshake (single protocol). It takes precedence over `http3` / `http09`.
+- `serverTlsAlpn(&ServerConfig)` and `clientTlsAlpn(&ClientConfig)` — effective ALPN for the
+  handshake (including the HTTP defaults when `alpn` is null).
+
+### Raw application STREAM data
+
+When `raw_application_streams` is true on **both** `ServerConfig` and `ClientConfig`:
+
+- Incoming STREAM frames are appended to per-stream `RawAppStreamSlot` buffers as opaque bytes
+  (`handleRawApplicationStreamServer` / `handleRawApplicationStreamClient`). No HTTP/0.9 or
+  HTTP/3 parsing is performed.
+- Data is merged using the same contiguous-offset rules as the HTTP/3 download path (duplicates
+  and gaps are handled conservatively).
+
+Use `rawAppRecvBuffer` / `Client.rawAppRecvBuffer` for a `[]const u8` view of accumulated data
+(same backing store as the slot; consume or copy before the slot is reused). This path is for
+embedders that drive their own framing on top of QUIC streams.
+
+### External UDP / embedder recv loops
+
+- `Server.feedPacket(buf, src)` — dispatch one datagram without `recvfrom` (e.g. shared UDP port).
+- `Server.processPendingWork()` — PTO, flush pending HTTP/raw sends, `flushSendBatch`, reap connections (call after draining injected packets).
+- `Server.initFromSocket(allocator, config, sock, take_ownership)` — use a pre-bound IPv4 UDP socket; when `take_ownership` is false, `deinit` does not close the fd.
+- `Client.feedPacket(buf)` — inject one datagram.
+- `Client.processPendingWork(server_addr)` — Initial/Finished retransmits when the embedder owns the poll loop.
+- `Client.initFromSocket` — same ownership semantics as the server.
+
+### Opening streams and sending data (non-HTTP)
+
+- `rawAllocateNextLocalUniStream` / `rawAllocateNextLocalBidiStream` on `ConnState` — RFC 9000 §2.1 local stream IDs (do not mix with HTTP streams on the same connection).
+- `Server.sendRawStreamData(server, conn, stream_id, offset, data, fin)` and `Client.sendRawStreamData(...)` — send one STREAM frame on 1-RTT; the embedder tracks per-stream offsets.
+
+Dependents import the package module `zquic` from `build.zig.zon`; it imports vendored `tls` as `tls`.
+
 ## TLS Integration
 
 QUIC uses TLS 1.3 without the TLS record layer (RFC 9001). A thin adapter in

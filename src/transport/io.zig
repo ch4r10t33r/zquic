@@ -905,6 +905,12 @@ pub const ConnState = struct {
     max_streams_uni_recv: u64 = 100,
     peer_bidi_stream_count: u64 = 0,
     peer_uni_stream_count: u64 = 0,
+    /// Next locally opened uni stream ID (RFC 9000 §2.1). Initialized to 3 on the
+    /// server and 2 on the client. Advanced by `rawAllocateNextLocalUniStream`.
+    next_local_uni_stream_id: u64 = 0,
+    /// Next locally opened bidi stream ID. Initialized to 1 on the server and 0 on
+    /// the client. Advanced by `rawAllocateNextLocalBidiStream`.
+    next_local_bidi_stream_id: u64 = 0,
 
     // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
     // Before the peer's address is validated (Retry token accepted or handshake
@@ -1102,6 +1108,8 @@ pub const Server = struct {
     /// 0-RTT anti-replay nonce cache (RFC 9001 §8.1).
     /// Keyed by the first 8 bytes of the PSK identity from each ClientHello.
     nonce_cache: session_mod.NonceCache = .{},
+    /// When false, `deinit` does not `close(self.sock)` (caller owns the UDP fd).
+    owns_socket: bool = true,
     /// Initialize server: load cert/key and create UDP socket.
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !*Server {
         // Heap-allocate the Server to avoid blowing the stack: the conns array
@@ -1169,8 +1177,92 @@ pub const Server = struct {
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
+            .owns_socket = true,
         };
         return self;
+    }
+
+    /// Same as `init`, but uses an already-bound IPv4 UDP `sock` (e.g. shared with
+    /// another protocol). Does not take ownership unless `take_ownership` is true;
+    /// when false, `deinit` will not close the socket.
+    pub fn initFromSocket(
+        allocator: std.mem.Allocator,
+        config: ServerConfig,
+        sock: std.posix.socket_t,
+        take_ownership: bool,
+    ) !*Server {
+        const self = try allocator.create(Server);
+        errdefer allocator.destroy(self);
+
+        const cert_der = loadCertDer(allocator, config.cert_path) catch |err| {
+            dbg("io: cert load failed ({s}): {}\n", .{ config.cert_path, err });
+            return err;
+        };
+        errdefer allocator.free(cert_der);
+
+        const pk = loadPrivateKey(allocator, config.key_path) catch |err| {
+            dbg("io: key load failed ({s}): {}\n", .{ config.key_path, err });
+            return err;
+        };
+
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(sock);
+
+        var retry_secret: [32]u8 = undefined;
+        std.crypto.random.bytes(&retry_secret);
+
+        self.* = .{
+            .allocator = allocator,
+            .config = config,
+            .sock = sock,
+            .raw_sock = null,
+            .cert_der = cert_der,
+            .private_key = pk,
+            .retry_secret = retry_secret,
+            .owns_socket = take_ownership,
+        };
+        return self;
+    }
+
+    /// Inject a UDP payload as if it had been received on `recvfrom` (shared-socket / embedder recv loops).
+    pub fn feedPacket(self: *Server, buf: []const u8, src: std.net.Address) void {
+        self.processPacket(buf, src);
+    }
+
+    /// Run loss recovery, flush pending HTTP responses, and reap idle connections — same work as an idle `run()` iteration without reading the socket.
+    pub fn processPendingWork(self: *Server) void {
+        self.checkPto();
+        self.flushPendingHttp09Responses();
+        self.http09RetransmitPendingFins();
+        self.flushPendingHttp3Responses();
+        self.http3RetransmitPendingFins();
+        self.flushSendBatch();
+        self.reapDrainedConnections();
+    }
+
+    /// Send one raw STREAM frame on 1-RTT (embedder tracks per-stream offsets). Requires `phase == .connected` and application keys.
+    pub fn sendRawStreamData(
+        self: *Server,
+        conn: *ConnState,
+        stream_id: u64,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+    ) void {
+        if (conn.phase != .connected or !conn.has_app_keys) return;
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = stream_id,
+            .offset = offset,
+            .data = data,
+            .fin = fin,
+            .has_length = true,
+        };
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const flen = sf.serialize(&frame_buf) catch return;
+        self.send1Rtt(conn, frame_buf[0..flen], conn.peer);
     }
 
     pub fn deinit(self: *Server) void {
@@ -1182,7 +1274,7 @@ pub const Server = struct {
                 conn.qlog.close();
             }
         }
-        std.posix.close(self.sock);
+        if (self.owns_socket) std.posix.close(self.sock);
         if (self.raw_sock) |rs| std.posix.close(rs);
         self.allocator.free(self.cert_der);
         self.allocator.destroy(self);
@@ -1437,6 +1529,8 @@ pub const Server = struct {
                     .peer = peer,
                     .init_dcid = dcid,
                     .use_v2 = is_v2,
+                    .next_local_uni_stream_id = 3,
+                    .next_local_bidi_stream_id = 1,
                 };
                 const conn = &(slot.*.?);
                 if (self.config.cubic) {
@@ -4129,6 +4223,31 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     }
 }
 
+/// Allocate the next locally initiated **unidirectional** stream ID (RFC 9000 §2.1).
+/// Do not mix with HTTP/0.9 or HTTP/3 stream usage on the same connection.
+pub fn rawAllocateNextLocalUniStream(conn: *ConnState) u64 {
+    const id = conn.next_local_uni_stream_id;
+    conn.next_local_uni_stream_id += 4;
+    return id;
+}
+
+/// Allocate the next locally initiated **bidirectional** stream ID.
+pub fn rawAllocateNextLocalBidiStream(conn: *ConnState) u64 {
+    const id = conn.next_local_bidi_stream_id;
+    conn.next_local_bidi_stream_id += 4;
+    return id;
+}
+
+/// Opaque receive buffer for an inbound raw-application stream on a **server** `ConnState`.
+pub fn rawAppRecvBuffer(conn: *ConnState, stream_id: u64) ?[]const u8 {
+    for (&conn.raw_app_streams) |*slot| {
+        if (slot.active and slot.stream_id == stream_id) {
+            return slot.buf.items;
+        }
+    }
+    return null;
+}
+
 // ── Stream download tracker ───────────────────────────────────────────────────
 
 /// Maps a QUIC stream ID to an open output file for download accumulation.
@@ -4193,6 +4312,11 @@ pub const Client = struct {
     /// for the resumption second connection it is the remaining URLs.
     active_urls: []const []const u8 = &.{},
 
+    /// Wall clock (ms) of last Initial send — used by `processPendingWork` for retransmit timing.
+    last_initial_retransmit_ms: i64 = 0,
+    /// When false, `deinit` does not close `sock`.
+    owns_socket: bool = true,
+
     // Stored Initial packet for retransmission.
     // On the first sendClientHello call, the packet is built and stored here.
     // Subsequent retransmit calls resend this exact buffer to avoid adding the
@@ -4230,6 +4354,8 @@ pub const Client = struct {
             // with QUIC v1 even when v2 is preferred.  use_v2 is promoted to true
             // once the server's v2 Initial is successfully decrypted.
             .use_v2 = false,
+            .next_local_uni_stream_id = 2,
+            .next_local_bidi_stream_id = 0,
         };
         if (config.cubic) {
             conn.cc = congestion.CongestionController.init(.cubic);
@@ -4255,6 +4381,58 @@ pub const Client = struct {
             .tls = tls_client,
             .conn = conn,
             .active_urls = config.urls,
+            .owns_socket = true,
+        };
+    }
+
+    /// Build client state around an existing IPv4 UDP socket (e.g. shared with another protocol).
+    pub fn initFromSocket(
+        allocator: std.mem.Allocator,
+        config: ClientConfig,
+        sock: std.posix.socket_t,
+        take_ownership: bool,
+    ) !Client {
+        var sk_buf: i32 = 8 * 1024 * 1024;
+        const sk_opt = std.mem.asBytes(&sk_buf);
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, sk_opt) catch {};
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
+        setupEcnSocket(sock);
+
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+        const dcid = ConnectionId.random(prng.random(), 8);
+        const scid = ConnectionId.random(prng.random(), 8);
+
+        const tls_client = ClientHandshake.init();
+        var conn = ConnState{
+            .local_cid = scid,
+            .remote_cid = dcid,
+            .peer = undefined,
+            .use_v2 = false,
+            .next_local_uni_stream_id = 2,
+            .next_local_bidi_stream_id = 0,
+        };
+        if (config.cubic) {
+            conn.cc = congestion.CongestionController.init(.cubic);
+        }
+        conn.init_keys = InitialSecrets.derive(dcid.slice());
+        if (config.v2) {
+            conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
+        }
+        if (config.qlog_dir) |qd| {
+            conn.qlog = qlog_writer.Writer.open(qd, dcid.slice(), "client");
+            var dst_buf: [64]u8 = undefined;
+            const dst_str = std.fmt.bufPrint(&dst_buf, "{s}:{}", .{ config.host, config.port }) catch "?";
+            conn.qlog.connectionStarted("0.0.0.0", 0, dst_str, config.port, 0x00000001);
+        }
+
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .sock = sock,
+            .tls = tls_client,
+            .conn = conn,
+            .active_urls = config.urls,
+            .owns_socket = take_ownership,
         };
     }
 
@@ -4265,7 +4443,76 @@ pub const Client = struct {
         freeConnStateRawAppBuffers(&self.conn, self.allocator);
         self.conn.qlog.connectionClosed("client_shutdown");
         self.conn.qlog.close();
-        std.posix.close(self.sock);
+        if (self.owns_socket) std.posix.close(self.sock);
+    }
+
+    /// Inject a UDP payload as if it had been received on `recvfrom`.
+    pub fn feedPacket(self: *Client, buf: []const u8) void {
+        self.processPacket(buf);
+    }
+
+    /// Initial / Finished handshake retransmits and deferred work (no `recvfrom`). Call from a timer when using an external recv loop.
+    pub fn processPendingWork(self: *Client, server_addr: std.net.Address) void {
+        const now = std.time.milliTimestamp();
+        if (self.conn.phase == .initial and self.initial_pkt_len > 0 and
+            now - self.last_initial_retransmit_ms >= 500)
+        {
+            self.sendClientHello(server_addr) catch {};
+        }
+        if (self.conn.has_hs_keys and self.conn.phase != .connected and
+            self.conn.finished_pkt_len > 0 and now - self.conn.finished_sent_ms >= 500)
+        {
+            _ = std.posix.sendto(
+                self.sock,
+                self.conn.finished_pkt[0..self.conn.finished_pkt_len],
+                0,
+                &server_addr.any,
+                server_addr.getOsSockLen(),
+            ) catch {};
+            self.conn.finished_sent_ms = now;
+        }
+    }
+
+    /// Send one raw STREAM frame on 1-RTT (embedder tracks per-stream offsets).
+    pub fn sendRawStreamData(
+        self: *Client,
+        stream_id: u64,
+        offset: u64,
+        data: []const u8,
+        fin: bool,
+    ) void {
+        if (self.conn.phase != .connected or !self.conn.has_app_keys) return;
+        const sf = stream_frame_mod.StreamFrame{
+            .stream_id = stream_id,
+            .offset = offset,
+            .data = data,
+            .fin = fin,
+            .has_length = true,
+        };
+        var frame_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const flen = sf.serialize(&frame_buf) catch return;
+        var send_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
+        const pkt_len = build1RttPacketFull(
+            &send_buf,
+            self.conn.remote_cid,
+            frame_buf[0..flen],
+            self.conn.app_pn,
+            &self.conn.app_client_km,
+            self.conn.key_phase_bit,
+            self.conn.use_chacha20,
+        ) catch return;
+        self.conn.app_pn += 1;
+        _ = std.posix.sendto(self.sock, send_buf[0..pkt_len], 0, &self.conn.peer.any, self.conn.peer.getOsSockLen()) catch {};
+    }
+
+    /// Opaque receive buffer for an inbound raw-application stream on a **client**.
+    pub fn rawAppRecvBuffer(self: *const Client, stream_id: u64) ?[]const u8 {
+        for (&self.raw_app_recv) |*slot| {
+            if (slot.active and slot.stream_id == stream_id) {
+                return slot.buf.items;
+            }
+        }
+        return null;
     }
 
     /// Connect to the server and download all configured URLs.
@@ -4352,7 +4599,10 @@ pub const Client = struct {
             .local_cid = scid,
             .remote_cid = dcid,
             .peer = server_addr,
+            .next_local_uni_stream_id = 2,
+            .next_local_bidi_stream_id = 0,
         };
+        self.last_initial_retransmit_ms = 0;
         if (self.config.cubic) {
             self.conn.cc = congestion.CongestionController.init(.cubic);
         }
@@ -4535,6 +4785,7 @@ pub const Client = struct {
                 &server.any,
                 server.getOsSockLen(),
             );
+            self.last_initial_retransmit_ms = std.time.milliTimestamp();
             return;
         }
 
@@ -4656,6 +4907,7 @@ pub const Client = struct {
         self.initial_pkt_len = pkt_len;
 
         _ = try std.posix.sendto(self.sock, self.initial_pkt[0..pkt_len], 0, &server.any, server.getOsSockLen());
+        self.last_initial_retransmit_ms = std.time.milliTimestamp();
 
         // If early keys were derived, send first batch of 0-RTT GETs (up to 20).
         // 1 Initial + 20 0-RTT = 21 packets ≤ NS3 queue limit of 25.
