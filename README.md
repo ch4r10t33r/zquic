@@ -242,23 +242,32 @@ examples/
   session_resumption.zig  Session tickets and 0-RTT
 ```
 
-## Embedding zquic (non-HTTP QUIC applications)
+## Embedder guide
 
-The `transport.io` server and client are still oriented around the quic-interop-runner
-HTTP/0.9 and HTTP/3 paths. The following APIs support other protocols (e.g. custom ALPN
-and opaque stream bytes):
+The `transport.io` server and client are oriented around the quic-interop-runner HTTP/0.9 and
+HTTP/3 paths. The APIs below let other protocols reuse the same TLS 1.3 + QUIC stack (custom
+ALPN, opaque stream bytes, external UDP loops).
 
 ### Custom ALPN
 
-- `ServerConfig.alpn` / `ClientConfig.alpn` — single protocol string for TLS (overrides `http3` / `http09`).
-- `serverTlsAlpn` / `clientTlsAlpn` — effective ALPN for the handshake.
+- `ServerConfig.alpn` and `ClientConfig.alpn` — when set, that exact string is sent in the TLS
+  handshake (single protocol). It takes precedence over `http3` / `http09`.
+- `serverTlsAlpn(&ServerConfig)` and `clientTlsAlpn(&ClientConfig)` — effective ALPN for the
+  handshake (including the HTTP defaults when `alpn` is null).
 
 ### Raw application STREAM data
 
-When `raw_application_streams` is true on both configs, inbound STREAM frames are stored in
-`RawAppStreamSlot` buffers (`handleRawApplicationStreamServer` / `handleRawApplicationStreamClient`).
+When `raw_application_streams` is true on **both** `ServerConfig` and `ClientConfig`:
+
+- Incoming STREAM frames are appended to per-stream `RawAppStreamSlot` buffers as opaque bytes
+  (`handleRawApplicationStreamServer` / `handleRawApplicationStreamClient`). No HTTP/0.9 or
+  HTTP/3 parsing is performed.
+- Data is merged using the same contiguous-offset rules as the HTTP/3 download path (duplicates
+  and gaps are handled conservatively).
+
 Use `rawAppRecvBuffer` / `Client.rawAppRecvBuffer` for a `[]const u8` view of accumulated data
-(same backing store as the slot; consume or copy before the slot is reused).
+(same backing store as the slot; consume or copy before the slot is reused). This path is for
+embedders that drive their own framing on top of QUIC streams.
 
 ### External UDP / embedder recv loops
 
@@ -273,11 +282,6 @@ Use `rawAppRecvBuffer` / `Client.rawAppRecvBuffer` for a `[]const u8` view of ac
 
 - `rawAllocateNextLocalUniStream` / `rawAllocateNextLocalBidiStream` on `ConnState` — RFC 9000 §2.1 local stream IDs (do not mix with HTTP streams on the same connection).
 - `Server.sendRawStreamData(server, conn, stream_id, offset, data, fin)` and `Client.sendRawStreamData(...)` — send one STREAM frame on 1-RTT; the embedder tracks per-stream offsets.
-
-### Remaining limitations
-
-- Full loss recovery for a **client** driven only by `feedPacket` + `processPendingWork` may need additional hooks over time; the interop client still uses the built-in `runEventLoop` for downloads.
-- Zero-copy **sends** are not exposed; receives are exposed as slices into internal `ArrayList` buffers.
 
 Dependents import the package module `zquic` from `build.zig.zon`; it imports vendored `tls` as `tls`.
 
