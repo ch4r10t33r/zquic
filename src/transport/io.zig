@@ -2886,7 +2886,7 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
-        var file_buf: [1200]u8 = undefined;
+        var file_buf: [1450]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
             dbg("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
@@ -3816,10 +3816,10 @@ pub const Server = struct {
 
     /// Send the next HTTP/3 DATA-frame chunk for one queued response slot.
     fn http3SendNextChunk(self: *Server, conn: *ConnState, slot: *Http3OutSlot) void {
-        // Wrap up to 900 bytes of file content in an HTTP/3 DATA frame.
-        // DATA frame overhead is 2 bytes (type=0x00 + 1-byte varint length),
-        // so the total STREAM payload is at most 902 bytes — well within one UDP packet.
-        const CHUNK: usize = 900;
+        // Wrap up to 1400 bytes of file content in an HTTP/3 DATA frame.
+        // DATA frame overhead is 2-3 bytes (type=0x00 + varint length),
+        // so the total STREAM payload fits well within one 1500-byte UDP datagram.
+        const CHUNK: usize = 1400;
         var file_buf: [CHUNK]u8 = undefined;
         const n = slot.file.read(&file_buf) catch |err| {
             dbg("io: http3 stream_id={} read error: {}\n", .{ slot.stream_id, err });
@@ -3885,7 +3885,7 @@ pub const Server = struct {
         }
 
         // Wrap the chunk in an HTTP/3 DATA frame.
-        var data_out: [CHUNK + 10]u8 = undefined;
+        var data_out: [CHUNK + 16]u8 = undefined;
         const data_frame_len = h3_frame.writeFrame(&data_out, @intFromEnum(h3_frame.FrameType.data), file_buf[0..n]) catch {
             if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.close();
@@ -5814,7 +5814,6 @@ pub const Client = struct {
             // Wait for all downloads in this batch to complete.
             const batch_target = batch_end;
             dbg("io: downloadUrls waiting for batch target={} (deadline=60s)\n", .{batch_target});
-            var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
             const dl_deadline = std.time.milliTimestamp() + 60_000;
             var dl_iter: u32 = 0;
             while (true) {
@@ -5874,19 +5873,14 @@ pub const Client = struct {
                 if (fds[0].revents & std.posix.POLL.IN == 0) continue;
 
                 dbg("io: downloadUrls poll ready iter={} streams_done={}\n", .{ dl_iter, self.streams_done });
-                var drained: usize = 0;
-                while (true) {
-                    var src_addr: std.posix.sockaddr.storage = undefined;
-                    var src_len: std.posix.socklen_t = @sizeOf(@TypeOf(src_addr));
-                    const flags: u32 = if (drained == 0) 0 else MSG_DONTWAIT;
-                    const n = std.posix.recvfrom(self.sock, &recv_buf, flags, @ptrCast(&src_addr), &src_len) catch |err| {
-                        if (drained > 0 and err == error.WouldBlock) break;
-                        dbg("io: downloadUrls recvfrom error: {}\n", .{err});
-                        break;
-                    };
-                    drained += 1;
-                    dbg("io: downloadUrls recv {} bytes drained={} streams_done={}\n", .{ n, drained, self.streams_done });
-                    self.processPacket(recv_buf[0..n]);
+                // Batch receive: on Linux uses recvmmsg for up to 64 datagrams
+                // per syscall; on macOS falls back to a recvfrom drain loop with
+                // per-entry buffers (avoiding buffer reuse between packets).
+                var rb = batch_io.RecvBatch{};
+                const n_recv = rb.recv(self.sock, true);
+                for (rb.entries[0..n_recv]) |*e| {
+                    dbg("io: downloadUrls recv {} bytes streams_done={}\n", .{ e.len, self.streams_done });
+                    self.processPacket(e.buf[0..e.len]);
                 }
                 // Send one cumulative ACK after draining all pending packets.
                 // This replaces N individual ACKs with a single packet, reducing

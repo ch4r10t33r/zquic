@@ -7,8 +7,11 @@
 
 const std = @import("std");
 
-/// Maximum segment size (bytes). QUIC uses the full MTU; we default to 1200.
-pub const mss: u64 = 1200;
+/// Maximum segment size (bytes) for congestion control calculations.
+/// Set to 1350 to match typical QUIC payload sizes (1500 MTU - headers/AEAD).
+/// This only affects CC window math (initial cwnd, CA growth, ssthresh floor),
+/// not actual packet sizing which is governed by MAX_DATAGRAM_SIZE (1500).
+pub const mss: u64 = 1350;
 /// Maximum congestion window (bytes).
 const max_cwnd: u64 = 64 * 1024 * 1024; // 64 MB
 

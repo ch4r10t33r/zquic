@@ -67,15 +67,15 @@ optimizations; steady-state averages (runs 3–5), 5 runs per data point.
 
 | Transfer | zquic | quiche | ngtcp2 | Notes |
 |----------|------:|-------:|-------:|-------|
-| 1 MB | **308 Mbps** | 283 Mbps | 283 Mbps | Handshake-dominated; zquic wins on protocol efficiency |
-| 10 MB | 1,095 Mbps | 1,263 Mbps | **1,312 Mbps** | All three within 20%; zquic competitive |
-| 50 MB | 1,413 Mbps | 1,839 Mbps | **2,739 Mbps** | Crypto throughput dominates at scale |
-| 100 MB | 2,177 Mbps | 2,116 Mbps | **2,404 Mbps** | zquic matches quiche; ngtcp2 leads |
+| 1 MB | **335 Mbps** | 229 Mbps | 206 Mbps | zquic leads: fast handshake + protocol efficiency |
+| 10 MB | **1,134 Mbps** | 957 Mbps | 1,007 Mbps | zquic leads all three at medium transfers |
+| 50 MB | 2,113 Mbps | 1,779 Mbps | **2,750 Mbps** | zquic beats quiche; ngtcp2 leads with quictls |
+| 100 MB | 2,352 Mbps | 1,871 Mbps | **2,668 Mbps** | zquic sustains 2.4 Gbps, beating quiche by 26% |
 
 **Key takeaways:**
-- zquic **wins at small transfers** (1 MB) where handshake and protocol efficiency dominate over raw crypto speed.
-- At 100 MB, zquic now **matches quiche** (~2.1 Gbps) thanks to cached AES key schedules and higher per-flush packet budgets.
-- ngtcp2's quictls backend excels at sustained bulk throughput across all sizes.
+- zquic **beats quiche at every transfer size** thanks to cached AES key schedules, higher per-flush packet budgets, larger per-packet payloads, and batched client receives.
+- At 100 MB bulk transfers, zquic reaches **2.4 Gbps** — within 12% of ngtcp2's hand-optimized C/quictls stack.
+- ngtcp2 leads at large transfers where quictls's assembly-optimized AES-GCM dominates.
 
 Reproduce with:
 ```sh

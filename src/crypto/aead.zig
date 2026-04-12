@@ -42,7 +42,6 @@ pub fn encryptAes128Gcm(
 ) AeadError!void {
     if (dst.len < plaintext.len + Aes128Gcm.tag_length) return error.BufferTooSmall;
     var tag: [Aes128Gcm.tag_length]u8 = undefined;
-    @memcpy(dst[0..plaintext.len], plaintext);
     Aes128Gcm.encrypt(dst[0..plaintext.len], &tag, plaintext, aad, nonce, key);
     @memcpy(dst[plaintext.len..][0..Aes128Gcm.tag_length], &tag);
 }
@@ -74,7 +73,6 @@ pub fn encryptChaCha20Poly1305(
 ) AeadError!void {
     if (dst.len < plaintext.len + ChaCha20Poly1305.tag_length) return error.BufferTooSmall;
     var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
-    @memcpy(dst[0..plaintext.len], plaintext);
     ChaCha20Poly1305.encrypt(dst[0..plaintext.len], &tag, plaintext, aad, nonce, key);
     @memcpy(dst[plaintext.len..][0..ChaCha20Poly1305.tag_length], &tag);
 }
