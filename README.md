@@ -242,6 +242,45 @@ examples/
   session_resumption.zig  Session tickets and 0-RTT
 ```
 
+## Embedding zquic (non-HTTP QUIC applications)
+
+The `transport.io` server and client are still oriented around the quic-interop-runner
+HTTP/0.9 and HTTP/3 paths. The following APIs support other protocols (e.g. custom ALPN
+and opaque stream bytes):
+
+### Custom ALPN
+
+- `ServerConfig.alpn` / `ClientConfig.alpn` — single protocol string for TLS (overrides `http3` / `http09`).
+- `serverTlsAlpn` / `clientTlsAlpn` — effective ALPN for the handshake.
+
+### Raw application STREAM data
+
+When `raw_application_streams` is true on both configs, inbound STREAM frames are stored in
+`RawAppStreamSlot` buffers (`handleRawApplicationStreamServer` / `handleRawApplicationStreamClient`).
+Use `rawAppRecvBuffer` / `Client.rawAppRecvBuffer` for a `[]const u8` view of accumulated data
+(same backing store as the slot; consume or copy before the slot is reused).
+
+### External UDP / embedder recv loops
+
+- `Server.feedPacket(buf, src)` — dispatch one datagram without `recvfrom` (e.g. shared UDP port).
+- `Server.processPendingWork()` — PTO, flush pending HTTP/raw sends, `flushSendBatch`, reap connections (call after draining injected packets).
+- `Server.initFromSocket(allocator, config, sock, take_ownership)` — use a pre-bound IPv4 UDP socket; when `take_ownership` is false, `deinit` does not close the fd.
+- `Client.feedPacket(buf)` — inject one datagram.
+- `Client.processPendingWork(server_addr)` — Initial/Finished retransmits when the embedder owns the poll loop.
+- `Client.initFromSocket` — same ownership semantics as the server.
+
+### Opening streams and sending data (non-HTTP)
+
+- `rawAllocateNextLocalUniStream` / `rawAllocateNextLocalBidiStream` on `ConnState` — RFC 9000 §2.1 local stream IDs (do not mix with HTTP streams on the same connection).
+- `Server.sendRawStreamData(server, conn, stream_id, offset, data, fin)` and `Client.sendRawStreamData(...)` — send one STREAM frame on 1-RTT; the embedder tracks per-stream offsets.
+
+### Remaining limitations
+
+- Full loss recovery for a **client** driven only by `feedPacket` + `processPendingWork` may need additional hooks over time; the interop client still uses the built-in `runEventLoop` for downloads.
+- Zero-copy **sends** are not exposed; receives are exposed as slices into internal `ArrayList` buffers.
+
+Dependents import the package module `zquic` from `build.zig.zon`; it imports vendored `tls` as `tls`.
+
 ## TLS Integration
 
 QUIC uses TLS 1.3 without the TLS record layer (RFC 9001). A thin adapter in
