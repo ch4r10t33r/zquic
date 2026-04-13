@@ -1779,7 +1779,9 @@ pub const Server = struct {
         hmac.update(odcid);
         var expected_mac: [32]u8 = undefined;
         hmac.final(&expected_mac);
-        if (!std.mem.eql(u8, received_mac, &expected_mac)) return null;
+        var received: [32]u8 = undefined;
+        @memcpy(&received, received_mac);
+        if (!std.crypto.timing_safe.eql([32]u8, received, expected_mac)) return null;
         return odcid;
     }
 
@@ -2455,7 +2457,9 @@ pub const Server = struct {
                     // the peer is signalling a reset without connection state.
                     if (buf.len >= 21 and conn.stateless_reset_token_set) {
                         const tail = buf[buf.len - 16 ..];
-                        if (std.mem.eql(u8, tail, &conn.stateless_reset_token)) {
+                        var tail_arr: [16]u8 = undefined;
+                        @memcpy(&tail_arr, tail);
+                        if (std.crypto.timing_safe.eql([16]u8, tail_arr, conn.stateless_reset_token)) {
                             dbg("io: Stateless Reset detected — entering draining\n", .{});
                             conn.draining = true;
                             return;

@@ -1107,7 +1107,8 @@ pub const ServerHandshake = struct {
             self.secrets.client_handshake,
             &peekHash(self.transcript),
         );
-        if (!std.mem.eql(u8, verify_data, &expected)) return error.BadFinishedMac;
+        const recv: [32]u8 = verify_data[0..32].*;
+        if (!std.crypto.timing_safe.eql([32]u8, recv, expected)) return error.BadFinishedMac;
 
         self.transcript.update(fin_bytes);
         self.handshake_done = true;
@@ -1296,7 +1297,8 @@ pub const ClientHandshake = struct {
                     );
                     if (msg_len != 32) return error.BadFinishedLength;
                     const vd = msg[4 .. 4 + msg_len];
-                    if (!std.mem.eql(u8, vd, &expected)) return error.BadFinishedMac;
+                    const recv: [32]u8 = vd[0..32].*;
+                    if (!std.crypto.timing_safe.eql([32]u8, recv, expected)) return error.BadFinishedMac;
                     self.transcript.update(msg);
 
                     // Derive app secrets
