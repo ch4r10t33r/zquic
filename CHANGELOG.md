@@ -11,6 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.2.2] - 2026-04-13
+
+### Security
+
+- **Connection IDs and random material**: generate CIDs, stateless reset tokens,
+  and PATH_CHALLENGE bytes with `std.crypto.random` instead of a millisecond-seeded
+  PRNG (avoids collisions when multiple packets are handled in the same ms).
+
+### Changed
+
+- **QUIC-TLS transport parameters**: encode varints via `varint.encode` (remove
+  duplicate local encoder).
+- **Retry integrity verification**: always compute the expected tag before
+  comparing; use `std.crypto.timing_safe.eql` for the 16-byte MAC.
+
+### Documentation
+
+- README “Implementation notes” (version negotiation, demo `Endpoint`, CSPRNG).
+- Clarify demo `Endpoint` connection limit, `retry_token` buffer, version
+  negotiation helpers, and `CachedAes128Context` design tradeoff.
+
+---
+
 ## [v1.2.1] - 2026-04-12
 
 ### Added
@@ -117,7 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.2.2...HEAD
+[v1.2.2]: https://github.com/ch4r10t33r/zquic/compare/v1.2.1...v1.2.2
+[v1.2.1]: https://github.com/ch4r10t33r/zquic/compare/v1.2.0...v1.2.1
 [v1.2.0]: https://github.com/ch4r10t33r/zquic/compare/v1.1.0...v1.2.0
 [v1.1.0]: https://github.com/ch4r10t33r/zquic/compare/v0.1.0...v1.1.0
 [v0.1.0]: https://github.com/ch4r10t33r/zquic/releases/tag/v0.1.0
