@@ -112,25 +112,25 @@ pub const TRANSPORT_PARAMS_EXT_TYPE: u16 = 0xffa5;
 
 /// Build a minimal QUIC transport parameters extension for the client.
 /// Returns bytes written to `out`.
-pub fn buildClientTransportParams(out: []u8) usize {
+pub fn buildClientTransportParams(out: []u8) (varint.EncodeError || varint.DecodeError)!usize {
     // Transport parameters (also used in Encrypted Extensions for the server role).
     // Flow-control limits must cover interop "transfer" (multi-megabyte files on
     // several client-initiated bidirectional streams at once).
     var pos: usize = 0;
 
     const write_param = struct {
-        fn call(buf: []u8, p: usize, id: u64, val: u64) usize {
+        fn call(buf: []u8, p: usize, id: u64, val: u64) (varint.EncodeError || varint.DecodeError)!usize {
             var w_pos = p;
             // ID varint
             var id_buf: [8]u8 = undefined;
-            const id_enc = varint.encode(&id_buf, id) catch unreachable;
+            const id_enc = try varint.encode(&id_buf, id);
             @memcpy(buf[w_pos .. w_pos + id_enc.len], id_enc);
             w_pos += id_enc.len;
             // Value varint (in a varint-length field)
             var val_buf: [8]u8 = undefined;
-            const val_enc = varint.encode(&val_buf, val) catch unreachable;
+            const val_enc = try varint.encode(&val_buf, val);
             var len_buf: [8]u8 = undefined;
-            const len_enc = varint.encode(&len_buf, val_enc.len) catch unreachable;
+            const len_enc = try varint.encode(&len_buf, val_enc.len);
             @memcpy(buf[w_pos .. w_pos + len_enc.len], len_enc);
             w_pos += len_enc.len;
             @memcpy(buf[w_pos .. w_pos + val_enc.len], val_enc);
@@ -139,13 +139,13 @@ pub fn buildClientTransportParams(out: []u8) usize {
         }
     }.call;
 
-    pos = write_param(out, pos, 0x01, 30_000); // max_idle_timeout
-    pos = write_param(out, pos, 0x04, 67_108_864); // initial_max_data (64 MiB)
-    pos = write_param(out, pos, 0x05, 16_777_216); // initial_max_stream_data_bidi_local (16 MiB)
-    pos = write_param(out, pos, 0x06, 16_777_216); // initial_max_stream_data_bidi_remote (16 MiB)
-    pos = write_param(out, pos, 0x07, 16_777_216); // initial_max_stream_data_uni (16 MiB)
-    pos = write_param(out, pos, 0x08, 100); // initial_max_streams_bidi
-    pos = write_param(out, pos, 0x09, 100); // initial_max_streams_uni
+    pos = try write_param(out, pos, 0x01, 30_000); // max_idle_timeout
+    pos = try write_param(out, pos, 0x04, 67_108_864); // initial_max_data (64 MiB)
+    pos = try write_param(out, pos, 0x05, 16_777_216); // initial_max_stream_data_bidi_local (16 MiB)
+    pos = try write_param(out, pos, 0x06, 16_777_216); // initial_max_stream_data_bidi_remote (16 MiB)
+    pos = try write_param(out, pos, 0x07, 16_777_216); // initial_max_stream_data_uni (16 MiB)
+    pos = try write_param(out, pos, 0x08, 100); // initial_max_streams_bidi
+    pos = try write_param(out, pos, 0x09, 100); // initial_max_streams_uni
     return pos;
 }
 
@@ -312,7 +312,7 @@ test "wrap_strip: record round-trip" {
 
 test "transport_params: builds non-empty" {
     var buf: [256]u8 = undefined;
-    const n = buildClientTransportParams(&buf);
+    const n = try buildClientTransportParams(&buf);
     try std.testing.expect(n > 0);
 }
 

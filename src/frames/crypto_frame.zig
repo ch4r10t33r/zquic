@@ -23,7 +23,8 @@ pub const CryptoFrame = struct {
         var r = varint.Reader.init(buf);
         const offset = try r.readVarint();
         const length = try r.readVarint();
-        const data = try r.readBytes(@intCast(length));
+        const len_usize = try varint.lenToUsize(length);
+        const data = try r.readBytes(len_usize);
         return .{
             .frame = .{ .offset = offset, .data = data },
             .consumed = r.pos,

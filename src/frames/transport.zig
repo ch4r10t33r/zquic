@@ -52,7 +52,8 @@ pub const NewToken = struct {
     pub fn parse(buf: []const u8) varint.DecodeError!struct { frame: NewToken, consumed: usize } {
         var r = varint.Reader.init(buf);
         const len = try r.readVarint();
-        const token = try r.readBytes(@intCast(len));
+        const len_usize = try varint.lenToUsize(len);
+        const token = try r.readBytes(len_usize);
         return .{ .frame = .{ .token = token }, .consumed = r.pos };
     }
 };
@@ -180,7 +181,8 @@ pub const ConnectionClose = struct {
         const code = try r.readVarint();
         const ft: u64 = if (!is_app) try r.readVarint() else 0;
         const reason_len = try r.readVarint();
-        const reason = try r.readBytes(@intCast(reason_len));
+        const reason_usize = try varint.lenToUsize(reason_len);
+        const reason = try r.readBytes(reason_usize);
         return .{
             .frame = .{
                 .is_application = is_app,

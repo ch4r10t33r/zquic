@@ -11,7 +11,13 @@ const std = @import("std");
 pub const max_value: u64 = (1 << 62) - 1;
 
 pub const EncodeError = error{ValueTooLarge};
-pub const DecodeError = error{BufferTooShort};
+pub const DecodeError = error{ BufferTooShort, VarintLengthTooLarge };
+
+/// Cast a varint-decoded length to `usize` without silent truncation on small usize targets.
+pub fn lenToUsize(len: u64) DecodeError!usize {
+    if (len > std.math.maxInt(usize)) return error.VarintLengthTooLarge;
+    return @intCast(len);
+}
 
 /// Returns the number of bytes needed to encode `v`.
 pub fn encodedLen(v: u64) u4 {

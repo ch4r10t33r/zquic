@@ -1935,7 +1935,10 @@ pub const Server = struct {
         // Append original_destination_connection_id (id=0x00) when a Retry was
         // accepted — RFC 9000 §7.3 requires it so the client can verify.
         var tp_buf: [512]u8 = undefined;
-        var tp_len = quic_tls_mod.buildClientTransportParams(&tp_buf);
+        var tp_len = quic_tls_mod.buildClientTransportParams(&tp_buf) catch |err| {
+            dbg("io: transport params encode failed: {}\n", .{err});
+            return;
+        };
         if (conn.retry_odcid_len > 0) {
             const odcid = conn.retry_odcid[0..conn.retry_odcid_len];
             // Encode: id=0x00 (1 byte) | length varint (1 byte) | odcid bytes
@@ -4835,7 +4838,7 @@ pub const Client = struct {
             // First send: build the ClientHello and save it for any future rebuild.
             const alpn = clientTlsAlpn(&self.config);
             var quic_tp_buf: [128]u8 = undefined;
-            const quic_tp = buildClientTransportParams(&quic_tp_buf);
+            const quic_tp = try buildClientTransportParams(&quic_tp_buf);
 
             // Choose ClientHello variant based on flags.
             const now_ms: u64 = @intCast(std.time.milliTimestamp());
@@ -6381,8 +6384,8 @@ inline fn readU24(b: []const u8) u32 {
     return (@as(u32, b[0]) << 16) | (@as(u32, b[1]) << 8) | @as(u32, b[2]);
 }
 
-fn buildClientTransportParams(buf: []u8) []const u8 {
-    const n = quic_tls_mod.buildClientTransportParams(buf);
+fn buildClientTransportParams(buf: []u8) (varint.EncodeError || varint.DecodeError)![]const u8 {
+    const n = try quic_tls_mod.buildClientTransportParams(buf);
     return buf[0..n];
 }
 

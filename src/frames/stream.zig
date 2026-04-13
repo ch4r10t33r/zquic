@@ -37,7 +37,8 @@ pub const StreamFrame = struct {
 
         const data: []const u8 = if (has_length) blk: {
             const length = try r.readVarint();
-            break :blk try r.readBytes(@intCast(length));
+            const len_usize = try varint.lenToUsize(length);
+            break :blk try r.readBytes(len_usize);
         } else blk: {
             // Data extends to the end of the packet payload.
             break :blk r.buf[r.pos..];

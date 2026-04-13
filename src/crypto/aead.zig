@@ -191,6 +191,7 @@ pub const CachedAes128Context = struct {
         aes.encrypt(&t, &j);
 
         const ct = dst[0..plaintext.len];
+        // Divisor is the 16-byte GHASH block (non-zero); divCeil only fails if divisor is 0.
         const block_count = (std.math.divCeil(usize, aad.len, Ghash.block_length) catch unreachable) +
             (std.math.divCeil(usize, ct.len, Ghash.block_length) catch unreachable) + 1;
         var mac = Ghash.initForBlockCount(&h, block_count);
@@ -238,6 +239,7 @@ pub const CachedAes128Context = struct {
         std.mem.writeInt(u32, j[nonce_length..][0..4], 1, .big);
         aes.encrypt(&t, &j);
 
+        // Ghash.block_length is 16; divCeil only fails on divisor 0.
         const block_count = (std.math.divCeil(usize, aad.len, Ghash.block_length) catch unreachable) +
             (std.math.divCeil(usize, ct.len, Ghash.block_length) catch unreachable) + 1;
         var mac = Ghash.initForBlockCount(&h, block_count);

@@ -101,7 +101,8 @@ pub fn build(
     dcid: []const u8,
     scid: []const u8,
     supported_versions: []const u32,
-) error{BufferTooSmall}!usize {
+) error{ BufferTooSmall, InvalidCidLength }!usize {
+    if (dcid.len > types.max_cid_len or scid.len > types.max_cid_len) return error.InvalidCidLength;
     const needed = 1 + 4 + 1 + dcid.len + 1 + scid.len + 4 * supported_versions.len;
     if (buf.len < needed) return error.BufferTooSmall;
 
