@@ -9,17 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [v1.4.0] - 2026-04-13
+
 ### Added
 
 - **`transport/path_mtu.zig`:** clamp configured max UDP payload (RFC 9000 §14.1)
   and derive per-connection `app_stream_chunk` for HTTP/0.9 and HTTP/3 sends.
 - **`ServerConfig` / `ClientConfig`:** optional `max_udp_payload`; **`ConnState`**
   fields `max_udp_payload` and `app_stream_chunk`.
+- **`zquic.transport.path_mtu`** export in `root.zig`.
 
 ### Changed
 
 - **`stream_manager.zig`:** explicit stream state transitions; **`onRecvReset`**
   and **`StreamManager.onResetStreamFrame`** for RESET_STREAM final-size rules.
+
+### Fixed
+
+- **HTTP/3 (`io.zig`):** use a comptime-sized buffer for DATA frame encoding so
+  **ReleaseSafe** builds succeed (`conn.app_stream_chunk` is runtime-sized).
+
+### Documentation
+
+- README: configurable path MTU via `max_udp_payload`; DPLPMTUD probing still out
+  of scope.
 
 ---
 
@@ -190,7 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.4.0...HEAD
+[v1.4.0]: https://github.com/ch4r10t33r/zquic/compare/v1.3.0...v1.4.0
 [v1.3.0]: https://github.com/ch4r10t33r/zquic/compare/v1.2.2...v1.3.0
 [v1.2.2]: https://github.com/ch4r10t33r/zquic/compare/v1.2.1...v1.2.2
 [v1.2.1]: https://github.com/ch4r10t33r/zquic/compare/v1.2.0...v1.2.1
