@@ -38,6 +38,8 @@ const congestion = @import("../loss/congestion.zig");
 const recovery = @import("../loss/recovery.zig");
 const build_options = @import("build_options");
 const batch_io = @import("batch_io.zig");
+const path_mtu_mod = @import("path_mtu.zig");
+const default_conn_path_mtu = path_mtu_mod.initFromConfig(null);
 
 /// Compile-time-eliminated debug logger. With `-Dverbose=true` prints to stderr;
 /// in production builds all calls are removed by the optimizer with zero overhead.
@@ -98,20 +100,8 @@ pub const MAX_DATAGRAM_SIZE: usize = types.max_datagram_size;
 /// FIN retransmit attempts before giving up (~3 s at 200 ms intervals).
 const MAX_FIN_RETRANSMITS: usize = 15;
 
-/// Maximum file-data bytes in a single HTTP/0.9 STREAM frame.
-/// The UDP payload must fit within 1472 bytes (1500 MTU − 20 IP − 8 UDP).
-/// 1350 data + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag ≈ 1387, well within 1472.
-const H09_CHUNK: usize = 1350;
-
-/// Maximum file-data bytes in a single HTTP/3 DATA frame.
-/// 1350 data + 3 H3 overhead + ~11 STREAM header + ~10 1-RTT header + 16 AEAD tag ≈ 1390, within 1472.
-const H3_CHUNK: usize = 1350;
-
 /// H3 DATA frame overhead: 1 byte type (0x00) + 2 byte varint length.
 const H3_DATA_OVERHEAD: usize = 3;
-
-/// Total QUIC stream bytes per H3 DATA frame (payload + framing overhead).
-const H3_CHUNK_WIRE: usize = H3_CHUNK + H3_DATA_OVERHEAD;
 
 /// MSG_DONTWAIT flag for non-blocking recvfrom().
 /// std.posix.MSG is void on some platforms (macOS/Zig 0.14), so use raw values.
@@ -771,6 +761,11 @@ pub const ConnState = struct {
     // Peer UDP address
     peer: std.net.Address,
 
+    /// Clamped UDP payload limit for this path (RFC 9000 §14). Drives `app_stream_chunk`.
+    max_udp_payload: u16 = default_conn_path_mtu.max_udp_payload,
+    /// Largest HTTP/0.9 or HTTP/3 file read per STREAM frame (from `max_udp_payload`).
+    app_stream_chunk: usize = default_conn_path_mtu.app_stream_chunk,
+
     // Initial packet keys (derived from DCID)
     init_keys: ?InitialSecrets = null,
 
@@ -1078,6 +1073,8 @@ pub const ServerConfig = struct {
     /// Deliver incoming STREAM frames to `RawAppStreamSlot` buffers instead of
     /// parsing HTTP/0.9 or HTTP/3. Typically combined with `alpn`.
     raw_application_streams: bool = false,
+    /// Maximum UDP payload (bytes) for path sizing (RFC 9000 §14.1). When null, uses ~Ethernet MTU.
+    max_udp_payload: ?u16 = null,
 };
 
 /// TLS ALPN value for `ServerConfig` (custom string wins over HTTP flags).
@@ -1537,6 +1534,9 @@ pub const Server = struct {
                     .next_local_bidi_stream_id = 1,
                 };
                 const conn = &(slot.*.?);
+                const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
+                conn.max_udp_payload = pm.max_udp_payload;
+                conn.app_stream_chunk = pm.app_stream_chunk;
                 if (self.config.cubic) {
                     conn.cc = congestion.CongestionController.init(.cubic);
                 }
@@ -2558,7 +2558,8 @@ pub const Server = struct {
             // of data so the retransmission always starts before the gap.
             // The client writes at explicit sf.offset so duplicate retransmits
             // are idempotent (seekTo + writeAll overwrites the same bytes).
-            const REWIND_BYTES: u64 = 200 * H09_CHUNK;
+            const REWIND_BYTES: u64 = 200 * @as(u64, @intCast(conn.app_stream_chunk));
+            const chunk = conn.app_stream_chunk;
             for (&conn.http09_slots) |*slot| {
                 if (slot.active) {
                     // Active slot: rewind to re-send data that went to the dead port.
@@ -2576,8 +2577,8 @@ pub const Server = struct {
                     // reached the client on the old path.  Reopen the file and
                     // re-activate so flushPendingHttp09Responses re-sends everything.
                     const fp = slot.file_path[0..slot.file_path_len];
-                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / H09_CHUNK)
-                        (slot.fin_pkt_pn - REWIND_BYTES / H09_CHUNK) * H09_CHUNK
+                    const rewind_to: u64 = if (slot.fin_pkt_pn > REWIND_BYTES / chunk)
+                        (slot.fin_pkt_pn - REWIND_BYTES / chunk) * chunk
                     else
                         0;
                     if (std.fs.openFileAbsolute(fp, .{})) |f| {
@@ -2723,16 +2724,17 @@ pub const Server = struct {
                         }
                         // HTTP/3 slots: stream_offset is the QUIC stream offset.
                         // Derive file offset from QUIC stream offset and DATA frame
-                        // overhead: each H3_CHUNK-byte chunk is wrapped in a 3-byte
+                        // overhead: each `app_stream_chunk` bytes of file data is wrapped in a 3-byte
                         // DATA frame header (type 0x00 + 2-byte varint length).
                         for (&conn.http3_slots) |*slot| {
                             if (slot.stream_id != lp.stream_id) continue;
                             if (lp.stream_offset < slot.stream_offset) {
                                 const data_bytes = lp.stream_offset -| slot.stream_offset_base;
-                                // Each full chunk contributes H3_CHUNK_WIRE QUIC stream bytes.
-                                const full_chunks = data_bytes / H3_CHUNK_WIRE;
-                                const partial_quic = data_bytes % H3_CHUNK_WIRE;
-                                const file_pos = full_chunks * H3_CHUNK + if (partial_quic > H3_DATA_OVERHEAD) partial_quic - H3_DATA_OVERHEAD else 0;
+                                const h3_chunk_wire = conn.app_stream_chunk + H3_DATA_OVERHEAD;
+                                // Each full chunk contributes (app_stream_chunk + H3 overhead) QUIC stream bytes.
+                                const full_chunks = data_bytes / h3_chunk_wire;
+                                const partial_quic = data_bytes % h3_chunk_wire;
+                                const file_pos = full_chunks * conn.app_stream_chunk + if (partial_quic > H3_DATA_OVERHEAD) partial_quic - H3_DATA_OVERHEAD else 0;
                                 if (slot.active) {
                                     slot.stream_offset = lp.stream_offset;
                                     slot.file_offset = file_pos;
@@ -3048,8 +3050,9 @@ pub const Server = struct {
 
     /// Send the next STREAM chunk for one queued HTTP/0.9 response.
     fn http09SendNextChunk(self: *Server, conn: *ConnState, slot: *Http09OutSlot) void {
-        var file_buf: [H09_CHUNK]u8 = undefined;
-        const n = slot.file.read(&file_buf) catch |err| {
+        var file_buf: [path_mtu_mod.max_app_stream_chunk_cap]u8 = undefined;
+        const to_read = @min(conn.app_stream_chunk, file_buf.len);
+        const n = slot.file.read(file_buf[0..to_read]) catch |err| {
             dbg("io: http09 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             if (conn.http09_active_count > 0) conn.http09_active_count -= 1;
             slot.close();
@@ -4028,12 +4031,10 @@ pub const Server = struct {
 
     /// Send the next HTTP/3 DATA-frame chunk for one queued response slot.
     fn http3SendNextChunk(self: *Server, conn: *ConnState, slot: *Http3OutSlot) void {
-        // Wrap up to H3_CHUNK bytes of file content in an HTTP/3 DATA frame.
-        // DATA frame overhead is 2-3 bytes (type=0x00 + varint length),
-        // so the total STREAM payload fits well within one 1500-byte UDP datagram.
-        const CHUNK = H3_CHUNK;
-        var file_buf: [CHUNK]u8 = undefined;
-        const n = slot.file.read(&file_buf) catch |err| {
+        // Wrap file content in an HTTP/3 DATA frame (type=0x00 + varint length + payload).
+        const CHUNK = @min(conn.app_stream_chunk, path_mtu_mod.max_app_stream_chunk_cap);
+        var file_buf: [path_mtu_mod.max_app_stream_chunk_cap]u8 = undefined;
+        const n = slot.file.read(file_buf[0..CHUNK]) catch |err| {
             dbg("io: http3 stream_id={} read error: {}\n", .{ slot.stream_id, err });
             if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.close();
@@ -4219,6 +4220,8 @@ pub const ClientConfig = struct {
     alpn: ?[]const u8 = null,
     /// Buffer server→client STREAM data as opaque bytes (no HTTP parsing).
     raw_application_streams: bool = false,
+    /// Maximum UDP payload (bytes) for path sizing (RFC 9000 §14.1). When null, uses ~Ethernet MTU.
+    max_udp_payload: ?u16 = null,
 };
 
 /// TLS ALPN value for `ClientConfig`.
@@ -4391,6 +4394,9 @@ pub const Client = struct {
         if (config.cubic) {
             conn.cc = congestion.CongestionController.init(.cubic);
         }
+        const pm = path_mtu_mod.initFromConfig(config.max_udp_payload);
+        conn.max_udp_payload = pm.max_udp_payload;
+        conn.app_stream_chunk = pm.app_stream_chunk;
         conn.init_keys = InitialSecrets.derive(dcid.slice());
         if (config.v2) {
             // Pre-derive v2 keys so processInitialPacket can detect and handle
@@ -4444,6 +4450,9 @@ pub const Client = struct {
         if (config.cubic) {
             conn.cc = congestion.CongestionController.init(.cubic);
         }
+        const pm = path_mtu_mod.initFromConfig(config.max_udp_payload);
+        conn.max_udp_payload = pm.max_udp_payload;
+        conn.app_stream_chunk = pm.app_stream_chunk;
         conn.init_keys = InitialSecrets.derive(dcid.slice());
         if (config.v2) {
             conn.v2_upgrade_keys = InitialSecrets.deriveV2(dcid.slice());
@@ -4642,6 +4651,9 @@ pub const Client = struct {
         if (self.config.cubic) {
             self.conn.cc = congestion.CongestionController.init(.cubic);
         }
+        const pm = path_mtu_mod.initFromConfig(self.config.max_udp_payload);
+        self.conn.max_udp_payload = pm.max_udp_payload;
+        self.conn.app_stream_chunk = pm.app_stream_chunk;
         self.conn.init_keys = InitialSecrets.derive(dcid.slice());
 
         // Fresh TLS handshake state.

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`transport/path_mtu.zig`:** clamp configured max UDP payload (RFC 9000 §14.1)
+  and derive per-connection `app_stream_chunk` for HTTP/0.9 and HTTP/3 sends.
+- **`ServerConfig` / `ClientConfig`:** optional `max_udp_payload`; **`ConnState`**
+  fields `max_udp_payload` and `app_stream_chunk`.
+
+### Changed
+
+- **`stream_manager.zig`:** explicit stream state transitions; **`onRecvReset`**
+  and **`StreamManager.onResetStreamFrame`** for RESET_STREAM final-size rules.
+
 ---
 
 ## [v1.3.0] - 2026-04-14

@@ -7,6 +7,7 @@
 //! Each stream has a state machine:
 //!   Idle → Open → Half-Closed (local) → Closed
 //!             └─→ Half-Closed (remote) ┘
+//!             └─→ Reset (sent/received)
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -28,6 +29,8 @@ pub const StreamState = enum {
     reset_received,
 };
 
+pub const StreamStateError = error{InvalidStreamState};
+
 /// A single QUIC stream.
 pub const Stream = struct {
     id: StreamId,
@@ -45,9 +48,9 @@ pub const Stream = struct {
     send_offset: u64 = 0,
     /// True if the local side sent FIN.
     fin_sent: bool = false,
-    /// True if the remote side sent FIN.
+    /// True if the remote side sent FIN or final size is known from RESET.
     fin_received: bool = false,
-    /// Final size (if fin_received).
+    /// Final size (RFC 9000 §19.4): agreed cumulative byte count for the stream.
     fin_size: u64 = 0,
 
     pub fn init(id: StreamId, send_max: u64, recv_max: u64) Stream {
@@ -57,9 +60,37 @@ pub const Stream = struct {
         };
     }
 
+    pub fn transitionAllowed(from: StreamState, to: StreamState) bool {
+        if (from == to) return true;
+        return switch (from) {
+            .idle => to == .open,
+            .open => switch (to) {
+                .half_closed_local, .half_closed_remote, .closed, .reset_sent, .reset_received => true,
+                else => false,
+            },
+            .half_closed_local => switch (to) {
+                .closed, .reset_received => true,
+                else => false,
+            },
+            .half_closed_remote => switch (to) {
+                .closed, .reset_received => true,
+                else => false,
+            },
+            .closed, .reset_sent, .reset_received => false,
+        };
+    }
+
+    fn setState(self: *Stream, next: StreamState) StreamStateError!void {
+        if (!transitionAllowed(self.state, next)) return error.InvalidStreamState;
+        self.state = next;
+    }
+
     /// Write `data` into the receive buffer. Returns false on flow control
-    /// violation or out-of-order data that doesn't fit in the buffer.
+    /// violation, invalid state, or out-of-order data that doesn't fit in the buffer.
     pub fn onRecvData(self: *Stream, offset: u64, data: []const u8, fin: bool) bool {
+        if (self.state == .closed or self.state == .reset_received or self.state == .reset_sent)
+            return false;
+
         if (!self.fc.onReceive(offset, data.len)) return false;
 
         // Accept only in-order data for simplicity.
@@ -77,12 +108,24 @@ pub const Stream = struct {
             if (self.fin_received and new_fin_size != self.fin_size) return false;
             self.fin_received = true;
             self.fin_size = new_fin_size;
-            if (self.state == .half_closed_local) {
-                self.state = .closed;
-            } else {
-                self.state = .half_closed_remote;
-            }
+            const next: StreamState = if (self.state == .half_closed_local) .closed else .half_closed_remote;
+            self.setState(next) catch return false;
         }
+        return true;
+    }
+
+    /// Remote RESET_STREAM (RFC 9000 §19.4). `final_size` must match any prior FIN.
+    pub fn onRecvReset(self: *Stream, final_size: u64) bool {
+        if (self.state == .closed) {
+            return final_size == self.fin_size;
+        }
+        if (self.state == .reset_received) {
+            return final_size == self.fin_size;
+        }
+        if (self.fin_received and final_size != self.fin_size) return false;
+        self.fin_received = true;
+        self.fin_size = final_size;
+        self.setState(.reset_received) catch return false;
         return true;
     }
 
@@ -102,13 +145,11 @@ pub const Stream = struct {
 
     /// Mark local side as finished (FIN will be sent in next STREAM frame).
     pub fn closeLocal(self: *Stream) void {
-        if (self.state == .closed or self.state == .reset_sent) return;
+        if (self.state == .closed or self.state == .reset_sent or self.state == .reset_received)
+            return;
         self.fin_sent = true;
-        if (self.state == .half_closed_remote) {
-            self.state = .closed;
-        } else {
-            self.state = .half_closed_local;
-        }
+        const next: StreamState = if (self.state == .half_closed_remote) .closed else .half_closed_local;
+        self.setState(next) catch return;
     }
 };
 
@@ -191,6 +232,18 @@ pub const StreamManager = struct {
         }
         return false;
     }
+
+    /// Process an incoming RESET_STREAM frame (RFC 9000 §19.4).
+    pub fn onResetStreamFrame(self: *StreamManager, f: frames.ResetStream) bool {
+        const sid = StreamId.init(@intCast(f.stream_id));
+        if (self.findStream(sid)) |s| {
+            return s.onRecvReset(f.final_size);
+        }
+        if (self.allocStream(sid)) |s| {
+            return s.onRecvReset(f.final_size);
+        }
+        return false;
+    }
 };
 
 test "stream: basic read/write" {
@@ -206,6 +259,45 @@ test "stream: basic read/write" {
     const n = s.read(&out);
     try testing.expectEqualSlices(u8, "hello world", out[0..n]);
     try testing.expect(s.fin_received);
+}
+
+test "stream: FIN final size mismatch" {
+    const testing = std.testing;
+    const sid = StreamId.init(0);
+    var s = Stream.init(sid, 100_000, 100_000);
+    s.state = .open;
+    try testing.expect(s.onRecvData(0, "ab", true));
+    try testing.expect(!s.onRecvData(0, "abc", true));
+}
+
+test "stream: RESET matches FIN final size" {
+    const testing = std.testing;
+    const sid = StreamId.init(0);
+    var s = Stream.init(sid, 100_000, 100_000);
+    s.state = .open;
+    try testing.expect(s.onRecvData(0, "x", true));
+    try testing.expect(s.onRecvReset(1));
+    try testing.expect(s.state == .reset_received);
+}
+
+test "stream: RESET conflicts with FIN size" {
+    const testing = std.testing;
+    const sid = StreamId.init(0);
+    var s = Stream.init(sid, 100_000, 100_000);
+    s.state = .open;
+    try testing.expect(s.onRecvData(0, "x", true));
+    try testing.expect(!s.onRecvReset(99));
+}
+
+test "stream: closeLocal transitions" {
+    const testing = std.testing;
+    const sid = StreamId.init(0);
+    var s = Stream.init(sid, 100_000, 100_000);
+    s.state = .open;
+    s.closeLocal();
+    try testing.expect(s.state == .half_closed_local);
+    try testing.expect(s.onRecvData(0, "a", true));
+    try testing.expect(s.state == .closed);
 }
 
 test "stream_manager: open and find streams" {
@@ -242,6 +334,20 @@ test "stream_manager: process stream frame" {
     var buf: [8]u8 = undefined;
     const n = s.?.read(&buf);
     try testing.expectEqualSlices(u8, "ping", buf[0..n]);
+}
+
+test "stream_manager: RESET_STREAM frame" {
+    const testing = std.testing;
+    var mgr = StreamManager.init(.server);
+    const rs = frames.ResetStream{
+        .stream_id = 4,
+        .application_protocol_error_code = 0x100,
+        .final_size = 0,
+    };
+    try testing.expect(mgr.onResetStreamFrame(rs));
+    const s = mgr.findStream(StreamId.init(4));
+    try testing.expect(s != null);
+    try testing.expect(s.?.state == .reset_received);
 }
 
 test "flow_control: stream flow control violation" {
