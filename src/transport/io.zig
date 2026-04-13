@@ -901,8 +901,13 @@ pub const ConnState = struct {
     // exceed these limits trigger a STREAM_LIMIT_ERROR (0x4).
     // max_streams_*_recv is updated when we send MAX_STREAMS frames.
     // peer_*_stream_count tracks the highest stream number used so far.
+    //
+    // peer_max_*_streams: how many **locally initiated** streams of each type
+    // the peer allows us to open (initial transport params + MAX_STREAMS frames).
     max_streams_bidi_recv: u64 = 100,
     max_streams_uni_recv: u64 = 100,
+    peer_max_bidi_streams: u64 = 100,
+    peer_max_uni_streams: u64 = 100,
     peer_bidi_stream_count: u64 = 0,
     peer_uni_stream_count: u64 = 0,
     /// Next locally opened uni stream ID (RFC 9000 §2.1). Initialized to 3 on the
@@ -2783,9 +2788,15 @@ pub const Server = struct {
                 continue;
             }
             if (ft == 0x12 or ft == 0x13) {
-                // MAX_STREAMS — ignore for now (we don't enforce stream limits).
+                // MAX_STREAMS — peer raises how many streams we may open (RFC 9000 §19.11).
                 const v = varint.decode(frames[pos..]) catch return;
                 pos += v.len;
+                if (ft == 0x12) {
+                    conn.peer_max_bidi_streams = v.value;
+                } else {
+                    conn.peer_max_uni_streams = v.value;
+                }
+                dbg("io: MAX_STREAMS {} maximum_streams={}\n", .{ ft, v.value });
                 continue;
             }
             if (ft == 0x14) {
@@ -4221,19 +4232,39 @@ fn freeConnStateRawAppBuffers(conn: *ConnState, allocator: std.mem.Allocator) vo
     }
 }
 
+/// Opening a stream beyond the peer's limit (RFC 9000 §4.6).
+pub const OpenLocalStreamError = error{StreamLimitExceeded};
+
 /// Allocate the next locally initiated **unidirectional** stream ID (RFC 9000 §2.1).
 /// Do not mix with HTTP/0.9 or HTTP/3 stream usage on the same connection.
-pub fn rawAllocateNextLocalUniStream(conn: *ConnState) u64 {
+pub fn rawAllocateNextLocalUniStream(conn: *ConnState) OpenLocalStreamError!u64 {
+    if (localUniStreamsOpened(conn) >= conn.peer_max_uni_streams) return error.StreamLimitExceeded;
     const id = conn.next_local_uni_stream_id;
     conn.next_local_uni_stream_id += 4;
     return id;
 }
 
 /// Allocate the next locally initiated **bidirectional** stream ID.
-pub fn rawAllocateNextLocalBidiStream(conn: *ConnState) u64 {
+pub fn rawAllocateNextLocalBidiStream(conn: *ConnState) OpenLocalStreamError!u64 {
+    if (localBidiStreamsOpened(conn) >= conn.peer_max_bidi_streams) return error.StreamLimitExceeded;
     const id = conn.next_local_bidi_stream_id;
     conn.next_local_bidi_stream_id += 4;
     return id;
+}
+
+/// Count of locally initiated bidirectional streams already opened (next ID not yet consumed).
+fn localBidiStreamsOpened(conn: *const ConnState) u64 {
+    const n = conn.next_local_bidi_stream_id;
+    if ((n & 3) == 0) return n / 4; // client-initiated bidi: 0, 4, 8, …
+    if ((n & 3) == 1) return (n - 1) / 4; // server-initiated bidi: 1, 5, 9, …
+    return 0;
+}
+
+fn localUniStreamsOpened(conn: *const ConnState) u64 {
+    const n = conn.next_local_uni_stream_id;
+    if ((n & 3) == 2) return if (n >= 2) (n - 2) / 4 else 0; // client uni: 2, 6, 10, …
+    if ((n & 3) == 3) return if (n >= 3) (n - 3) / 4 else 0; // server uni: 3, 7, 11, …
+    return 0;
 }
 
 /// Opaque receive buffer for an inbound raw-application stream on a **server** `ConnState`.
@@ -5458,9 +5489,14 @@ pub const Client = struct {
                 continue;
             }
             if (ft == 0x12 or ft == 0x13) {
-                // MAX_STREAMS — ignore.
                 const v = varint.decode(plaintext[pos..pt_len]) catch return;
                 pos += v.len;
+                if (ft == 0x12) {
+                    self.conn.peer_max_bidi_streams = v.value;
+                } else {
+                    self.conn.peer_max_uni_streams = v.value;
+                }
+                dbg("io: client MAX_STREAMS {} maximum_streams={}\n", .{ ft, v.value });
                 continue;
             }
             if (ft == 0x14 or ft == 0x15) {
