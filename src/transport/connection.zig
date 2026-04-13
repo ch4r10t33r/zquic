@@ -163,6 +163,7 @@ pub const Connection = struct {
 
     /// Retry token received from server (client-side only).
     /// Used in the client's retry-response Initial packet.
+    /// One opaque token; 256 is a conservative max byte length (RFC 9000 does not cap it).
     retry_token: ?[256]u8 = null,
     retry_token_len: usize = 0,
 
@@ -268,8 +269,9 @@ pub const Connection = struct {
 
     /// Handle a received Version Negotiation packet (client-side only).
     ///
-    /// Returns the list of server-supported versions so the caller can decide
-    /// whether to retry with a different version or close.
+    /// Parses the server's supported versions and fails if QUIC v1 is not listed.
+    /// The full client stack also performs compatible version negotiation when
+    /// upgrading to QUIC v2 (see `io.zig`: server Initial handling and v2 key promotion).
     ///
     /// Returns error.WrongRole for server connections.
     /// Returns error.NoCommonVersion if QUIC v1 is absent from the list.
@@ -282,10 +284,6 @@ pub const Connection = struct {
         var it = pkt.versions();
         while (it.next()) |v| {
             if (v == version_neg.QUIC_V1) {
-                // We already support this version; the server should be able to
-                // handle our packets.  In a real implementation the client would
-                // retry the connection with this version.  For now we just
-                // acknowledge that v1 is supported.
                 return;
             }
         }

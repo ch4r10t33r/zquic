@@ -4,6 +4,12 @@
 //! connections keyed by destination connection ID. New incoming packets
 //! are dispatched to the appropriate connection or trigger creation of a
 //! new server-side connection.
+//!
+//! **Interop / demo only:** this type uses a small fixed-size connection
+//! table (see `max_connections`) so the struct stays stack-friendly.
+//! Production integrations should use the embedder API (`initFromSocket` /
+//! `feedPacket` in `io.zig`) and manage connection tables on the heap with
+//! whatever capacity and eviction policy they need.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -15,8 +21,8 @@ const varint = @import("../varint.zig");
 pub const ConnectionId = types.ConnectionId;
 pub const Connection = connection.Connection;
 
-/// Maximum number of concurrent connections per endpoint (kept small to avoid
-/// large stack frames; production code should use heap-allocated connection maps).
+/// Maximum concurrent connections for this demo endpoint (fixed array → predictable
+/// stack size). Not a protocol limit. Embedders using `io.zig` manage their own maps.
 pub const max_connections = 8;
 
 /// The result of processing a received datagram.
@@ -99,8 +105,7 @@ pub const Endpoint = struct {
 
             // Server: create new connection on Initial packet
             if (self.role == .server and lh.header.packet_type == .initial) {
-                var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-                const local_cid = ConnectionId.random(prng.random(), 8);
+                const local_cid = ConnectionId.random(std.crypto.random, 8);
                 var new_conn = Connection.init(.server, local_cid, dcid);
                 new_conn.deriveInitialKeys(dcid);
                 _ = self.addConnection(new_conn) catch return .discarded;

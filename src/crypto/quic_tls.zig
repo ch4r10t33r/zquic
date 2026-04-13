@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const keys = @import("keys.zig");
+const varint = @import("../varint.zig");
 
 /// Maximum bytes we buffer for a single crypto level's send queue.
 pub const send_buf_len = 4096;
@@ -122,14 +123,14 @@ pub fn buildClientTransportParams(out: []u8) usize {
             var w_pos = p;
             // ID varint
             var id_buf: [8]u8 = undefined;
-            const id_enc = encodeVarintLocal(&id_buf, id);
+            const id_enc = varint.encode(&id_buf, id) catch unreachable;
             @memcpy(buf[w_pos .. w_pos + id_enc.len], id_enc);
             w_pos += id_enc.len;
             // Value varint (in a varint-length field)
             var val_buf: [8]u8 = undefined;
-            const val_enc = encodeVarintLocal(&val_buf, val);
+            const val_enc = varint.encode(&val_buf, val) catch unreachable;
             var len_buf: [8]u8 = undefined;
-            const len_enc = encodeVarintLocal(&len_buf, val_enc.len);
+            const len_enc = varint.encode(&len_buf, val_enc.len) catch unreachable;
             @memcpy(buf[w_pos .. w_pos + len_enc.len], len_enc);
             w_pos += len_enc.len;
             @memcpy(buf[w_pos .. w_pos + val_enc.len], val_enc);
@@ -146,25 +147,6 @@ pub fn buildClientTransportParams(out: []u8) usize {
     pos = write_param(out, pos, 0x08, 100); // initial_max_streams_bidi
     pos = write_param(out, pos, 0x09, 100); // initial_max_streams_uni
     return pos;
-}
-
-fn encodeVarintLocal(buf: []u8, v: u64) []const u8 {
-    if (v < 64) {
-        buf[0] = @intCast(v);
-        return buf[0..1];
-    } else if (v < 16384) {
-        const w: u16 = @intCast(v | (0b01 << 14));
-        std.mem.writeInt(u16, buf[0..2], w, .big);
-        return buf[0..2];
-    } else if (v < 1073741824) {
-        const w: u32 = @intCast(v | (@as(u64, 0b10) << 30));
-        std.mem.writeInt(u32, buf[0..4], w, .big);
-        return buf[0..4];
-    } else {
-        const w: u64 = v | (@as(u64, 0b11) << 62);
-        std.mem.writeInt(u64, buf[0..8], w, .big);
-        return buf[0..8];
-    }
 }
 
 /// Tracks CRYPTO stream offsets per encryption level for reassembly.

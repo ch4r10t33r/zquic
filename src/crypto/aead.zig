@@ -152,6 +152,11 @@ pub const HeaderProtection = struct {
 /// Caches the AES key schedule so that `initEnc()` (10-round key expansion)
 /// is performed once at key derivation time rather than on every packet.
 /// On ARM this saves ~40 AES operations per encrypt/decrypt call.
+///
+/// AES-128-GCM is implemented by composing the standard library AES block cipher,
+/// CTR mode, and GHASH — not by calling `Aes128Gcm` directly — so the expanded
+/// key can be reused. That trades a larger audit surface for fewer per-packet
+/// key schedules; the primitives are the usual `std.crypto` building blocks.
 pub const CachedAes128Context = struct {
     const AesEncCtx = @TypeOf(Aes128.initEnc([_]u8{0} ** 16));
     const tag_length = 16;

@@ -58,6 +58,12 @@ All 13/13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-run
 | `ecn` | ✅ |
 | `rebind-port` | ✅ |
 
+## Implementation notes
+
+- **Version negotiation:** Incoming Version Negotiation packets are handled in `Connection.handleVersionNegotiation` (client must see QUIC v1 in the list). Compatible upgrade to QUIC v2 is implemented in the transport I/O layer when the server’s Initial uses v2 (see `io.zig` and `connection.zig` tests).
+- **Demo `Endpoint` (`src/transport/endpoint.zig`):** `max_connections` is a small fixed array so the struct stays stack-friendly for samples and tests. Integrations that drive the stack via `io.zig` (`initFromSocket`, `feedPacket`, etc.) keep connections in their own maps.
+- **Random bytes:** Connection IDs, stateless reset tokens, and path challenge data use the OS-backed CSPRNG (`std.crypto.random`), not time-seeded PRNGs.
+
 ## Performance
 
 Loopback throughput benchmark on Apple Silicon (M-series Mac), comparing zquic
