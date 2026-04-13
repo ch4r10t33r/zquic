@@ -63,6 +63,7 @@ All 13/13 [quic-interop-runner](https://github.com/quic-interop/quic-interop-run
 - **Version negotiation:** Incoming Version Negotiation packets are handled in `Connection.handleVersionNegotiation` (client must see QUIC v1 in the list). Compatible upgrade to QUIC v2 is implemented in the transport I/O layer when the server’s Initial uses v2 (see `io.zig` and `connection.zig` tests).
 - **Demo `Endpoint` (`src/transport/endpoint.zig`):** `max_connections` is a small fixed array so the struct stays stack-friendly for samples and tests. Integrations that drive the stack via `io.zig` (`initFromSocket`, `feedPacket`, etc.) keep connections in their own maps.
 - **Random bytes:** Connection IDs, stateless reset tokens, and path challenge data use the OS-backed CSPRNG (`std.crypto.random`), not time-seeded PRNGs.
+- **Path MTU discovery (RFC 9000 §14):** not implemented. Datagrams use a fixed ~1500-byte UDP payload budget; paths with a lower MTU may need tuning.
 
 ## Performance
 
@@ -286,7 +287,7 @@ embedders that drive their own framing on top of QUIC streams.
 
 ### Opening streams and sending data (non-HTTP)
 
-- `rawAllocateNextLocalUniStream` / `rawAllocateNextLocalBidiStream` on `ConnState` — RFC 9000 §2.1 local stream IDs (do not mix with HTTP streams on the same connection).
+- `try rawAllocateNextLocalUniStream` / `try rawAllocateNextLocalBidiStream` on `ConnState` — RFC 9000 §2.1 local stream IDs; returns `error.StreamLimitExceeded` if the peer’s `MAX_STREAMS` / transport-parameter budget is exhausted (do not mix with HTTP streams on the same connection).
 - `Server.sendRawStreamData(server, conn, stream_id, offset, data, fin)` and `Client.sendRawStreamData(...)` — send one STREAM frame on 1-RTT; the embedder tracks per-stream offsets.
 
 Dependents import the package module `zquic` from `build.zig.zon`; it imports vendored `tls` as `tls`.

@@ -72,8 +72,11 @@ pub const Stream = struct {
         }
 
         if (fin) {
+            const new_fin_size = offset + data.len;
+            // RFC 9000 §3.5 / §19.4: final size must match across STREAM and RESET_STREAM.
+            if (self.fin_received and new_fin_size != self.fin_size) return false;
             self.fin_received = true;
-            self.fin_size = offset + data.len;
+            self.fin_size = new_fin_size;
             if (self.state == .half_closed_local) {
                 self.state = .closed;
             } else {
@@ -99,6 +102,7 @@ pub const Stream = struct {
 
     /// Mark local side as finished (FIN will be sent in next STREAM frame).
     pub fn closeLocal(self: *Stream) void {
+        if (self.state == .closed or self.state == .reset_sent) return;
         self.fin_sent = true;
         if (self.state == .half_closed_remote) {
             self.state = .closed;
