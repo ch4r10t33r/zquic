@@ -4097,8 +4097,8 @@ pub const Server = struct {
             return;
         }
 
-        // Wrap the chunk in an HTTP/3 DATA frame.
-        var data_out: [CHUNK + 16]u8 = undefined;
+        // Wrap the chunk in an HTTP/3 DATA frame (buffer size is comptime; payload ≤ max_app_stream_chunk_cap).
+        var data_out: [path_mtu_mod.max_app_stream_chunk_cap + 32]u8 = undefined;
         const data_frame_len = h3_frame.writeFrame(&data_out, @intFromEnum(h3_frame.FrameType.data), file_buf[0..n]) catch {
             if (conn.http3_active_count > 0) conn.http3_active_count -= 1;
             slot.close();
