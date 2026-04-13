@@ -1521,8 +1521,7 @@ pub const Server = struct {
     fn newConn(self: *Server, dcid: ConnectionId, scid: ConnectionId, peer: std.net.Address, is_v2: bool) ?*ConnState {
         for (&self.conns) |*slot| {
             if (slot.* == null) {
-                var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-                const local_cid = ConnectionId.random(prng.random(), 8);
+                const local_cid = ConnectionId.random(std.crypto.random, 8);
                 slot.* = ConnState{
                     .local_cid = local_cid,
                     .remote_cid = scid,
@@ -2347,8 +2346,7 @@ pub const Server = struct {
         // NEW_CONNECTION_ID frame (RFC 9000 §19.15) — give the client an
         // alternative CID to use when it migrates (--migrate mode only).
         if (self.config.migrate) {
-            var prng2 = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ 0xdeadbeef));
-            const new_cid = ConnectionId.random(prng2.random(), 8);
+            const new_cid = ConnectionId.random(std.crypto.random, 8);
             conn.alt_local_cid = new_cid;
             if (fp + 28 <= frames_buf.len) {
                 frames_buf[fp] = 0x18;
@@ -2364,8 +2362,7 @@ pub const Server = struct {
                 // Generate a random stateless reset token (RFC 9000 §10.3) once
                 // per connection and include it with the NEW_CONNECTION_ID frame.
                 if (!conn.stateless_reset_token_set) {
-                    var prng3 = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ @as(i64, @intCast(new_cid.slice()[0]))));
-                    prng3.random().bytes(&conn.stateless_reset_token);
+                    std.crypto.random.bytes(&conn.stateless_reset_token);
                     conn.stateless_reset_token_set = true;
                 }
                 @memcpy(frames_buf[fp .. fp + 16], &conn.stateless_reset_token);
@@ -2535,8 +2532,7 @@ pub const Server = struct {
         // rebind, causing a download stall and eventual 60 s timeout.
         if (!addressEqual(conn.peer, src)) {
             var challenge: [8]u8 = undefined;
-            var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-            prng.random().bytes(&challenge);
+            std.crypto.random.bytes(&challenge);
             // Overwrite any pending challenge — a fresh one is needed for the new path.
             conn.path_challenge_data = challenge;
             // Eagerly update peer so all subsequent sends reach the new address.
@@ -3296,8 +3292,7 @@ pub const Server = struct {
 
     /// Send a NEW_CONNECTION_ID frame offering a fresh alternative CID to the peer.
     fn sendNewConnectionId(self: *Server, conn: *ConnState, seq: u64, dst: std.net.Address) void {
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp() ^ @as(i64, @bitCast(seq))));
-        const new_cid = ConnectionId.random(prng.random(), 8);
+        const new_cid = ConnectionId.random(std.crypto.random, 8);
         conn.alt_local_cid = new_cid;
         conn.alt_local_cid_seq = seq;
         var buf: [32]u8 = undefined;
@@ -3313,8 +3308,7 @@ pub const Server = struct {
         @memcpy(buf[pos .. pos + 8], new_cid.slice());
         pos += 8;
         if (!conn.stateless_reset_token_set) {
-            var prng2 = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-            prng2.random().bytes(&conn.stateless_reset_token);
+            std.crypto.random.bytes(&conn.stateless_reset_token);
             conn.stateless_reset_token_set = true;
         }
         @memcpy(buf[pos .. pos + 16], &conn.stateless_reset_token);
@@ -4341,9 +4335,8 @@ pub const Client = struct {
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(sock);
 
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-        const dcid = ConnectionId.random(prng.random(), 8);
-        const scid = ConnectionId.random(prng.random(), 8);
+        const dcid = ConnectionId.random(std.crypto.random, 8);
+        const scid = ConnectionId.random(std.crypto.random, 8);
 
         const tls_client = ClientHandshake.init();
         var conn = ConnState{
@@ -4398,9 +4391,8 @@ pub const Client = struct {
         std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
         setupEcnSocket(sock);
 
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-        const dcid = ConnectionId.random(prng.random(), 8);
-        const scid = ConnectionId.random(prng.random(), 8);
+        const dcid = ConnectionId.random(std.crypto.random, 8);
+        const scid = ConnectionId.random(std.crypto.random, 8);
 
         const tls_client = ClientHandshake.init();
         var conn = ConnState{
@@ -4592,9 +4584,8 @@ pub const Client = struct {
         std.posix.setsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, sk_opt) catch {};
 
         // New random connection IDs.
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-        const dcid = ConnectionId.random(prng.random(), 8);
-        const scid = ConnectionId.random(prng.random(), 8);
+        const dcid = ConnectionId.random(std.crypto.random, 8);
+        const scid = ConnectionId.random(std.crypto.random, 8);
 
         for (&self.raw_app_recv) |*slot| {
             slot.deinit(self.allocator);

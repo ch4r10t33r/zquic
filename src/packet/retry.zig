@@ -84,10 +84,6 @@ pub fn verifyIntegrityTag(
     odcid: []const u8,
     retry_packet_with_tag: []const u8,
 ) bool {
-    if (retry_packet_with_tag.len < 16) return false;
-    const retry_without_tag = retry_packet_with_tag[0 .. retry_packet_with_tag.len - 16];
-    const received_tag = retry_packet_with_tag[retry_packet_with_tag.len - 16 ..][0..16];
-
     // Extract version from the packet (bytes 1–4 of the long header).
     const version: u32 = if (retry_packet_with_tag.len >= 5)
         (@as(u32, retry_packet_with_tag[1]) << 24) |
@@ -97,9 +93,23 @@ pub fn verifyIntegrityTag(
     else
         0x00000001;
 
+    // Always run tag computation (no early return on short input) so verification
+    // does not short-circuit before the AES-GCM step.
+    const body_len = retry_packet_with_tag.len -| 16;
+    const retry_without_tag = retry_packet_with_tag[0..body_len];
+
+    var received_tag: [16]u8 = [_]u8{0} ** 16;
+    if (retry_packet_with_tag.len >= 16) {
+        @memcpy(&received_tag, retry_packet_with_tag[retry_packet_with_tag.len - 16 ..][0..16]);
+    }
+
     var computed: [16]u8 = undefined;
-    computeIntegrityTagVersion(&computed, odcid, retry_without_tag, version) catch return false;
-    return std.mem.eql(u8, &computed, received_tag);
+    computeIntegrityTagVersion(&computed, odcid, retry_without_tag, version) catch {
+        @memset(&computed, 0);
+    };
+
+    const tags_match = std.crypto.timing_safe.eql([16]u8, computed, received_tag);
+    return tags_match and retry_packet_with_tag.len >= 16;
 }
 
 /// Build a complete Retry packet (including integrity tag) into `buf`.
