@@ -11,6 +11,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.3.0] - 2026-04-14
+
+### Security
+
+- **Timing-safe comparisons** for Retry HMAC verification, stateless reset token
+  tails, and TLS Finished `verify_data` (`std.crypto.timing_safe.eql`).
+
+### Changed
+
+- **Peer stream limits (RFC 9000 §4.6):** track `peer_max_bidi_streams` /
+  `peer_max_uni_streams`, apply incoming **MAX_STREAMS** frames on client and
+  server, and enforce limits when allocating local stream IDs.
+- **`rawAllocateNextLocalBidiStream` / `rawAllocateNextLocalUniStream`** now
+  return `!u64` and **`error.StreamLimitExceeded`** when the peer’s limit is
+  reached (breaking API vs 1.2.x).
+- **Varint lengths:** `varint.lenToUsize` rejects values that do not fit in
+  `usize`; STREAM, CRYPTO, NEW_TOKEN, and CONNECTION_CLOSE parsers use it.
+- **Transport parameters:** `buildClientTransportParams` propagates varint
+  encode errors instead of `catch unreachable`.
+- **Constants:** single `types.max_datagram_size`, QUIC version literals via
+  `types.Version`, shared TLS transport-params extension id, file-level
+  `MAX_FIN_RETRANSMITS`.
+- **Verbose I/O:** `std.log.scoped(.zquic)` instead of `std.debug.print` when
+  verbose mode is enabled.
+
+### Fixed
+
+- **Streams (`stream_manager.zig`):** reject inconsistent FIN final sizes; ignore
+  `closeLocal` when already closed or after `reset_sent`.
+- **Version Negotiation `build`:** reject DCID/SCID lengths above 20 bytes.
+
+### Documentation
+
+- README: Path MTU discovery not implemented; embedder notes for `try`
+  `rawAllocate*`.
+
+---
+
 ## [v1.2.2] - 2026-04-13
 
 ### Security
@@ -140,7 +178,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.3.0...HEAD
+[v1.3.0]: https://github.com/ch4r10t33r/zquic/compare/v1.2.2...v1.3.0
 [v1.2.2]: https://github.com/ch4r10t33r/zquic/compare/v1.2.1...v1.2.2
 [v1.2.1]: https://github.com/ch4r10t33r/zquic/compare/v1.2.0...v1.2.1
 [v1.2.0]: https://github.com/ch4r10t33r/zquic/compare/v1.1.0...v1.2.0
