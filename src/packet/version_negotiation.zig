@@ -13,12 +13,13 @@
 //!   4*K bytes: Supported Versions list (at least one)
 
 const std = @import("std");
+const types = @import("../types.zig");
 
 /// QUIC version 1 (RFC 9000).
-pub const QUIC_V1: u32 = 0x00000001;
+pub const QUIC_V1: u32 = @intFromEnum(types.Version.quic_v1);
 
 /// QUIC version 2 (RFC 9369).
-pub const QUIC_V2: u32 = 0x6b3343cf;
+pub const QUIC_V2: u32 = @intFromEnum(types.Version.quic_v2);
 
 /// Parse error types for Version Negotiation packets.
 pub const ParseError = error{

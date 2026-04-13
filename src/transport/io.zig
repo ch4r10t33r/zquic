@@ -13,6 +13,7 @@
 //!   1-RTT      – AES-128-GCM with keys derived from TLS application_secret
 
 const std = @import("std");
+const log = std.log.scoped(.zquic);
 const packet_mod = @import("../packet/packet.zig");
 const header_mod = @import("../packet/header.zig");
 const varint = @import("../varint.zig");
@@ -41,7 +42,7 @@ const batch_io = @import("batch_io.zig");
 /// Compile-time-eliminated debug logger. With `-Dverbose=true` prints to stderr;
 /// in production builds all calls are removed by the optimizer with zero overhead.
 inline fn dbg(comptime fmt: []const u8, args: anytype) void {
-    if (build_options.verbose) std.debug.print(fmt, args);
+    if (build_options.verbose) log.debug(fmt, args);
 }
 
 const ConnectionId = types.ConnectionId;
@@ -51,8 +52,8 @@ const QuicKeyMaterial = tls_hs.QuicKeyMaterial;
 const ServerHandshake = tls_hs.ServerHandshake;
 const ClientHandshake = tls_hs.ClientHandshake;
 
-const QUIC_VERSION_1: u32 = 0x00000001;
-const QUIC_VERSION_2: u32 = 0x6b3343cf;
+const QUIC_VERSION_1: u32 = @intFromEnum(types.Version.quic_v1);
+const QUIC_VERSION_2: u32 = @intFromEnum(types.Version.quic_v2);
 
 // ── ECN constants (RFC 9000 §13.4) ───────────────────────────────────────────
 // Platform-specific socket option numbers for IP_TOS.
@@ -92,7 +93,10 @@ fn setupEcnSocket(sock: std.posix.fd_t) void {
     );
 }
 pub const MAX_CONNECTIONS: usize = 16;
-pub const MAX_DATAGRAM_SIZE: usize = 1500;
+pub const MAX_DATAGRAM_SIZE: usize = types.max_datagram_size;
+
+/// FIN retransmit attempts before giving up (~3 s at 200 ms intervals).
+const MAX_FIN_RETRANSMITS: usize = 15;
 
 /// Maximum file-data bytes in a single HTTP/0.9 STREAM frame.
 /// The UDP payload must fit within 1472 bytes (1500 MTU − 20 IP − 8 UDP).
@@ -637,8 +641,6 @@ const Http09OutSlot = struct {
     fin_last_sent_ms: i64 = 0,
     fin_retransmit_count: usize = 0,
 
-    const MAX_FIN_RETRANSMITS: usize = 15; // ~3 s at 200 ms intervals
-
     fn close(self: *Http09OutSlot) void {
         if (self.active) {
             self.file.close();
@@ -684,8 +686,6 @@ const Http3OutSlot = struct {
     fin_pkt_pn: u64 = 0,
     fin_last_sent_ms: i64 = 0,
     fin_retransmit_count: usize = 0,
-
-    const MAX_FIN_RETRANSMITS: usize = 15;
 
     fn close(self: *Http3OutSlot) void {
         if (self.active) {
@@ -3225,7 +3225,7 @@ pub const Server = struct {
                     if (!slot.awaiting_fin_ack) continue;
                     if (now - slot.fin_last_sent_ms < 200) continue;
 
-                    if (slot.fin_retransmit_count >= Http09OutSlot.MAX_FIN_RETRANSMITS) {
+                    if (slot.fin_retransmit_count >= MAX_FIN_RETRANSMITS) {
                         dbg("io: stream_id={} FIN retransmit limit reached, giving up\n", .{slot.stream_id});
                         slot.awaiting_fin_ack = false;
                         continue;
@@ -3234,7 +3234,7 @@ pub const Server = struct {
                     slot.fin_retransmit_count += 1;
                     slot.fin_last_sent_ms = now;
                     budget -= 1;
-                    dbg("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, Http09OutSlot.MAX_FIN_RETRANSMITS });
+                    dbg("io: retransmitting FIN for stream_id={} (attempt {}/{})\n", .{ slot.stream_id, slot.fin_retransmit_count, MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
                 }
             }
@@ -4174,7 +4174,7 @@ pub const Server = struct {
                     if (!slot.awaiting_fin_ack) continue;
                     if (now - slot.fin_last_sent_ms < 200) continue;
 
-                    if (slot.fin_retransmit_count >= Http3OutSlot.MAX_FIN_RETRANSMITS) {
+                    if (slot.fin_retransmit_count >= MAX_FIN_RETRANSMITS) {
                         dbg("io: http3 stream_id={} FIN retransmit limit reached\n", .{slot.stream_id});
                         slot.awaiting_fin_ack = false;
                         continue;
@@ -4182,7 +4182,7 @@ pub const Server = struct {
 
                     slot.fin_retransmit_count += 1;
                     slot.fin_last_sent_ms = now;
-                    dbg("io: http3 retransmit FIN stream_id={} attempt {}/{}\n", .{ slot.stream_id, slot.fin_retransmit_count, Http3OutSlot.MAX_FIN_RETRANSMITS });
+                    dbg("io: http3 retransmit FIN stream_id={} attempt {}/{}\n", .{ slot.stream_id, slot.fin_retransmit_count, MAX_FIN_RETRANSMITS });
                     self.send1Rtt(conn, slot.fin_frame[0..slot.fin_frame_len], conn.peer);
                 }
             }

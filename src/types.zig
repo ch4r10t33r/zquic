@@ -14,6 +14,9 @@ pub const Version = enum(u32) {
     }
 };
 
+/// Maximum UDP payload size used for buffer sizing (typical Ethernet MTU − IP/UDP).
+pub const max_datagram_size: usize = 1500;
+
 // Connection IDs are 0–20 bytes in QUIC v1 (RFC 9000 §17.2)
 pub const max_cid_len = 20;
 

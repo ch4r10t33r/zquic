@@ -21,6 +21,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const keys_mod = @import("../crypto/keys.zig");
+const quic_tls = @import("../crypto/quic_tls.zig");
 const tls_vendor = @import("tls");
 
 const Sha256 = crypto.hash.sha2.Sha256;
@@ -45,7 +46,7 @@ pub const EXT_ALPN: u16 = 0x0010;
 pub const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 pub const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 pub const EXT_KEY_SHARE: u16 = 0x0033;
-pub const EXT_QUIC_TRANSPORT_PARAMS: u16 = 0xffa5;
+pub const EXT_QUIC_TRANSPORT_PARAMS: u16 = quic_tls.TRANSPORT_PARAMS_EXT_TYPE;
 pub const EXT_PRE_SHARED_KEY: u16 = 0x0029;
 pub const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 pub const EXT_EARLY_DATA: u16 = 0x002a;

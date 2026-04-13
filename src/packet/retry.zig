@@ -13,6 +13,7 @@
 //!   ODCID Length (1 byte) + ODCID + Retry packet (without integrity tag)
 
 const std = @import("std");
+const types = @import("../types.zig");
 const aead_mod = @import("../crypto/aead.zig");
 
 /// AES-128-GCM key for QUIC v1 Retry integrity tag (RFC 9001 §5.8).
@@ -60,8 +61,8 @@ pub fn computeIntegrityTagVersion(
     retry_packet: []const u8,
     version: u32,
 ) aead_mod.AeadError!void {
-    const key = if (version == 0x6b3343cf) retry_key_v2 else retry_key;
-    const nonce = if (version == 0x6b3343cf) retry_nonce_v2 else retry_nonce;
+    const key = if (version == @intFromEnum(types.Version.quic_v2)) retry_key_v2 else retry_key;
+    const nonce = if (version == @intFromEnum(types.Version.quic_v2)) retry_nonce_v2 else retry_nonce;
 
     // Build the pseudo-packet: ODCID Length (1 byte) + ODCID + Retry packet
     var pseudo: [512]u8 = undefined;
@@ -130,7 +131,7 @@ pub fn buildRetryPacket(
     // First byte: Header Form=1, Fixed Bit=1, Type=Retry, low nibble=0.
     // v1: Retry type bits = 0b11 → 0xF0
     // v2: Retry type bits = 0b00 → 0xC0  (RFC 9369 §3.1)
-    buf[pos] = if (version == 0x6b3343cf) 0xC0 else 0xF0;
+    buf[pos] = if (version == @intFromEnum(types.Version.quic_v2)) 0xC0 else 0xF0;
     pos += 1;
     std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
     pos += 4;

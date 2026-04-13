@@ -18,6 +18,7 @@
 //!   for (rb.entries[0..n]) |*e| processPacket(e.buf[0..e.len], e.addr);
 
 const std = @import("std");
+const types = @import("../types.zig");
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 
@@ -29,7 +30,7 @@ else switch (builtin.target.os.tag) {
     else => 0x40, // Linux
 };
 
-pub const MAX_DATAGRAM_SIZE: usize = 1500;
+pub const MAX_DATAGRAM_SIZE: usize = types.max_datagram_size;
 pub const BATCH_SIZE: usize = 64;
 
 // ── Send batch ────────────────────────────────────────────────────────────────

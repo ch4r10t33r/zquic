@@ -48,7 +48,7 @@ pub const LongType = enum(u2) {
 
 /// Return the 2-bit wire encoding for `pkt_type` given `version`.
 pub fn longTypeBits(pkt_type: LongType, version: u32) u2 {
-    if (version == 0x6b3343cf) { // QUIC v2
+    if (version == @intFromEnum(types.Version.quic_v2)) { // QUIC v2
         return switch (pkt_type) {
             .initial => 1,
             .zero_rtt => 2,
@@ -61,7 +61,7 @@ pub fn longTypeBits(pkt_type: LongType, version: u32) u2 {
 
 /// Return the `LongType` for the given 2-bit wire encoding and `version`.
 pub fn longTypeFromBits(bits: u2, version: u32) LongType {
-    if (version == 0x6b3343cf) { // QUIC v2
+    if (version == @intFromEnum(types.Version.quic_v2)) { // QUIC v2
         return switch (bits) {
             0 => .retry,
             1 => .initial,
