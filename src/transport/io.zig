@@ -4420,6 +4420,13 @@ pub const Client = struct {
     /// Opaque STREAM receive buffers when `raw_application_streams` is set.
     raw_app_recv: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
 
+    /// Count of unretired CIDs the peer has issued to us via NEW_CONNECTION_ID.
+    /// RFC 9000 §5.1.1: we advertise `active_connection_id_limit` (default 2 per
+    /// §18.2, which we use since we don't send the param); exceeding it is a
+    /// CONNECTION_ID_LIMIT_ERROR (0x09).  The initial CID from the handshake
+    /// counts as one, so peer may issue up to (limit - 1) additional.
+    peer_cid_count: u64 = 1,
+
     /// Deferred ACK: instead of sending one ACK per received server packet,
     /// we accumulate the highest received PN here and flush a single cumulative
     /// ACK after draining all pending packets in the recv loop.  This reduces
@@ -5660,6 +5667,19 @@ pub const Client = struct {
                     self.conn.stateless_reset_token_set = true;
                 }
                 pos += 16;
+                // RFC 9000 §5.1.1: enforce our advertised active_connection_id_limit.
+                // We use the default of 2 per RFC 9000 §18.2 (we don't send the
+                // param).  Retire-prior-to (rpt_r.value) would reduce the count
+                // if we actually retired CIDs; since we don't rotate, we just
+                // cap total issuances.
+                const cid_limit: u64 = 2;
+                self.conn.peer_cid_count += 1;
+                if (self.conn.peer_cid_count > cid_limit) {
+                    dbg("io: CONNECTION_ID_LIMIT_ERROR peer issued {} CIDs, limit={}\n", .{ self.conn.peer_cid_count, cid_limit });
+                    // We don't currently send CONNECTION_CLOSE from the client
+                    // path; drop the frame and let the server time out.
+                    return;
+                }
                 if (seq_r.value == 1) {
                     self.conn.next_remote_cid = new_cid;
                     dbg("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
