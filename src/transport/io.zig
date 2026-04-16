@@ -1799,9 +1799,10 @@ pub const Server = struct {
                 const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[fpos..pt_len], ft) catch break;
                 fpos += sf_r.consumed;
                 const sid_type = sf_r.frame.stream_id & 3;
-                // RFC 9000 §19.8: reject server-initiated stream IDs from the peer.
-                if (sid_type == 1 or sid_type == 3) {
-                    dbg("io: 0-RTT STREAM_STATE_ERROR peer used our initiator bit sid={}\n", .{sf_r.frame.stream_id});
+                // RFC 9000 §19.8: reject writes to a server-initiated
+                // unidirectional stream (send-only from server's perspective).
+                if (sid_type == 3) {
+                    dbg("io: 0-RTT STREAM_STATE_ERROR peer wrote to server-initiated uni sid={}\n", .{sf_r.frame.stream_id});
                     break;
                 }
                 // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
@@ -3052,14 +3053,15 @@ pub const Server = struct {
                 // stream_count = (stream_id >> 2) + 1 (RFC 9000 §2.1).
                 // Client-initiated bidi: stream_id & 3 == 0; uni: stream_id & 3 == 2.
                 const sid_type = sf_r.frame.stream_id & 3;
-                // RFC 9000 §19.8: a server receiving a STREAM frame on a
-                // server-initiated stream ID (sid_type 1 or 3) is a protocol
-                // violation — STREAM_STATE_ERROR (0x05).  Additionally,
-                // server-initiated unidirectional streams (sid_type 3) cannot
-                // carry data sent to the server (they only flow server→client).
-                if (sid_type == 1 or sid_type == 3) {
-                    dbg("io: STREAM_STATE_ERROR peer used our initiator bit sid={} type={}\n", .{ sf_r.frame.stream_id, sid_type });
-                    self.sendConnectionClose(conn, 0x05, "stream initiator mismatch", src);
+                // RFC 9000 §19.8: a STREAM frame received on a server-initiated
+                // unidirectional stream (sid_type 3) is a protocol violation —
+                // such streams are send-only (server→client) and the client
+                // cannot write to them.  Bidirectional streams (sid_type 0 or 1)
+                // accept data from either endpoint regardless of who initiated
+                // the stream, so we don't reject those here.
+                if (sid_type == 3) {
+                    dbg("io: STREAM_STATE_ERROR peer wrote to server-initiated uni sid={}\n", .{sf_r.frame.stream_id});
+                    self.sendConnectionClose(conn, 0x05, "write to send-only stream", src);
                     return;
                 }
                 if (sid_type == 0 or sid_type == 2) { // client-initiated
@@ -5770,14 +5772,13 @@ pub const Client = struct {
                     return;
                 };
                 pos += sf_r.consumed;
-                // RFC 9000 §19.8: the client must reject STREAM frames arriving
-                // on a client-initiated stream ID (sid_type 0 or 2) — that's a
-                // STREAM_STATE_ERROR since the server cannot unilaterally open
-                // a stream in our direction.  Reject and drop the rest of the
-                // packet; the server will close or time out the connection.
+                // RFC 9000 §19.8: reject writes to a client-initiated
+                // unidirectional stream — those are send-only (client→server)
+                // and the server cannot write to them.  Bidirectional streams
+                // (sid_type 0 or 1) are valid in either direction.
                 const sid_type = sf_r.frame.stream_id & 3;
-                if (sid_type == 0 or sid_type == 2) {
-                    dbg("io: client STREAM_STATE_ERROR peer used our initiator bit sid={} type={}\n", .{ sf_r.frame.stream_id, sid_type });
+                if (sid_type == 2) {
+                    dbg("io: client STREAM_STATE_ERROR server wrote to client-initiated uni sid={}\n", .{sf_r.frame.stream_id});
                     return;
                 }
                 dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
