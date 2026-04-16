@@ -94,6 +94,12 @@ fn setupEcnSocket(sock: std.posix.fd_t) void {
         @sizeOf(u8),
     );
 }
+/// Maximum concurrent connections held in the demo `Server` struct's
+/// inline array.  Kept small to avoid multi-MB stack frames during init.
+/// **This is NOT a protocol-level cap.**  Production embedders should use
+/// `Server.initFromSocket` + `feedPacket` with their own heap-allocated
+/// connection map sized to their workload.  See the "Embedder guide" in
+/// the README.
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = types.max_datagram_size;
 
@@ -739,6 +745,44 @@ pub const ConnPhase = enum {
     closed,
 };
 
+/// Final-size tracking entry (RFC 9000 §4.5).  `used=false` slots are empty.
+const FinEntry = struct {
+    stream_id: u64 = 0,
+    final_size: u64 = 0,
+    used: bool = false,
+};
+
+/// Record the final size of a stream that reached FIN/RESET.  Evicts the
+/// oldest entry (index 0) if full.  Idempotent for an existing stream_id.
+fn recordFinalSize(tracker: *[16]FinEntry, stream_id: u64, final_size: u64) void {
+    for (tracker) |*e| {
+        if (e.used and e.stream_id == stream_id) {
+            e.final_size = final_size;
+            return;
+        }
+    }
+    for (tracker) |*e| {
+        if (!e.used) {
+            e.* = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+            return;
+        }
+    }
+    // Full — shift and replace the last slot.
+    var i: usize = 0;
+    while (i < tracker.len - 1) : (i += 1) tracker[i] = tracker[i + 1];
+    tracker[tracker.len - 1] = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+}
+
+/// Returns true if `final_size` matches any previously-recorded final size
+/// for this stream_id, or if no entry exists (new stream).  Returns false
+/// only on a known mismatch — caller should close with FINAL_SIZE_ERROR.
+fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64) bool {
+    for (tracker) |e| {
+        if (e.used and e.stream_id == stream_id) return e.final_size == final_size;
+    }
+    return true;
+}
+
 /// Per-connection crypto and TLS state.
 pub const ConnState = struct {
     phase: ConnPhase = .initial,
@@ -911,6 +955,22 @@ pub const ConnState = struct {
     /// Next locally opened bidi stream ID. Initialized to 1 on the server and 0 on
     /// the client. Advanced by `rawAllocateNextLocalBidiStream`.
     next_local_bidi_stream_id: u64 = 0,
+
+    // ── Final size tracking (RFC 9000 §3.5 / §11.3) ───────────────────────────
+    // When a STREAM frame with FIN arrives, we record the final size so that a
+    // subsequent RESET_STREAM can be validated for consistency.  Mismatch
+    // triggers FINAL_SIZE_ERROR (0x06).  A small ring is sufficient: only the
+    // most-recently-finished streams need to be checked against late RESETs,
+    // and stale entries naturally age out as newer FIN/RESETs arrive.
+    fin_tracker: [16]FinEntry = [_]FinEntry{.{}} ** 16,
+
+    // ── Active connection ID limit (RFC 9000 §5.1.1) ──────────────────────────
+    // Count of unretired CIDs the peer has issued via NEW_CONNECTION_ID.
+    // We use the default active_connection_id_limit = 2 from RFC 9000 §18.2
+    // (we don't send the transport param).  The initial CID from the handshake
+    // counts as one, so the peer may issue up to (limit - 1) additional before
+    // we error with CONNECTION_ID_LIMIT_ERROR (0x09).
+    peer_cid_count: u64 = 1,
 
     // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
     // Before the peer's address is validated (Retry token accepted or handshake
@@ -1099,7 +1159,13 @@ pub const Server = struct {
     private_key: tls_vendor.config.PrivateKey,
     conns: [MAX_CONNECTIONS]?ConnState = [_]?ConnState{null} ** MAX_CONNECTIONS,
     /// Random server token secret for Retry token HMAC-SHA256 verification.
+    /// Rotated periodically; `retry_secret_prev` is the previous secret and is
+    /// accepted during a grace window equal to the token TTL so tokens minted
+    /// just before rotation remain valid.
     retry_secret: [32]u8 = [_]u8{0} ** 32,
+    retry_secret_prev: [32]u8 = [_]u8{0} ** 32,
+    retry_secret_prev_valid: bool = false,
+    retry_secret_last_rotate_ms: i64 = 0,
     /// (Removed: was a 50ms pacing gate. CC-based rate-limiting is now sufficient.)
     /// Pacing timestamp for http09RetransmitPendingFins: at most one burst per 50ms.
     http09_retransmit_last_ms: i64 = 0,
@@ -1179,6 +1245,7 @@ pub const Server = struct {
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
+            .retry_secret_last_rotate_ms = std.time.milliTimestamp(),
             .owns_socket = true,
         };
         return self;
@@ -1224,6 +1291,7 @@ pub const Server = struct {
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
+            .retry_secret_last_rotate_ms = std.time.milliTimestamp(),
             .owns_socket = take_ownership,
         };
         return self;
@@ -1730,8 +1798,14 @@ pub const Server = struct {
             if (ft >= 0x08 and ft <= 0x0f) {
                 const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[fpos..pt_len], ft) catch break;
                 fpos += sf_r.consumed;
-                // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
                 const sid_type = sf_r.frame.stream_id & 3;
+                // RFC 9000 §19.8: reject writes to a server-initiated
+                // unidirectional stream (send-only from server's perspective).
+                if (sid_type == 3) {
+                    dbg("io: 0-RTT STREAM_STATE_ERROR peer wrote to server-initiated uni sid={}\n", .{sf_r.frame.stream_id});
+                    break;
+                }
+                // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
                 if (sid_type == 0 or sid_type == 2) {
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
                     if (sid_type == 0 and stream_count > conn.max_streams_bidi_recv) {
@@ -1751,42 +1825,90 @@ pub const Server = struct {
         }
     }
 
-    /// Build a Retry token that encodes the original DCID so the server can
-    /// recover it at verification time without external state.
-    ///
-    /// Token format (max 53 bytes):
-    ///   [0]      odcid length (1 byte)
-    ///   [1..n]   odcid bytes
-    ///   [n..n+32] HMAC-SHA256(retry_secret, odcid)
-    ///
-    /// Returns the number of bytes written into `out`.
-    fn mintRetryToken(self: *Server, odcid: []const u8, out: *[53]u8) usize {
-        out[0] = @intCast(odcid.len);
-        @memcpy(out[1..][0..odcid.len], odcid);
-        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.retry_secret);
-        hmac.update(odcid);
-        var mac: [32]u8 = undefined;
-        hmac.final(&mac);
-        @memcpy(out[1 + odcid.len ..][0..32], &mac);
-        return 1 + odcid.len + 32;
+    /// Retry token lifetime in milliseconds.  RFC 9000 §8.1.3 recommends
+    /// short validity to limit replay windows; 30 s comfortably covers
+    /// ~2 network round trips plus a retry retransmit.
+    const retry_token_ttl_ms: i64 = 30_000;
+    /// Rotate the retry secret this often.  A compromised secret remains
+    /// exploitable only for the rotation interval plus one TTL window.
+    const retry_secret_rotate_ms: i64 = 60 * 60 * 1000; // 1 hour
+
+    /// Rotate `retry_secret` if it is older than `retry_secret_rotate_ms`.
+    /// The previous secret is retained so tokens minted just before rotation
+    /// stay valid for one more TTL window.
+    fn maybeRotateRetrySecret(self: *Server) void {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - self.retry_secret_last_rotate_ms < retry_secret_rotate_ms) return;
+        self.retry_secret_prev = self.retry_secret;
+        self.retry_secret_prev_valid = self.retry_secret_last_rotate_ms > 0;
+        std.crypto.random.bytes(&self.retry_secret);
+        self.retry_secret_last_rotate_ms = now_ms;
+        dbg("io: rotated retry_secret (prev_valid={})\n", .{self.retry_secret_prev_valid});
     }
 
-    /// Verify a Retry token.  The original DCID is encoded inside the token
-    /// itself (see mintRetryToken), so no external odcid parameter is needed.
-    /// Returns the original DCID slice on success, or null on failure.
-    fn verifyRetryToken(self: *Server, token: []const u8) ?[]const u8 {
-        if (token.len < 1 + 32) return null;
-        const odcid_len: usize = token[0];
-        if (token.len < 1 + odcid_len + 32) return null;
-        const odcid = token[1..][0..odcid_len];
-        const received_mac = token[1 + odcid_len ..][0..32];
-        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.retry_secret);
+    /// Compute HMAC over (odcid || timestamp) with the given key.
+    fn retryHmac(key: *const [32]u8, odcid: []const u8, ts_bytes: []const u8) [32]u8 {
+        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(key);
         hmac.update(odcid);
-        var expected_mac: [32]u8 = undefined;
-        hmac.final(&expected_mac);
+        hmac.update(ts_bytes);
+        var mac: [32]u8 = undefined;
+        hmac.final(&mac);
+        return mac;
+    }
+
+    /// Build a Retry token that encodes the original DCID and a minting
+    /// timestamp so it cannot be replayed indefinitely.
+    ///
+    /// Token format (max 61 bytes):
+    ///   [0]       odcid length (1 byte)
+    ///   [1..n]    odcid bytes (0..20)
+    ///   [n..n+8]  minting timestamp, ms since epoch, big-endian (i64)
+    ///   [n+8..n+40] HMAC-SHA256(retry_secret, odcid || timestamp)
+    ///
+    /// Returns the number of bytes written into `out`.
+    fn mintRetryToken(self: *Server, odcid: []const u8, out: *[61]u8) usize {
+        self.maybeRotateRetrySecret();
+        out[0] = @intCast(odcid.len);
+        @memcpy(out[1..][0..odcid.len], odcid);
+        const ts_offset = 1 + odcid.len;
+        const ts_ms: i64 = std.time.milliTimestamp();
+        std.mem.writeInt(i64, out[ts_offset..][0..8], ts_ms, .big);
+        const mac = retryHmac(&self.retry_secret, odcid, out[ts_offset..][0..8]);
+        @memcpy(out[ts_offset + 8 ..][0..32], &mac);
+        return 1 + odcid.len + 8 + 32;
+    }
+
+    /// Verify a Retry token.  Returns the original DCID on success, or null
+    /// if the MAC is invalid or the token has expired beyond
+    /// `retry_token_ttl_ms`.  RFC 9000 §8.1.3.
+    ///
+    /// Both the current and (when available) previous secrets are accepted
+    /// so tokens minted just before rotation remain valid for one more TTL.
+    fn verifyRetryToken(self: *Server, token: []const u8) ?[]const u8 {
+        // Minimum: odcid_len(1) + 0-byte odcid + timestamp(8) + mac(32) = 41 bytes.
+        if (token.len < 1 + 8 + 32) return null;
+        const odcid_len: usize = token[0];
+        if (token.len < 1 + odcid_len + 8 + 32) return null;
+        const odcid = token[1..][0..odcid_len];
+        const ts_bytes = token[1 + odcid_len ..][0..8];
+        const received_mac = token[1 + odcid_len + 8 ..][0..32];
+
         var received: [32]u8 = undefined;
         @memcpy(&received, received_mac);
-        if (!std.crypto.timing_safe.eql([32]u8, received, expected_mac)) return null;
+        const current_mac = retryHmac(&self.retry_secret, odcid, ts_bytes);
+        var ok = std.crypto.timing_safe.eql([32]u8, received, current_mac);
+        if (!ok and self.retry_secret_prev_valid) {
+            const prev_mac = retryHmac(&self.retry_secret_prev, odcid, ts_bytes);
+            ok = std.crypto.timing_safe.eql([32]u8, received, prev_mac);
+        }
+        if (!ok) return null;
+
+        // Check freshness: reject tokens older than retry_token_ttl_ms.
+        const minted_ms = std.mem.readInt(i64, ts_bytes, .big);
+        const now_ms = std.time.milliTimestamp();
+        const age_ms = now_ms - minted_ms;
+        if (age_ms < 0 or age_ms > retry_token_ttl_ms) return null;
+
         return odcid;
     }
 
@@ -1810,8 +1932,8 @@ pub const Server = struct {
         var new_scid: [8]u8 = undefined;
         std.crypto.random.bytes(&new_scid);
 
-        // Token encodes odcid + HMAC (max 53 bytes: 1 + 20 + 32)
-        var token_buf: [53]u8 = undefined;
+        // Token encodes odcid + timestamp + HMAC (max 61 bytes: 1 + 20 + 8 + 32)
+        var token_buf: [61]u8 = undefined;
         const token_len = self.mintRetryToken(odcid, &token_buf);
 
         var buf: [256]u8 = undefined;
@@ -2667,7 +2789,13 @@ pub const Server = struct {
                     @intCast(std.time.milliTimestamp()),
                     &conn.rtt,
                     &lost_buf,
-                );
+                ) catch {
+                    // Malformed ACK (e.g. first_ack_range > largest_acked) —
+                    // RFC 9000 §11.3 FRAME_ENCODING_ERROR.  Skip rest of frames.
+                    dbg("io: malformed ACK from peer (first_ack_range > largest_acked)\n", .{});
+                    pos += skipAckBody(frames[pos..], ft == 0x03);
+                    continue;
+                };
                 // Congestion control: credit the actual bytes delivered.
                 // bytes_acked is the sum of real packet sizes from the loss
                 // detector, keeping bytes_in_flight accurate.
@@ -2826,6 +2954,17 @@ pub const Server = struct {
                 dbg("io: RESET_STREAM stream_id={} code={} final_size={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code, r.frame.final_size,
                 });
+                // RFC 9000 §3.5 / §11.3: the final size in RESET_STREAM must
+                // match any final size previously established by a STREAM+FIN
+                // frame.  Mismatch → FINAL_SIZE_ERROR (0x06).
+                if (!checkFinalSize(&conn.fin_tracker, r.frame.stream_id, r.frame.final_size)) {
+                    dbg("io: FINAL_SIZE_ERROR sid={} reset_final={} vs prior FIN\n", .{
+                        r.frame.stream_id, r.frame.final_size,
+                    });
+                    self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
+                    return;
+                }
+                recordFinalSize(&conn.fin_tracker, r.frame.stream_id, r.frame.final_size);
                 // Cancel any pending response for this stream.
                 for (&conn.http09_slots) |*slot| {
                     if (slot.active and slot.stream_id == r.frame.stream_id) {
@@ -2914,6 +3053,17 @@ pub const Server = struct {
                 // stream_count = (stream_id >> 2) + 1 (RFC 9000 §2.1).
                 // Client-initiated bidi: stream_id & 3 == 0; uni: stream_id & 3 == 2.
                 const sid_type = sf_r.frame.stream_id & 3;
+                // RFC 9000 §19.8: a STREAM frame received on a server-initiated
+                // unidirectional stream (sid_type 3) is a protocol violation —
+                // such streams are send-only (server→client) and the client
+                // cannot write to them.  Bidirectional streams (sid_type 0 or 1)
+                // accept data from either endpoint regardless of who initiated
+                // the stream, so we don't reject those here.
+                if (sid_type == 3) {
+                    dbg("io: STREAM_STATE_ERROR peer wrote to server-initiated uni sid={}\n", .{sf_r.frame.stream_id});
+                    self.sendConnectionClose(conn, 0x05, "write to send-only stream", src);
+                    return;
+                }
                 if (sid_type == 0 or sid_type == 2) { // client-initiated
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
                     if (sid_type == 0) {
@@ -3403,6 +3553,18 @@ pub const Server = struct {
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+        // RFC 9000 §4.5: record final size on FIN and validate against any
+        // previously-established final size (from an earlier STREAM+FIN or
+        // RESET_STREAM).  Mismatch → FINAL_SIZE_ERROR (0x06).
+        if (sf.fin) {
+            const final_size = sf.offset + sf.data.len;
+            if (!checkFinalSize(&conn.fin_tracker, sf.stream_id, final_size)) {
+                dbg("io: FINAL_SIZE_ERROR sid={} new_fin={} vs prior\n", .{ sf.stream_id, final_size });
+                self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
+                return;
+            }
+            recordFinalSize(&conn.fin_tracker, sf.stream_id, final_size);
+        }
         if (self.config.raw_application_streams) {
             self.handleRawApplicationStreamServer(conn, sf, src);
             return;
@@ -5076,12 +5238,14 @@ pub const Client = struct {
                 if (lh.header.packet_type == .initial) {
                     // Skip token_len + token.
                     const tok_r = varint.decode(buf[pos..]) catch break :blk buf.len;
-                    pos += tok_r.len + @as(usize, @intCast(tok_r.value));
+                    const tok_len = varint.lenToUsize(tok_r.value) catch break :blk buf.len;
+                    pos += tok_r.len + tok_len;
                 }
                 if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
                     if (pos >= buf.len) break :blk buf.len;
                     const len_r = varint.decode(buf[pos..]) catch break :blk buf.len;
-                    pos += len_r.len + @as(usize, @intCast(len_r.value));
+                    const payload_len = varint.lenToUsize(len_r.value) catch break :blk buf.len;
+                    pos += len_r.len + payload_len;
                     break :blk @min(pos, buf.len);
                 }
                 break :blk buf.len;
@@ -5568,6 +5732,19 @@ pub const Client = struct {
                     self.conn.stateless_reset_token_set = true;
                 }
                 pos += 16;
+                // RFC 9000 §5.1.1: enforce our advertised active_connection_id_limit.
+                // We use the default of 2 per RFC 9000 §18.2 (we don't send the
+                // param).  Retire-prior-to (rpt_r.value) would reduce the count
+                // if we actually retired CIDs; since we don't rotate, we just
+                // cap total issuances.
+                const cid_limit: u64 = 2;
+                self.conn.peer_cid_count += 1;
+                if (self.conn.peer_cid_count > cid_limit) {
+                    dbg("io: CONNECTION_ID_LIMIT_ERROR peer issued {} CIDs, limit={}\n", .{ self.conn.peer_cid_count, cid_limit });
+                    // We don't currently send CONNECTION_CLOSE from the client
+                    // path; drop the frame and let the server time out.
+                    return;
+                }
                 if (seq_r.value == 1) {
                     self.conn.next_remote_cid = new_cid;
                     dbg("io: client stored next_remote_cid from NEW_CONNECTION_ID\n", .{});
@@ -5595,6 +5772,15 @@ pub const Client = struct {
                     return;
                 };
                 pos += sf_r.consumed;
+                // RFC 9000 §19.8: reject writes to a client-initiated
+                // unidirectional stream — those are send-only (client→server)
+                // and the server cannot write to them.  Bidirectional streams
+                // (sid_type 0 or 1) are valid in either direction.
+                const sid_type = sf_r.frame.stream_id & 3;
+                if (sid_type == 2) {
+                    dbg("io: client STREAM_STATE_ERROR server wrote to client-initiated uni sid={}\n", .{sf_r.frame.stream_id});
+                    return;
+                }
                 dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
                 self.handleStreamResponse(&sf_r.frame);
                 continue;

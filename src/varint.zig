@@ -11,7 +11,7 @@ const std = @import("std");
 pub const max_value: u64 = (1 << 62) - 1;
 
 pub const EncodeError = error{ValueTooLarge};
-pub const DecodeError = error{ BufferTooShort, VarintLengthTooLarge };
+pub const DecodeError = error{ BufferTooShort, VarintLengthTooLarge, NonMinimalEncoding };
 
 /// Cast a varint-decoded length to `usize` without silent truncation on small usize targets.
 pub fn lenToUsize(len: u64) DecodeError!usize {
@@ -59,6 +59,9 @@ pub fn encode(buf: []u8, v: u64) (EncodeError || DecodeError)![]u8 {
 
 /// Decode a variable-length integer from `buf`.
 /// Returns the decoded value and the number of bytes consumed.
+///
+/// RFC 9000 §16 requires the shortest encoding ("MUST use"); this
+/// decoder rejects non-minimal encodings with error.NonMinimalEncoding.
 pub fn decode(buf: []const u8) DecodeError!struct { value: u64, len: u4 } {
     if (buf.len == 0) return error.BufferTooShort;
     const prefix: u2 = @intCast(buf[0] >> 6);
@@ -69,17 +72,26 @@ pub fn decode(buf: []const u8) DecodeError!struct { value: u64, len: u4 } {
         0b01 => {
             if (buf.len < 2) return error.BufferTooShort;
             const w = std.mem.readInt(u16, buf[0..2], .big);
-            return .{ .value = w & 0x3fff, .len = 2 };
+            const v: u64 = w & 0x3fff;
+            // Values < 64 must be encoded in 1 byte.
+            if (v < (1 << 6)) return error.NonMinimalEncoding;
+            return .{ .value = v, .len = 2 };
         },
         0b10 => {
             if (buf.len < 4) return error.BufferTooShort;
             const w = std.mem.readInt(u32, buf[0..4], .big);
-            return .{ .value = w & 0x3fffffff, .len = 4 };
+            const v: u64 = w & 0x3fffffff;
+            // Values < 16384 must be encoded in 1 or 2 bytes.
+            if (v < (1 << 14)) return error.NonMinimalEncoding;
+            return .{ .value = v, .len = 4 };
         },
         0b11 => {
             if (buf.len < 8) return error.BufferTooShort;
             const w = std.mem.readInt(u64, buf[0..8], .big);
-            return .{ .value = w & 0x3fffffffffffffff, .len = 8 };
+            const v: u64 = w & 0x3fffffffffffffff;
+            // Values < 2^30 must be encoded in 1, 2, or 4 bytes.
+            if (v < (1 << 30)) return error.NonMinimalEncoding;
+            return .{ .value = v, .len = 8 };
         },
     }
 }
@@ -191,4 +203,46 @@ test "varint: RFC 9000 example — 37" {
 test "varint: error on oversized value" {
     var buf: [8]u8 = undefined;
     try std.testing.expectError(error.ValueTooLarge, encode(&buf, max_value + 1));
+}
+
+test "varint: reject non-minimal 2-byte encoding of value < 64" {
+    // 0x4001 = 2-byte form encoding value 1; must be rejected.
+    const buf = [_]u8{ 0x40, 0x01 };
+    try std.testing.expectError(error.NonMinimalEncoding, decode(&buf));
+}
+
+test "varint: reject non-minimal 4-byte encoding of value < 16384" {
+    // 0x80000001 = 4-byte form encoding value 1; must be rejected.
+    const buf = [_]u8{ 0x80, 0x00, 0x00, 0x01 };
+    try std.testing.expectError(error.NonMinimalEncoding, decode(&buf));
+
+    // 0x80003fff = 4-byte form encoding 16383 (max of 2-byte form); must be rejected.
+    const buf2 = [_]u8{ 0x80, 0x00, 0x3f, 0xff };
+    try std.testing.expectError(error.NonMinimalEncoding, decode(&buf2));
+}
+
+test "varint: reject non-minimal 8-byte encoding of value < 2^30" {
+    // 0xc000000000000001 = 8-byte form encoding value 1; must be rejected.
+    const buf = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    try std.testing.expectError(error.NonMinimalEncoding, decode(&buf));
+}
+
+test "varint: accept minimum-valid larger encodings" {
+    // 0x4040 = 2-byte form encoding 64 (smallest value requiring 2 bytes); OK.
+    const b2 = [_]u8{ 0x40, 0x40 };
+    const d2 = try decode(&b2);
+    try std.testing.expectEqual(@as(u64, 64), d2.value);
+    try std.testing.expectEqual(@as(u4, 2), d2.len);
+
+    // 0x80004000 = 4-byte form encoding 16384 (smallest value requiring 4 bytes); OK.
+    const b4 = [_]u8{ 0x80, 0x00, 0x40, 0x00 };
+    const d4 = try decode(&b4);
+    try std.testing.expectEqual(@as(u64, 16384), d4.value);
+    try std.testing.expectEqual(@as(u4, 4), d4.len);
+
+    // 0xc000000040000000 = 8-byte form encoding 2^30 (smallest value requiring 8 bytes); OK.
+    const b8 = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 };
+    const d8 = try decode(&b8);
+    try std.testing.expectEqual(@as(u64, 1 << 30), d8.value);
+    try std.testing.expectEqual(@as(u4, 8), d8.len);
 }
