@@ -2667,7 +2667,13 @@ pub const Server = struct {
                     @intCast(std.time.milliTimestamp()),
                     &conn.rtt,
                     &lost_buf,
-                );
+                ) catch {
+                    // Malformed ACK (e.g. first_ack_range > largest_acked) —
+                    // RFC 9000 §11.3 FRAME_ENCODING_ERROR.  Skip rest of frames.
+                    dbg("io: malformed ACK from peer (first_ack_range > largest_acked)\n", .{});
+                    pos += skipAckBody(frames[pos..], ft == 0x03);
+                    continue;
+                };
                 // Congestion control: credit the actual bytes delivered.
                 // bytes_acked is the sum of real packet sizes from the loss
                 // detector, keeping bytes_in_flight accurate.
@@ -5076,12 +5082,14 @@ pub const Client = struct {
                 if (lh.header.packet_type == .initial) {
                     // Skip token_len + token.
                     const tok_r = varint.decode(buf[pos..]) catch break :blk buf.len;
-                    pos += tok_r.len + @as(usize, @intCast(tok_r.value));
+                    const tok_len = varint.lenToUsize(tok_r.value) catch break :blk buf.len;
+                    pos += tok_r.len + tok_len;
                 }
                 if (lh.header.packet_type == .initial or lh.header.packet_type == .handshake) {
                     if (pos >= buf.len) break :blk buf.len;
                     const len_r = varint.decode(buf[pos..]) catch break :blk buf.len;
-                    pos += len_r.len + @as(usize, @intCast(len_r.value));
+                    const payload_len = varint.lenToUsize(len_r.value) catch break :blk buf.len;
+                    pos += len_r.len + payload_len;
                     break :blk @min(pos, buf.len);
                 }
                 break :blk buf.len;

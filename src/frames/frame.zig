@@ -109,6 +109,7 @@ pub const ParseError = varint.DecodeError || error{
     InvalidFrame,
     BufferTooShort,
     TooLong,
+    FrameEncodingError,
 };
 
 /// Parse one frame from `buf`. Returns the frame and bytes consumed.

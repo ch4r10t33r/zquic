@@ -108,9 +108,21 @@ pub const LossDetector = struct {
         }
     }
 
+    pub const OnAckError = error{FrameEncodingError};
+
+    pub const OnAckResult = struct {
+        lost_count: usize,
+        rtt_updated: bool,
+        bytes_acked: u64,
+        lost_bytes: u64,
+    };
+
     /// Process an ACK frame. Returns packets declared lost.
     /// `now_ms` is the current wall-clock time in milliseconds.
     /// `rtt` is the RTT estimator.
+    ///
+    /// Returns `error.FrameEncodingError` if `first_ack_range > largest_acked`
+    /// (RFC 9000 §19.3: the first range must not underflow the packet number space).
     pub fn onAck(
         self: *LossDetector,
         largest_acked: u64,
@@ -127,7 +139,12 @@ pub const LossDetector = struct {
         /// Callers that stored stream metadata in `has_stream_data` can use
         /// this to rewind and retransmit the affected data.
         lost_buf: []SentPacket,
-    ) struct { lost_count: usize, rtt_updated: bool, bytes_acked: u64, lost_bytes: u64 } {
+    ) OnAckError!OnAckResult {
+        // Validate: first_ack_range must not exceed largest_acked (RFC 9000 §19.3).
+        // A saturating subtract would mask this protocol violation as a silent
+        // accept of packets [0..largest_acked], so we reject here.
+        if (first_ack_range > largest_acked) return error.FrameEncodingError;
+
         var rtt_updated = false;
 
         // Update RTT sample for the largest acknowledged packet.
@@ -146,7 +163,7 @@ pub const LossDetector = struct {
         // The first ACK range covers [smallest_acked .. largest_acked].
         // Packets in this range are definitively acknowledged.
         // Packets below smallest_acked may be in a gap (possibly lost).
-        const smallest_acked = largest_acked -| first_ack_range;
+        const smallest_acked = largest_acked - first_ack_range;
 
         var lost_count: usize = 0;
         var bytes_acked: u64 = 0;
@@ -182,7 +199,12 @@ pub const LossDetector = struct {
             i += 1;
         }
 
-        return .{ .lost_count = lost_count, .rtt_updated = rtt_updated, .bytes_acked = bytes_acked, .lost_bytes = lost_bytes };
+        return OnAckResult{
+            .lost_count = lost_count,
+            .rtt_updated = rtt_updated,
+            .bytes_acked = bytes_acked,
+            .lost_bytes = lost_bytes,
+        };
     }
 };
 
@@ -234,6 +256,18 @@ test "loss: packet threshold detection" {
     // Packets 0, 1, 2 are in a gap and should be detected as lost via
     // k_packet_threshold (5 >= 0+3, 1+3, 2+3).
     var lost_buf: [8]SentPacket = undefined;
-    const result = ld.onAck(5, 0, 0, 200, &rtt, &lost_buf);
+    const result = try ld.onAck(5, 0, 0, 200, &rtt, &lost_buf);
     try testing.expect(result.lost_count >= 2);
+}
+
+test "loss: rejects invalid first_ack_range > largest_acked" {
+    const testing = std.testing;
+    var ld = LossDetector{};
+    var rtt = RttEstimator{};
+    var lost_buf: [4]SentPacket = undefined;
+    // largest_acked=5, first_ack_range=10 → would underflow.
+    try testing.expectError(
+        error.FrameEncodingError,
+        ld.onAck(5, 10, 0, 200, &rtt, &lost_buf),
+    );
 }

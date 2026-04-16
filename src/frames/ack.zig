@@ -42,13 +42,21 @@ pub const AckFrame = struct {
     ecn: ?EcnCounts,
 
     /// Parse an ACK frame from `buf` (after the type byte).
-    pub fn parse(buf: []const u8, has_ecn: bool) varint.DecodeError!struct { frame: AckFrame, consumed: usize } {
+    ///
+    /// Returns `error.NonMinimalEncoding` for varints that violate RFC 9000 §16,
+    /// and `error.FrameEncodingError` for ranges that underflow the packet
+    /// number space (RFC 9000 §19.3: first_range must not exceed largest,
+    /// additional gaps/lengths must not underflow).
+    pub fn parse(buf: []const u8, has_ecn: bool) (varint.DecodeError || error{FrameEncodingError})!struct { frame: AckFrame, consumed: usize } {
         var r = varint.Reader.init(buf);
 
         const largest = try r.readVarint();
         const delay = try r.readVarint();
         const range_count = try r.readVarint();
         const first_range = try r.readVarint();
+
+        // RFC 9000 §19.3: first_range must not exceed largest_acknowledged.
+        if (first_range > largest) return error.FrameEncodingError;
 
         var frame: AckFrame = .{
             .largest_acknowledged = largest,
@@ -61,7 +69,7 @@ pub const AckFrame = struct {
         // First range: [largest - first_range, largest]
         frame.ranges[0] = .{
             .largest = largest,
-            .smallest = largest -| first_range,
+            .smallest = largest - first_range,
         };
         frame.range_count = 1;
 
@@ -71,9 +79,17 @@ pub const AckFrame = struct {
         while (i < range_count and frame.range_count < max_ack_ranges) : (i += 1) {
             const gap = try r.readVarint();
             const range_len = try r.readVarint();
-            // The largest of this range is 2 below the smallest of the previous
-            const range_largest = current_smallest -| (gap + 2);
-            const range_smallest = range_largest -| range_len;
+            // RFC 9000 §19.3.1: additional ranges must not underflow the PN space.
+            // gap + 2 must be <= current_smallest, and range_len must be <= the
+            // computed range_largest.  We use checked arithmetic to reject
+            // malformed ACKs instead of silently clamping.
+            if (gap >= current_smallest) return error.FrameEncodingError;
+            // gap + 2 could overflow u64 if gap is near max, but earlier check
+            // (gap < current_smallest ≤ 2^62) means gap+2 is safe.
+            if (gap + 2 > current_smallest) return error.FrameEncodingError;
+            const range_largest = current_smallest - (gap + 2);
+            if (range_len > range_largest) return error.FrameEncodingError;
+            const range_smallest = range_largest - range_len;
             frame.ranges[frame.range_count] = .{
                 .largest = range_largest,
                 .smallest = range_smallest,
