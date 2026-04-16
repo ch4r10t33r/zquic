@@ -1730,8 +1730,13 @@ pub const Server = struct {
             if (ft >= 0x08 and ft <= 0x0f) {
                 const sf_r = stream_frame_mod.StreamFrame.parse(plaintext[fpos..pt_len], ft) catch break;
                 fpos += sf_r.consumed;
-                // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
                 const sid_type = sf_r.frame.stream_id & 3;
+                // RFC 9000 §19.8: reject server-initiated stream IDs from the peer.
+                if (sid_type == 1 or sid_type == 3) {
+                    dbg("io: 0-RTT STREAM_STATE_ERROR peer used our initiator bit sid={}\n", .{sf_r.frame.stream_id});
+                    break;
+                }
+                // Stream limit enforcement for 0-RTT (RFC 9000 §4.6).
                 if (sid_type == 0 or sid_type == 2) {
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
                     if (sid_type == 0 and stream_count > conn.max_streams_bidi_recv) {
@@ -2920,6 +2925,16 @@ pub const Server = struct {
                 // stream_count = (stream_id >> 2) + 1 (RFC 9000 §2.1).
                 // Client-initiated bidi: stream_id & 3 == 0; uni: stream_id & 3 == 2.
                 const sid_type = sf_r.frame.stream_id & 3;
+                // RFC 9000 §19.8: a server receiving a STREAM frame on a
+                // server-initiated stream ID (sid_type 1 or 3) is a protocol
+                // violation — STREAM_STATE_ERROR (0x05).  Additionally,
+                // server-initiated unidirectional streams (sid_type 3) cannot
+                // carry data sent to the server (they only flow server→client).
+                if (sid_type == 1 or sid_type == 3) {
+                    dbg("io: STREAM_STATE_ERROR peer used our initiator bit sid={} type={}\n", .{ sf_r.frame.stream_id, sid_type });
+                    self.sendConnectionClose(conn, 0x05, "stream initiator mismatch", src);
+                    return;
+                }
                 if (sid_type == 0 or sid_type == 2) { // client-initiated
                     const stream_count = (sf_r.frame.stream_id >> 2) + 1;
                     if (sid_type == 0) {
@@ -5603,6 +5618,16 @@ pub const Client = struct {
                     return;
                 };
                 pos += sf_r.consumed;
+                // RFC 9000 §19.8: the client must reject STREAM frames arriving
+                // on a client-initiated stream ID (sid_type 0 or 2) — that's a
+                // STREAM_STATE_ERROR since the server cannot unilaterally open
+                // a stream in our direction.  Reject and drop the rest of the
+                // packet; the server will close or time out the connection.
+                const sid_type = sf_r.frame.stream_id & 3;
+                if (sid_type == 0 or sid_type == 2) {
+                    dbg("io: client STREAM_STATE_ERROR peer used our initiator bit sid={} type={}\n", .{ sf_r.frame.stream_id, sid_type });
+                    return;
+                }
                 dbg("io: client parsed STREAM stream_id={} fin={} data_len={}\n", .{ sf_r.frame.stream_id, sf_r.frame.fin, sf_r.frame.data.len });
                 self.handleStreamResponse(&sf_r.frame);
                 continue;
