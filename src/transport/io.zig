@@ -1145,7 +1145,13 @@ pub const Server = struct {
     private_key: tls_vendor.config.PrivateKey,
     conns: [MAX_CONNECTIONS]?ConnState = [_]?ConnState{null} ** MAX_CONNECTIONS,
     /// Random server token secret for Retry token HMAC-SHA256 verification.
+    /// Rotated periodically; `retry_secret_prev` is the previous secret and is
+    /// accepted during a grace window equal to the token TTL so tokens minted
+    /// just before rotation remain valid.
     retry_secret: [32]u8 = [_]u8{0} ** 32,
+    retry_secret_prev: [32]u8 = [_]u8{0} ** 32,
+    retry_secret_prev_valid: bool = false,
+    retry_secret_last_rotate_ms: i64 = 0,
     /// (Removed: was a 50ms pacing gate. CC-based rate-limiting is now sufficient.)
     /// Pacing timestamp for http09RetransmitPendingFins: at most one burst per 50ms.
     http09_retransmit_last_ms: i64 = 0,
@@ -1225,6 +1231,7 @@ pub const Server = struct {
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
+            .retry_secret_last_rotate_ms = std.time.milliTimestamp(),
             .owns_socket = true,
         };
         return self;
@@ -1270,6 +1277,7 @@ pub const Server = struct {
             .cert_der = cert_der,
             .private_key = pk,
             .retry_secret = retry_secret,
+            .retry_secret_last_rotate_ms = std.time.milliTimestamp(),
             .owns_socket = take_ownership,
         };
         return self;
@@ -1802,42 +1810,90 @@ pub const Server = struct {
         }
     }
 
-    /// Build a Retry token that encodes the original DCID so the server can
-    /// recover it at verification time without external state.
-    ///
-    /// Token format (max 53 bytes):
-    ///   [0]      odcid length (1 byte)
-    ///   [1..n]   odcid bytes
-    ///   [n..n+32] HMAC-SHA256(retry_secret, odcid)
-    ///
-    /// Returns the number of bytes written into `out`.
-    fn mintRetryToken(self: *Server, odcid: []const u8, out: *[53]u8) usize {
-        out[0] = @intCast(odcid.len);
-        @memcpy(out[1..][0..odcid.len], odcid);
-        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.retry_secret);
-        hmac.update(odcid);
-        var mac: [32]u8 = undefined;
-        hmac.final(&mac);
-        @memcpy(out[1 + odcid.len ..][0..32], &mac);
-        return 1 + odcid.len + 32;
+    /// Retry token lifetime in milliseconds.  RFC 9000 §8.1.3 recommends
+    /// short validity to limit replay windows; 30 s comfortably covers
+    /// ~2 network round trips plus a retry retransmit.
+    const retry_token_ttl_ms: i64 = 30_000;
+    /// Rotate the retry secret this often.  A compromised secret remains
+    /// exploitable only for the rotation interval plus one TTL window.
+    const retry_secret_rotate_ms: i64 = 60 * 60 * 1000; // 1 hour
+
+    /// Rotate `retry_secret` if it is older than `retry_secret_rotate_ms`.
+    /// The previous secret is retained so tokens minted just before rotation
+    /// stay valid for one more TTL window.
+    fn maybeRotateRetrySecret(self: *Server) void {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms - self.retry_secret_last_rotate_ms < retry_secret_rotate_ms) return;
+        self.retry_secret_prev = self.retry_secret;
+        self.retry_secret_prev_valid = self.retry_secret_last_rotate_ms > 0;
+        std.crypto.random.bytes(&self.retry_secret);
+        self.retry_secret_last_rotate_ms = now_ms;
+        dbg("io: rotated retry_secret (prev_valid={})\n", .{self.retry_secret_prev_valid});
     }
 
-    /// Verify a Retry token.  The original DCID is encoded inside the token
-    /// itself (see mintRetryToken), so no external odcid parameter is needed.
-    /// Returns the original DCID slice on success, or null on failure.
-    fn verifyRetryToken(self: *Server, token: []const u8) ?[]const u8 {
-        if (token.len < 1 + 32) return null;
-        const odcid_len: usize = token[0];
-        if (token.len < 1 + odcid_len + 32) return null;
-        const odcid = token[1..][0..odcid_len];
-        const received_mac = token[1 + odcid_len ..][0..32];
-        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&self.retry_secret);
+    /// Compute HMAC over (odcid || timestamp) with the given key.
+    fn retryHmac(key: *const [32]u8, odcid: []const u8, ts_bytes: []const u8) [32]u8 {
+        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(key);
         hmac.update(odcid);
-        var expected_mac: [32]u8 = undefined;
-        hmac.final(&expected_mac);
+        hmac.update(ts_bytes);
+        var mac: [32]u8 = undefined;
+        hmac.final(&mac);
+        return mac;
+    }
+
+    /// Build a Retry token that encodes the original DCID and a minting
+    /// timestamp so it cannot be replayed indefinitely.
+    ///
+    /// Token format (max 61 bytes):
+    ///   [0]       odcid length (1 byte)
+    ///   [1..n]    odcid bytes (0..20)
+    ///   [n..n+8]  minting timestamp, ms since epoch, big-endian (i64)
+    ///   [n+8..n+40] HMAC-SHA256(retry_secret, odcid || timestamp)
+    ///
+    /// Returns the number of bytes written into `out`.
+    fn mintRetryToken(self: *Server, odcid: []const u8, out: *[61]u8) usize {
+        self.maybeRotateRetrySecret();
+        out[0] = @intCast(odcid.len);
+        @memcpy(out[1..][0..odcid.len], odcid);
+        const ts_offset = 1 + odcid.len;
+        const ts_ms: i64 = std.time.milliTimestamp();
+        std.mem.writeInt(i64, out[ts_offset..][0..8], ts_ms, .big);
+        const mac = retryHmac(&self.retry_secret, odcid, out[ts_offset..][0..8]);
+        @memcpy(out[ts_offset + 8 ..][0..32], &mac);
+        return 1 + odcid.len + 8 + 32;
+    }
+
+    /// Verify a Retry token.  Returns the original DCID on success, or null
+    /// if the MAC is invalid or the token has expired beyond
+    /// `retry_token_ttl_ms`.  RFC 9000 §8.1.3.
+    ///
+    /// Both the current and (when available) previous secrets are accepted
+    /// so tokens minted just before rotation remain valid for one more TTL.
+    fn verifyRetryToken(self: *Server, token: []const u8) ?[]const u8 {
+        // Minimum: odcid_len(1) + 0-byte odcid + timestamp(8) + mac(32) = 41 bytes.
+        if (token.len < 1 + 8 + 32) return null;
+        const odcid_len: usize = token[0];
+        if (token.len < 1 + odcid_len + 8 + 32) return null;
+        const odcid = token[1..][0..odcid_len];
+        const ts_bytes = token[1 + odcid_len ..][0..8];
+        const received_mac = token[1 + odcid_len + 8 ..][0..32];
+
         var received: [32]u8 = undefined;
         @memcpy(&received, received_mac);
-        if (!std.crypto.timing_safe.eql([32]u8, received, expected_mac)) return null;
+        const current_mac = retryHmac(&self.retry_secret, odcid, ts_bytes);
+        var ok = std.crypto.timing_safe.eql([32]u8, received, current_mac);
+        if (!ok and self.retry_secret_prev_valid) {
+            const prev_mac = retryHmac(&self.retry_secret_prev, odcid, ts_bytes);
+            ok = std.crypto.timing_safe.eql([32]u8, received, prev_mac);
+        }
+        if (!ok) return null;
+
+        // Check freshness: reject tokens older than retry_token_ttl_ms.
+        const minted_ms = std.mem.readInt(i64, ts_bytes, .big);
+        const now_ms = std.time.milliTimestamp();
+        const age_ms = now_ms - minted_ms;
+        if (age_ms < 0 or age_ms > retry_token_ttl_ms) return null;
+
         return odcid;
     }
 
@@ -1861,8 +1917,8 @@ pub const Server = struct {
         var new_scid: [8]u8 = undefined;
         std.crypto.random.bytes(&new_scid);
 
-        // Token encodes odcid + HMAC (max 53 bytes: 1 + 20 + 32)
-        var token_buf: [53]u8 = undefined;
+        // Token encodes odcid + timestamp + HMAC (max 61 bytes: 1 + 20 + 8 + 32)
+        var token_buf: [61]u8 = undefined;
         const token_len = self.mintRetryToken(odcid, &token_buf);
 
         var buf: [256]u8 = undefined;
