@@ -60,12 +60,36 @@ jobs:
           echo "Generated release notes for $TAG"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: release-notes.md
-          files: |
-            release-assets/zquic-server-linux-amd64
-            release-assets/zquic-client-linux-amd64
-          generate_release_notes: false
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Idempotent release creation: if the release already exists
+          # (e.g. a previous run created it but a later step flaked), we
+          # update notes and re-upload assets rather than failing.
+          PRERELEASE_FLAG=""
+          case "${TAG}" in
+            *-*) PRERELEASE_FLAG="--prerelease" ;;
+          esac
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — updating notes and re-uploading assets."
+            gh release edit "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --notes-file release-notes.md \
+              ${PRERELEASE_FLAG:+--prerelease}
+            gh release upload "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber \
+              release-assets/zquic-server-linux-amd64 \
+              release-assets/zquic-client-linux-amd64
+          else
+            echo "Creating new release ${TAG}."
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${TAG}" \
+              --notes-file release-notes.md \
+              ${PRERELEASE_FLAG} \
+              release-assets/zquic-server-linux-amd64 \
+              release-assets/zquic-client-linux-amd64
+          fi
