@@ -94,6 +94,12 @@ fn setupEcnSocket(sock: std.posix.fd_t) void {
         @sizeOf(u8),
     );
 }
+/// Maximum concurrent connections held in the demo `Server` struct's
+/// inline array.  Kept small to avoid multi-MB stack frames during init.
+/// **This is NOT a protocol-level cap.**  Production embedders should use
+/// `Server.initFromSocket` + `feedPacket` with their own heap-allocated
+/// connection map sized to their workload.  See the "Embedder guide" in
+/// the README.
 pub const MAX_CONNECTIONS: usize = 16;
 pub const MAX_DATAGRAM_SIZE: usize = types.max_datagram_size;
 
