@@ -739,6 +739,44 @@ pub const ConnPhase = enum {
     closed,
 };
 
+/// Final-size tracking entry (RFC 9000 §4.5).  `used=false` slots are empty.
+const FinEntry = struct {
+    stream_id: u64 = 0,
+    final_size: u64 = 0,
+    used: bool = false,
+};
+
+/// Record the final size of a stream that reached FIN/RESET.  Evicts the
+/// oldest entry (index 0) if full.  Idempotent for an existing stream_id.
+fn recordFinalSize(tracker: *[16]FinEntry, stream_id: u64, final_size: u64) void {
+    for (tracker) |*e| {
+        if (e.used and e.stream_id == stream_id) {
+            e.final_size = final_size;
+            return;
+        }
+    }
+    for (tracker) |*e| {
+        if (!e.used) {
+            e.* = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+            return;
+        }
+    }
+    // Full — shift and replace the last slot.
+    var i: usize = 0;
+    while (i < tracker.len - 1) : (i += 1) tracker[i] = tracker[i + 1];
+    tracker[tracker.len - 1] = .{ .stream_id = stream_id, .final_size = final_size, .used = true };
+}
+
+/// Returns true if `final_size` matches any previously-recorded final size
+/// for this stream_id, or if no entry exists (new stream).  Returns false
+/// only on a known mismatch — caller should close with FINAL_SIZE_ERROR.
+fn checkFinalSize(tracker: *const [16]FinEntry, stream_id: u64, final_size: u64) bool {
+    for (tracker) |e| {
+        if (e.used and e.stream_id == stream_id) return e.final_size == final_size;
+    }
+    return true;
+}
+
 /// Per-connection crypto and TLS state.
 pub const ConnState = struct {
     phase: ConnPhase = .initial,
@@ -911,6 +949,14 @@ pub const ConnState = struct {
     /// Next locally opened bidi stream ID. Initialized to 1 on the server and 0 on
     /// the client. Advanced by `rawAllocateNextLocalBidiStream`.
     next_local_bidi_stream_id: u64 = 0,
+
+    // ── Final size tracking (RFC 9000 §3.5 / §11.3) ───────────────────────────
+    // When a STREAM frame with FIN arrives, we record the final size so that a
+    // subsequent RESET_STREAM can be validated for consistency.  Mismatch
+    // triggers FINAL_SIZE_ERROR (0x06).  A small ring is sufficient: only the
+    // most-recently-finished streams need to be checked against late RESETs,
+    // and stale entries naturally age out as newer FIN/RESETs arrive.
+    fin_tracker: [16]FinEntry = [_]FinEntry{.{}} ** 16,
 
     // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
     // Before the peer's address is validated (Retry token accepted or handshake
@@ -2837,6 +2883,17 @@ pub const Server = struct {
                 dbg("io: RESET_STREAM stream_id={} code={} final_size={}\n", .{
                     r.frame.stream_id, r.frame.application_protocol_error_code, r.frame.final_size,
                 });
+                // RFC 9000 §3.5 / §11.3: the final size in RESET_STREAM must
+                // match any final size previously established by a STREAM+FIN
+                // frame.  Mismatch → FINAL_SIZE_ERROR (0x06).
+                if (!checkFinalSize(&conn.fin_tracker, r.frame.stream_id, r.frame.final_size)) {
+                    dbg("io: FINAL_SIZE_ERROR sid={} reset_final={} vs prior FIN\n", .{
+                        r.frame.stream_id, r.frame.final_size,
+                    });
+                    self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
+                    return;
+                }
+                recordFinalSize(&conn.fin_tracker, r.frame.stream_id, r.frame.final_size);
                 // Cancel any pending response for this stream.
                 for (&conn.http09_slots) |*slot| {
                     if (slot.active and slot.stream_id == r.frame.stream_id) {
@@ -3424,6 +3481,18 @@ pub const Server = struct {
     }
 
     fn handleStreamData(self: *Server, conn: *ConnState, sf: *const stream_frame_mod.StreamFrame, src: std.net.Address) void {
+        // RFC 9000 §4.5: record final size on FIN and validate against any
+        // previously-established final size (from an earlier STREAM+FIN or
+        // RESET_STREAM).  Mismatch → FINAL_SIZE_ERROR (0x06).
+        if (sf.fin) {
+            const final_size = sf.offset + sf.data.len;
+            if (!checkFinalSize(&conn.fin_tracker, sf.stream_id, final_size)) {
+                dbg("io: FINAL_SIZE_ERROR sid={} new_fin={} vs prior\n", .{ sf.stream_id, final_size });
+                self.sendConnectionClose(conn, 0x06, "final size mismatch", src);
+                return;
+            }
+            recordFinalSize(&conn.fin_tracker, sf.stream_id, final_size);
+        }
         if (self.config.raw_application_streams) {
             self.handleRawApplicationStreamServer(conn, sf, src);
             return;
