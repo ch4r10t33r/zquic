@@ -11,6 +11,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [v1.5.0] - 2026-04-16
+
+### Security
+
+- **Retry token replay window closed (#108):** tokens now embed a minting
+  timestamp and are rejected after 30 s. The `retry_secret` rotates hourly;
+  the previous secret is kept for one TTL so tokens minted just before
+  rotation remain valid. Bounds the blast radius of a leaked secret from
+  "forever" to ~1 hour + 30 s.
+- **Retry token format** extended from 53 to 61 bytes (adds 8-byte timestamp
+  into the HMAC-SHA256 input).
+
+### Fixed
+
+- **FINAL_SIZE_ERROR enforcement (#109, RFC 9000 §3.5/§11.3):** per-connection
+  tracker cross-checks RESET_STREAM `final_size` against any prior STREAM+FIN
+  final size on the same stream, and vice-versa. Mismatch triggers
+  `FINAL_SIZE_ERROR` (0x06) rather than silent acceptance.
+- **Non-minimal varint rejection (#110, RFC 9000 §16 MUST):** `varint.decode`
+  now rejects varints encoded in more bytes than needed. Prevents peers from
+  bloating packets and restores canonicalization.
+- **Active connection ID limit (#111, RFC 9000 §5.1.1):** client tracks the
+  count of unretired CIDs received from the peer and drops packets that would
+  exceed the advertised `active_connection_id_limit` (default 2 per §18.2).
+- **ACK range underflow (#112, RFC 9000 §19.3):** `LossDetector.onAck` now
+  returns `error.FrameEncodingError` when `first_ack_range > largest_acked`,
+  and `AckFrame.parse` validates every additional gap/range for underflow.
+  Previously saturating subtraction silently accepted malformed ACKs.
+- **Stream-initiator violations (#113, RFC 9000 §19.8):** reject STREAM frames
+  that write to send-only unidirectional streams (server rejects sid_type 3,
+  client rejects sid_type 2). Bidirectional streams continue to accept frames
+  in either direction.
+- **Coalesced packet parser hardening (#115):** replaced raw `@intCast` of
+  varint-decoded lengths with `varint.lenToUsize` for defense-in-depth.
+
+### Changed
+
+- **`varint.DecodeError`** adds `NonMinimalEncoding`.
+- **`LossDetector.onAck`** now returns `OnAckError!OnAckResult` (breaking API
+  vs 1.4.x).
+- **`AckFrame.parse`** returns `(varint.DecodeError || error{FrameEncodingError})!…`.
+
+### Documentation
+
+- Prominently calls out that `MAX_CONNECTIONS = 16` on the demo `Server`
+  struct is not a protocol cap; production embedders use `initFromSocket` +
+  `feedPacket` with their own heap-allocated connection map (#114).
+
+### Tests
+
+- 165/165 unit tests pass (added 6 new tests: 5 varint boundary cases + 1 ACK
+  underflow). 13/13 quic-interop-runner tests pass.
+
+---
+
 ## [v1.4.0] - 2026-04-13
 
 ### Added
@@ -205,7 +260,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/ch4r10t33r/zquic/compare/v1.5.0...HEAD
+[v1.5.0]: https://github.com/ch4r10t33r/zquic/compare/v1.4.0...v1.5.0
 [v1.4.0]: https://github.com/ch4r10t33r/zquic/compare/v1.3.0...v1.4.0
 [v1.3.0]: https://github.com/ch4r10t33r/zquic/compare/v1.2.2...v1.3.0
 [v1.2.2]: https://github.com/ch4r10t33r/zquic/compare/v1.2.1...v1.2.2
