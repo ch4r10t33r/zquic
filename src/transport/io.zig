@@ -964,6 +964,14 @@ pub const ConnState = struct {
     // and stale entries naturally age out as newer FIN/RESETs arrive.
     fin_tracker: [16]FinEntry = [_]FinEntry{.{}} ** 16,
 
+    // ── Active connection ID limit (RFC 9000 §5.1.1) ──────────────────────────
+    // Count of unretired CIDs the peer has issued via NEW_CONNECTION_ID.
+    // We use the default active_connection_id_limit = 2 from RFC 9000 §18.2
+    // (we don't send the transport param).  The initial CID from the handshake
+    // counts as one, so the peer may issue up to (limit - 1) additional before
+    // we error with CONNECTION_ID_LIMIT_ERROR (0x09).
+    peer_cid_count: u64 = 1,
+
     // ── Anti-amplification (RFC 9000 §8.1) ─────────────────────────────────────
     // Before the peer's address is validated (Retry token accepted or handshake
     // completed), the server MUST NOT send more than 3× the bytes received.
@@ -4481,13 +4489,6 @@ pub const Client = struct {
 
     /// Opaque STREAM receive buffers when `raw_application_streams` is set.
     raw_app_recv: [64]RawAppStreamSlot = [_]RawAppStreamSlot{.{}} ** 64,
-
-    /// Count of unretired CIDs the peer has issued to us via NEW_CONNECTION_ID.
-    /// RFC 9000 §5.1.1: we advertise `active_connection_id_limit` (default 2 per
-    /// §18.2, which we use since we don't send the param); exceeding it is a
-    /// CONNECTION_ID_LIMIT_ERROR (0x09).  The initial CID from the handshake
-    /// counts as one, so peer may issue up to (limit - 1) additional.
-    peer_cid_count: u64 = 1,
 
     /// Deferred ACK: instead of sending one ACK per received server packet,
     /// we accumulate the highest received PN here and flush a single cumulative
